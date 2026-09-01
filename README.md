@@ -1,139 +1,258 @@
-# OncoGemma Stage v4.5: CAP-Compliant Synoptic Reporting & AJCC Staging (MedGemma 1.5)
+# OncoGemma v5 — Enterprise Clinical AI Copilot for Digital Breast Pathology
 
-OncoGemma is an enterprise-grade clinical AI copilot for automated Whole-Slide Image (WSI) processing, hotspot triage, Nottingham Histological Grading, and standardized CAP-compliant synoptic surgical pathology reporting for invasive breast carcinoma.
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.11%20%7C%203.12-blue.svg)](https://python.org)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-009688.svg)](https://fastapi.tiangolo.com)
+[![Next.js](https://img.shields.io/badge/Next.js-14.2+-black.svg)](https://nextjs.org)
+[![Google Cloud](https://img.shields.io/badge/GCP-Cloud%20Storage%20%7C%20Vertex%20AI-4285F4.svg)](https://cloud.google.com)
+[![Tests](https://img.shields.io/badge/Tests-58%2F58%20Passing-brightgreen.svg)](tests/)
 
-This repository branch (`v4.5-cap-reporting`) implements **Stage v4.5 (CAP-Compliant Reporting via Pure Zero-LLM AJCC Staging, MedGemma 1.5 Narrative Synthesis & ReportLab Clinical PDF Generation)**, synthesizing confirmed histologic grading from Stage v4.4, mitotic counts from Stage v4.3, and hotspot triage from Stage v4.2 alongside surgical, gross, and biomarker data into standard College of American Pathologists (CAP) Cancer Protocol checklists.
+**OncoGemma v5** is an enterprise-grade clinical AI platform and diagnostic copilot designed for pathologists to analyze Whole-Slide Images (WSIs) of invasive breast carcinoma. It automates gigapixel slide ingestion, quality control, tumor bed triage, mitotic figure quantification, Nottingham Histologic Grading (Elston-Ellis modification), and College of American Pathologists (CAP) synoptic cancer reporting with AJCC 8th/9th Edition staging.
 
 ---
 
-## 🏗️ Pipeline Architecture Flow
+## 🏛️ Comprehensive Architecture & Workflow Pipeline
+
+OncoGemma follows a strict 6-stage clinical diagnostic workflow where each stage produces verifiable intermediate machine evidence that pathologists inspect, modify, and confirm before proceeding.
 
 ```mermaid
 flowchart TD
-    A["Confirmed Stage 5 Grading + Stage 4 Mitotic HPFs + Stage 3 Hotspots"] --> B["Stage 6 Background Worker (worker/report.py)"]
-    B --> C["Aggregate Verified Stage 1-5 Machine & Override Data"]
-    C --> D["Deterministic Zero-LLM AJCC Staging Engine (pipeline/staging.py)"]
-    C --> E["MedGemma 1.5 Multi-Section Narrative Synthesis (configs/prompts/cap_report@v1.md)"]
-    E --> F["Pure Code Numerical Consistency Guardrail"]
-    D & F --> G["Persist Draft Report to DB (reports Table) -> Status: awaiting_review"]
-    
-    G --> H["Stage 6 Pathologist Synoptic Workspace (frontend/components/viewer/ReportWorkspace.tsx)"]
-    H -->|"Interactive Synoptic Smart-Form"| I["Update Gross / Surgical / Biomarker Elements"]
-    I -->|"Live Debounced API Call"| D
-    H -->|"Live PDF Streaming / Preview"| J["ReportLab Clinical PDF Engine (pipeline/report_pdf.py)"]
-    J -->|"Embed Key Visual Evidence"| K["WSI Heatmap + Top Mitotic HPF + Grading Patch"]
-    
-    H -->|"Pathologist Review & Sign-Off Gate"| L["Digital Attestation Modal (Credentials, NPI, Checkbox)"]
-    L -->|"Commit Final Signature"| M["Lock Report -> status: signed (Case: done)"]
-    M --> N["Generate SHA-256 Integrity Hash & Audit Event"]
-    M --> O["Structured CAP eCC / FHIR JSON Export + Printable Clinical PDF"]
-    M -.->|"Formal Re-open / Correction"| P["Versioned Amendment Workflow (v1.0 -> v1.1)"]
+    subgraph S1["Stage 1: WSI Ingest (v4.0)"]
+        A1["Raw Whole-Slide Image (.svs / .ndpi / .tiff)"] --> B1["PyVips & OpenSlide DeepZoom Ingestion"]
+        B1 --> C1["GCS Multi-Resolution Pyramid (oncogemma-dev-pyramids)"]
+    end
+
+    subgraph S2["Stage 2: Stain & QC Gate (v4.1)"]
+        C1 --> A2["Otsu Tissue Segmentation & Area Analysis"]
+        A2 --> B2["Laplacian Focus Quality & Marker/Bubble Filters"]
+        B2 --> C2["Calibrated Optical Density Macenko Stain Normalization"]
+        C2 --> D2["Pathologist QC Gate & Threshold Confirmation"]
+    end
+
+    subgraph S3["Stage 3: Hotspot Triage (v4.2)"]
+        D2 --> A3["Tissue Grid Tiling (1.0 um/px @ 10x)"]
+        A3 --> B3["Vertex AI Path Foundation Embedding & Linear Probe"]
+        B3 --> C3["Spatial KDE Tumor Probability Contouring"]
+        C3 --> D3["Interactive Hotspot Polygon Review Workspace"]
+    end
+
+    subgraph S4["Stage 4: Mitosis Counting (v4.3)"]
+        D3 --> A4["40x High-Power Sweep within Active Hotspots"]
+        A4 --> B4["YOLO Candidate Detection & Morphological Filters"]
+        B4 --> C4["2D Spatial Convolution (10 Standard HPFs = 2.157 mm2)"]
+        C4 --> D4["Pathologist Mitosis Review Gallery (Score 1/2/3)"]
+    end
+
+    subgraph S5["Stage 5: Nottingham Histologic Grade (v4.4)"]
+        D4 --> A5["24 Stratified 10x Evidence Patch Extraction"]
+        A5 --> B5["MedGemma 1.5 Tubule Formation & Pleomorphism Inference"]
+        B5 --> C5["Consensus Histologic Subtype Classification"]
+        C5 --> D5["Pure Zero-LLM Aggregation: Grade 1, 2, or 3 (Sum 3-9)"]
+    end
+
+    subgraph S6["Stage 6: CAP Synoptic Report (v4.5)"]
+        D5 --> A6["Deterministic Zero-LLM AJCC Staging Engine (pT, pN, Group)"]
+        A6 --> B6["MedGemma 1.5 Narrative Synthesis with Guardrails"]
+        B6 --> C6["ReportLab Clinical 2-Column PDF Generator"]
+        C6 --> D6["Pathologist Attestation, NPI Signing & Versioned Amendments"]
+    end
+
+    S1 --> S2 --> S3 --> S4 --> S5 --> S6
 ```
 
 ---
 
-## 📋 Mathematical Specification & Staging Invariants
+## 📦 Consolidated Stage Specifications (v4.0 – v4.5)
 
-### 1. Pure Zero-LLM Pathologic T (pT) Staging
-$$\text{pT} = \begin{cases} 
-\text{pTis} & \text{if in situ only} \\
-\text{pT1mi} & \text{if } 0.0 < \text{size\_mm} \le 1.0 \\
-\text{pT1a} & \text{if } 1.0 < \text{size\_mm} \le 5.0 \\
-\text{pT1b} & \text{if } 5.0 < \text{size\_mm} \le 10.0 \\
-\text{pT1c} & \text{if } 10.0 < \text{size\_mm} \le 20.0 \\
-\text{pT2} & \text{if } 20.0 < \text{size\_mm} \le 50.0 \\
-\text{pT3} & \text{if } \text{size\_mm} > 50.0 \\
-\text{pT4a/b/c} & \text{if chest wall extension and/or skin ulceration}
+### 🔬 Stage 1 (v4.0): Gigapixel Whole-Slide Image Ingestion
+* **High-Throughput Slide Ingest**: Decodes Aperio (`.svs`), Hamamatsu (`.ndpi`), and generic BigTIFF slides using `pyvips` and `openslide`.
+* **DeepZoom Tile Generator**: Generates multiscale DZI pyramid image pyramids uploaded directly to Google Cloud Storage (`oncogemma-dev-pyramids`).
+* **OpenSeadragon 5.0 High-DPI Viewer**: Smooth pan, zoom, sub-pixel coordinate conversion, and micro-magnification overlays.
+* **Audit Trail**: Every file upload and stage transition is logged to the `audit_events` ledger.
+
+### 🧪 Stage 2 (v4.1): Preprocessing & Automated QC Gate
+* **Tissue Segmentation**: Otsu thresholding in HSV color space to distinguish valid tissue parenchyma from background glass.
+* **Automated Quality Checks**:
+  * **Focus Quality**: Evaluated via Laplacian variance kernel ($	ext{Var}(
+abla^2 I)$). Flags blurred fields with $	ext{score} < 85.0$.
+  * **Artifact Detection**: Identifies surgical ink, coverslip bubbles, and tissue folds.
+* **Calibrated Optical Density Macenko Stain Normalization**:
+  * Converts RGB to Optical Density: $	ext{OD} = -\log_{10}((I + 1)/255)$.
+  * Computes calibrated singular vectors for Hematoxylin and Eosin ($W_{	ext{target}}$: Hematoxylin $[0.644, 0.717, 0.267]$, Eosin $[0.093, 0.954, 0.283]$).
+  * Concentration bounds $[0.75, 1.35]$ maintain authentic royal-purple nuclear chromatin and vibrant pink cytoplasm without artificial saturation.
+
+### 🎯 Stage 3 (v4.2): Hotspot Triage & Microscopic Morphology Engine
+* **Vertex AI Foundation Embedding**: Extracts feature representations from normalized $1.0\ \mu	ext{m/px}$ patches across the tissue bed.
+* **Calibrated Linear Probe**: Predicts tumor probability scores ($P(	ext{invasive carcinoma})$) per tile.
+* **Spatial KDE & Polygon Contouring**: Applies 2D Gaussian Kernel Density Estimation to contour the most proliferative, high-density tumor regions.
+* **Interactive Hotspot Workspace**: Allows pathologists to view heatmaps, adjust threshold gates, add custom regions of interest (ROIs), and exclude necrotic/in-situ areas.
+
+### 🧬 Stage 4 (v4.3): High-Power Mitosis Detection & Virtual HPF Placement
+* **$40	imes$ High-Power Candidate Detection**: Scans $0.25\ \mu	ext{m/px}$ optical fields for mitotic candidates.
+* **Standardized 10-HPF Spatial Convolution**:
+  * Places 10 standard virtual High-Power Fields (each radius $= 262.0\ \mu	ext{m}$, area $= 0.2157	ext{ mm}^2$, total area $= 2.157	ext{ mm}^2$) matching standard clinical microscopy calibration ($FN = 22	ext{ mm}$ at $40	imes$).
+* **Pathologist Interactive Gallery**:
+  * Field-by-field candidate verification with synchronized macro biopsy minimap.
+  * Instantaneous Nottingham Mitotic Score calculation ($<8 	o 1$, $8	ext{--}15 	o 2$, $\ge 16 	o 3$).
+
+### 📊 Stage 5 (v4.4): Nottingham Histological Grading (MedGemma 1.5)
+* **Stratified Evidence Extraction**: Samples 24 normalized $10	imes$ patches from confirmed tumor hotspots with deterministic RNG seeding.
+* **Multi-Modal AI Inference (MedGemma 1.5)**:
+  * **Tubule Formation**: Evaluates percentage of tumor forming definite glandular lumens ($>75\% 	o 1$, $10	ext{--}75\% 	o 2$, $<10\% 	o 3$).
+  * **Nuclear Pleomorphism**: Analyzes nuclear size, chromatin clumping, and nucleolar prominence (Small/Uniform $	o 1$, Moderate $	o 2$, Marked/Bizarre $	o 3$).
+  * **Histologic Subtype**: Multi-patch consensus classification (IDC-NST vs. ILC vs. Special Types).
+* **Pure Zero-LLM Deterministic Aggregation**:
+  $$	ext{Nottingham Sum} = 	ext{Score}_{	ext{Tubule}} + 	ext{Score}_{	ext{Pleo}} + 	ext{Score}_{	ext{Mitosis}} \quad (	ext{Range: } 3	ext{--}9)$$
+  $$	ext{Grade} = egin{cases} 	ext{Grade 1 (Well Differentiated)} & 3 \le 	ext{Sum} \le 5 \ 	ext{Grade 2 (Moderately Differentiated)} & 6 \le 	ext{Sum} \le 7 \ 	ext{Grade 3 (Poorly Differentiated)} & 8 \le 	ext{Sum} \le 9 \end{cases}$$
+
+### 📑 Stage 6 (v4.5): CAP Synoptic Report & AJCC 8th/9th Staging
+* **Deterministic Zero-LLM AJCC Staging**:
+  * **Pathologic T (pT)**: Calculated strictly from macroscopic tumor dimensions and chest wall/skin extension (pTis to pT4d).
+  * **Pathologic N (pN)**: Calculated strictly from positive regional lymph node counts (pNX to pN3a).
+  * **Anatomic Stage Grouping**: Pure code matrix mapping (Stage 0 to Stage IV).
+* **MedGemma 1.5 Clinical Narrative Synthesis**: Synthesizes formal microscopic description, clinical history, and diagnostic comments.
+* **Code-Level Consistency Guardrail**: Verifies that LLM narrative statements do not contradict verified Nottingham grades or node counts.
+* **ReportLab Clinical PDF Engine**: Generates institutional two-column surgical pathology reports embedding key visual evidence (WSI Heatmap, Top Mitotic HPF, and $10	imes$ Grading Patch).
+* **Digital Attestation & Cryptographic Sign-Off**: Pathologist NPI, legal attestation, SHA-256 integrity digest, and formal versioned amendment workflows (`v1.0` $	o$ `v1.1`).
+
+---
+
+## 📐 Mathematical Specification & Invariant Tables
+
+### Nottingham Combined Histologic Grade (Elston-Ellis Modification)
+
+| Feature | Score 1 | Score 2 | Score 3 |
+| :--- | :--- | :--- | :--- |
+| **Tubule Formation** | $>75\%$ of tumor area | $10\% - 75\%$ of tumor area | $<10\%$ of tumor area |
+| **Nuclear Pleomorphism** | Small, regular, uniform | Moderate variation in size & shape | Marked variation, prominent nucleoli |
+| **Mitotic Count** ($2.157	ext{ mm}^2$) | $< 8$ mitotic figures | $8 - 15$ mitotic figures | $\ge 16$ mitotic figures |
+
+$$	extbf{Combined Score: } 3	ext{--}5 \implies 	extbf{Grade 1} \quadert\quad 6	ext{--}7 \implies 	extbf{Grade 2} \quadert\quad 8	ext{--}9 \implies 	extbf{Grade 3}$$
+
+---
+
+### AJCC 8th/9th Edition Breast Cancer Staging
+
+$$	ext{pT} = egin{cases} 
+	ext{pTis} & 	ext{Carcinoma in situ (DCIS, LCIS, Paget disease without tumor)} \
+	ext{pT1mi} & 	ext{Tumor } \le 1.0	ext{ mm} \
+	ext{pT1a} & 1.0 < 	ext{Tumor} \le 5.0	ext{ mm} \
+	ext{pT1b} & 5.0 < 	ext{Tumor} \le 10.0	ext{ mm} \
+	ext{pT1c} & 10.0 < 	ext{Tumor} \le 20.0	ext{ mm} \
+	ext{pT2} & 20.0 < 	ext{Tumor} \le 50.0	ext{ mm} \
+	ext{pT3} & 	ext{Tumor} > 50.0	ext{ mm} \
+	ext{pT4} & 	ext{Direct extension to chest wall (4a), skin ulceration (4b), both (4c), or inflammatory (4d)}
 \end{cases}$$
 
-### 2. Pathologic N (pN) Staging
-$$\text{pN} = \begin{cases}
-\text{pNX} & \text{if nodes not examined (biopsy)} \\
-\text{pN0} & \text{if } \text{positive\_nodes} = 0 \\
-\text{pN1mi} & \text{if micrometastasis only } (0.2\text{ mm} - 2.0\text{ mm}) \\
-\text{pN1a} & \text{if } 1 \le \text{positive\_nodes} \le 3 \\
-\text{pN2a} & \text{if } 4 \le \text{positive\_nodes} \le 9 \\
-\text{pN3a} & \text{if } \text{positive\_nodes} \ge 10
+$$	ext{pN} = egin{cases}
+	ext{pNX} & 	ext{Regional lymph nodes cannot be assessed (e.g. core biopsy)} \
+	ext{pN0} & 	ext{No regional lymph node metastasis} \
+	ext{pN1mi} & 	ext{Micrometastases only } (0.2	ext{ mm} - 2.0	ext{ mm}) \
+	ext{pN1a} & 1 - 3 	ext{ axillary lymph nodes positive} \
+	ext{pN2a} & 4 - 9 	ext{ axillary lymph nodes positive} \
+	ext{pN3a} & \ge 10 	ext{ axillary lymph nodes positive}
 \end{cases}$$
 
-### 3. Anatomic Stage Grouping
-$$\text{Stage Group} = \text{AJCC\_Matrix}(\text{pT}, \text{pN}, \text{pM})$$
-- Evaluated deterministically with pure zero-LLM matrix lookup (`0`, `IA`, `IB`, `IIA`, `IIB`, `IIIA`, `IIIB`, `IIIC`, `IV`).
+---
+
+## 🛠️ Technology Stack
+
+| Layer | Component | Description |
+| :--- | :--- | :--- |
+| **Frontend** | Next.js 14 (App Router) | High-performance React UI with Tailwind CSS and Lucide icons |
+| | OpenSeadragon 5.0 | High-DPI gigapixel whole-slide viewer |
+| | Canvas & SVG Overlays | Sub-pixel annotation layers for hot spots and mitotic beacons |
+| **Backend** | FastAPI / Python 3.12 | Asynchronous RESTful microservice backend |
+| | SQLAlchemy ORM & Pydantic | Typed database persistence and strict schema validation |
+| | ReportLab | High-precision clinical surgical pathology PDF generation |
+| **AI & Pipeline** | MedGemma 1.5 | Multi-modal clinical vision-language model (Vertex AI) |
+| | Path Foundation | Digital pathology representation embeddings |
+| | Pure NumPy Stain Engine | High-speed, calibrated Optical Density Macenko normalizer |
+| | OpenSlide & PyVips | Multi-resolution WSI tile decoders |
+| **Cloud & Storage** | Google Cloud Storage | Distributed object store (`raw`, `pyramids`, `artifacts`) |
+| | Google Cloud Vertex AI | Managed endpoints for MedGemma and Path Foundation models |
 
 ---
 
-## 🔍 Key Deliverables
+## 🚀 Quick Start & Local Development
 
-### 1. Pure Zero-LLM Staging Engine (`backend/pipeline/staging.py`)
-- Full AJCC 8th/9th Edition deterministic staging calculations.
-- Code-level numerical guardrail detecting any conflicting LLM narrative citations.
+### 1. Prerequisites
+* Python 3.11 or 3.12
+* Node.js 18+ and npm
+* `openslide` C-library installed on system PATH
+* Google Cloud CLI (`gcloud`) authenticated with access to GCS buckets
 
-### 2. Clinical PDF Generation Engine (`backend/pipeline/report_pdf.py`)
-- Built with ReportLab producing two-column institutional surgical pathology reports.
-- Embedded visual evidence: WSI Triage Heatmap, Highest-Density Mitotic HPF Crop with annotations, and representative $10\times$ Grading Patch.
-- Pathologist digital signature block with SHA-256 integrity checksum.
-
-### 3. Stage 6 Background Worker (`backend/worker/report.py`)
-- Aggregates confirmed outputs from Stages 1–5, calculates initial staging, invokes MedGemma 1.5 for narrative synthesis, and compiles draft PDF.
-
-### 4. Stage 6 REST API Router (`backend/app/routers/report.py`)
-- `GET /api/v1/stages/report/{case_id}`: Full Stage 6 synoptic payload.
-- `PUT /api/v1/stages/report/{case_id}`: Live debounced synoptic updates and reactive AJCC re-staging.
-- `POST /api/v1/stages/report/{case_id}/regenerate-narrative`: Re-synthesize narrative with MedGemma 1.5.
-- `GET /api/v1/stages/report/{case_id}/pdf`: Streams generated clinical PDF.
-- `GET /api/v1/stages/report/{case_id}/json`: Downloads structured CAP eCC / FHIR-compatible JSON.
-- `POST /api/v1/stages/report/sign`: Pathologist sign-off gate (credentials, legal attestation, cryptographic SHA-256 hash, case status $\to$ `done`).
-- `POST /api/v1/stages/report/amend`: Versioned amendment workflow (`v1.0` $\to$ `v1.1`).
-
-### 5. Pathologist Review Workspace (`frontend/components/viewer/ReportWorkspace.tsx`)
-- **Dynamic CAP Smart-Form**: Supports both **Core Needle Biopsy** and **Excision / Resection (Lumpectomy, Mastectomy)** protocols.
-- **Auto-Locked Stage 1-5 Diagnostic Chips**: Verified Nottingham Grade, Subtype, and Mitotic Rate.
-- **Live Reactive AJCC Staging Card**: Instantaneous recalculation on dimension or node changes.
-- **MedGemma Narrative Editor**: Section-by-section clinical findings narrative with live regeneration button.
-- **Pathologist Sign-Off Modal**: Attestation statement, NPI input, electronic signature, and amendment tracking.
-
----
-
-## 🧪 Verification & Validation Results
-
-### 1. Automated Backend Test Suite
-Executed the entire backend test suite:
+### 2. Backend Setup
 ```bash
-pytest backend/tests/ -v
-```
-**Result: 58/58 Passed (100% Pass Rate)**
-- `test_ajcc_pt_staging_cutoffs` ✅ PASSED (boundary values pTis, pT1mi, pT1a, pT1b, pT1c, pT2, pT3, pT4a/b/c)
-- `test_ajcc_pn_staging_cutoffs` ✅ PASSED (pNX, pN0, pN1mi, pN1a, pN2a, pN3a)
-- `test_ajcc_stage_group_matrix` ✅ PASSED (all stage group combinations)
-- `test_staging_invariant_violations` ✅ PASSED (asserts ValueError on node count discrepancy)
-- `test_narrative_consistency_guardrail` ✅ PASSED (asserts error on conflicting grade citation)
-- `test_clinical_pdf_generation` ✅ PASSED (asserts non-empty generated PDF)
-- `test_stage_6_full_workflow` ✅ PASSED (GET, PUT, regenerate, PDF streaming, JSON export, sign-off, amendment)
-- All 51 existing tests for Stages 1–5 ✅ PASSED
+# Navigate to backend directory
+cd backend
 
-### 2. Next.js Frontend Production Build
-```bash
-cd frontend && npm run build
+# Create and activate virtual environment
+python -m venv venv
+# Windows:
+.\venv\Scripts\Activate.ps1
+# Linux/macOS:
+source venv/bin/activate
+
+# Install Python dependencies
+pip install -r requirements.txt
+
+# Start FastAPI application server
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 ```
-**Result: Exit Code 0 (100% Clean Build)**
+
+### 3. Background Processing Worker
+In a separate terminal window:
+```bash
+cd backend
+python worker/main.py
+```
+
+### 4. Frontend Setup
+In a third terminal window:
+```bash
+cd frontend
+
+# Install Node dependencies
+npm install
+
+# Start Next.js development server
+npm run dev
+```
+
+### 5. Access the Web Application
+Open [http://localhost:3000](http://localhost:3000) in your browser.
 
 ---
 
-## 🚀 How to Run Locally
+## 🧪 Comprehensive Automated Test Suite
 
-1. **Start Backend Server**:
-   ```bash
-   cd backend
-   python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-   ```
-2. **Start Background Worker**:
-   ```bash
-   cd backend
-   python worker/main.py
-   ```
-3. **Start Web Frontend**:
-   ```bash
-   cd frontend
-   npm run dev
-   ```
-4. Open **http://localhost:3000** in your browser.
+Run the full end-to-end regression and mathematical invariant test suite:
+```bash
+cd backend
+pytest tests/ -v
+```
+
+### Test Coverage Summary (58/58 Tests Passing)
+* `tests/test_staging.py` (AJCC pT, pN, Stage Group matrix invariants, numerical consistency guardrails)
+* `tests/test_report.py` (ReportLab PDF generation, synoptic updates, digital attestation, versioned amendments)
+* `tests/test_grading.py` (MedGemma tubule, pleomorphism, pure code Nottingham aggregation, flags)
+* `tests/test_mitosis.py` (YOLO detection, virtual HPF spatial placement, mitotic rate thresholds)
+* `tests/test_triage_api.py` (Path Foundation embeddings, linear probe, KDE contouring)
+* `tests/test_stain.py` (Calibrated Macenko optical density deconvolution, color invariants)
+* `tests/test_tiles.py` (DeepZoom tile streaming, OpenSeadragon compatibility)
+
+---
+
+## 🔒 Security, Compliance & Auditability
+
+1. **Digital Attestation**: Final diagnostic sign-off is locked with the pathologist's credentials, NPI, and legal attestation text.
+2. **Cryptographic Checksums**: Generates a SHA-256 digest of all report parameters at the exact moment of signature.
+3. **Immutable Audit Ledger**: Every action (`case_created`, `qc_overridden`, `mitosis_reviewed`, `grade_approved`, `report_signed`, `report_amended`) is recorded in the `audit_events` table with user identity and timestamp.
+4. **Data Isolation**: 100% online cloud workflow utilizing partitioned Google Cloud Storage buckets (`oncogemma-dev-raw`, `oncogemma-dev-pyramids`, `oncogemma-dev-artifacts`).
+
+---
+
+## 📄 License
+
+This project is licensed under the Apache License, Version 2.0. See the [LICENSE](LICENSE) file for details.
