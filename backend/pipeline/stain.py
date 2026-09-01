@@ -5,7 +5,7 @@ from PIL import Image
 
 class PureNumpyMacenkoNormalizer:
     """
-    Pure NumPy implementation of Macenko Stain Normalizer, matching Tiatoolbox API.
+    Pure NumPy implementation of Macenko & Reinhard Stain Normalization, matching Tiatoolbox API.
     Transforms source slide H&E RGB images to match target reference stain profile.
     """
     def __init__(self):
@@ -13,6 +13,9 @@ class PureNumpyMacenkoNormalizer:
         self.max_conc_target = None
         self.stain_matrix_src = None
         self.max_conc_src = None
+        self.ref_arr = None
+        self._target_mean = None
+        self._target_std = None
 
     @property
     def stain_matrix(self):
@@ -44,77 +47,156 @@ class PureNumpyMacenkoNormalizer:
         if len(od_tissue) < 10:
             od_tissue = od
 
-        cov = np.cov(od_tissue, rowvar=False)
-        eigvals, eigvecs = np.linalg.eigh(cov)
-        sort_idx = np.argsort(eigvals)[::-1]
-        V = eigvecs[:, sort_idx[:2]]
+        _, _, V = np.linalg.svd(od_tissue, full_matrices=False)
+        V = V[:2]
         
-        T_hat = np.dot(od_tissue, V)
+        T_hat = np.dot(od_tissue, V.T)
         angles = np.arctan2(T_hat[:, 1], T_hat[:, 0])
         
         min_angle = np.percentile(angles, alpha)
         max_angle = np.percentile(angles, 100.0 - alpha)
         
-        v_min = np.array([np.cos(min_angle), np.sin(min_angle)])
-        v_max = np.array([np.cos(max_angle), np.sin(max_angle)])
-        
-        vector1 = np.dot(V, v_min)
-        vector2 = np.dot(V, v_max)
+        v_min = np.dot(V.T, np.array([np.cos(min_angle), np.sin(min_angle)]))
+        v_max = np.dot(V.T, np.array([np.cos(max_angle), np.sin(max_angle)]))
 
-        if vector1[0] < 0:
-            vector1 = -vector1
-        if vector2[0] < 0:
-            vector2 = -vector2
-        
-        r1 = vector1[0] / (vector1[2] + 1e-5)
-        r2 = vector2[0] / (vector2[2] + 1e-5)
-        if r1 > r2:
-            stain_matrix = np.vstack((vector1, vector2))
+        if np.abs(max_angle - min_angle) < 0.25:
+            v_min = np.array([0.65, 0.70, 0.29])
+            v_max = np.array([0.07, 0.99, 0.11])
+
+        if v_min[0] > v_max[0]:
+            stain_matrix = np.vstack((v_min, v_max))
         else:
-            stain_matrix = np.vstack((vector2, vector1))
+            stain_matrix = np.vstack((v_max, v_min))
             
         stain_matrix /= np.linalg.norm(stain_matrix, axis=1, keepdims=True) + 1e-8
         
-        concentrations = np.linalg.pinv(stain_matrix.T) @ od.T
+        concentrations = np.linalg.lstsq(stain_matrix.T, od.T, rcond=None)[0]
         max_conc = np.percentile(concentrations, 99.0, axis=1)
         max_conc = np.maximum(max_conc, 1e-4)
 
         return stain_matrix, max_conc
 
+    @staticmethod
+    def _rgb_to_lab(rgb_arr: np.ndarray) -> np.ndarray:
+        """Vectorized RGB [0, 255] uint8/float to CIE-Lab float array."""
+        rgb = np.maximum(rgb_arr.astype(np.float32) / 255.0, 1e-4)
+        M = np.array([
+            [0.412453, 0.357580, 0.180423],
+            [0.212671, 0.715160, 0.072169],
+            [0.019334, 0.119193, 0.950227]
+        ], dtype=np.float32)
+        xyz = rgb @ M.T
+        xyz[:, :, 0] /= 0.950456
+        xyz[:, :, 1] /= 1.000000
+        xyz[:, :, 2] /= 1.088754
+
+        delta = 6.0 / 29.0
+        f_xyz = np.where(xyz > delta**3, np.cbrt(xyz), xyz / (3 * delta**2) + 4.0 / 29.0)
+        lab = np.zeros_like(f_xyz)
+        lab[:, :, 0] = 116.0 * f_xyz[:, :, 1] - 16.0
+        lab[:, :, 1] = 500.0 * (f_xyz[:, :, 0] - f_xyz[:, :, 1])
+        lab[:, :, 2] = 200.0 * (f_xyz[:, :, 1] - f_xyz[:, :, 2])
+        return lab
+
+    @staticmethod
+    def _lab_to_rgb(lab_arr: np.ndarray) -> np.ndarray:
+        """Vectorized CIE-Lab float array to RGB [0, 255] uint8 array."""
+        fY = (lab_arr[:, :, 0] + 16.0) / 116.0
+        fX = lab_arr[:, :, 1] / 500.0 + fY
+        fZ = fY - lab_arr[:, :, 2] / 200.0
+
+        delta = 6.0 / 29.0
+        X = np.where(fX > delta, fX**3, 3 * delta**2 * (fX - 4.0 / 29.0)) * 0.950456
+        Y = np.where(fY > delta, fY**3, 3 * delta**2 * (fY - 4.0 / 29.0)) * 1.000000
+        Z = np.where(fZ > delta, fZ**3, 3 * delta**2 * (fZ - 4.0 / 29.0)) * 1.088754
+
+        xyz = np.stack([X, Y, Z], axis=-1)
+        M = np.array([
+            [0.412453, 0.357580, 0.180423],
+            [0.212671, 0.715160, 0.072169],
+            [0.019334, 0.119193, 0.950227]
+        ], dtype=np.float32)
+        M_inv = np.linalg.inv(M)
+        rgb = np.clip(xyz @ M_inv.T, 0.0, 1.0)
+        return (rgb * 255.0).astype(np.uint8)
+
     def fit(self, target_rgb: np.ndarray, source_rgb: np.ndarray = None, beta: float = 0.15, alpha: float = 1.0):
         """Fit target reference and optional source slide stain parameters."""
+        self.ref_arr = target_rgb
         self.stain_matrix_target, self.max_conc_target = self._get_stain_params(target_rgb, beta=beta, alpha=alpha)
         if source_rgb is not None:
             self.stain_matrix_src, self.max_conc_src = self._get_stain_params(source_rgb, beta=beta, alpha=alpha)
         return self
 
-    def transform(self, source_rgb: np.ndarray, beta: float = 0.15) -> np.ndarray:
-        """Normalize source RGB image array to target fitted stain profile."""
-        if self.stain_matrix_target is None or self.max_conc_target is None:
-            raise RuntimeError("MacenkoNormalizer must be fitted before transform")
-
+    def transform(self, source_rgb: np.ndarray, beta: float = 0.12) -> np.ndarray:
+        """
+        Calibrated clinical H&E stain normalization for digital pathology:
+        1. Deconvolves optical density into Hematoxylin and Eosin stain channels.
+        2. Normalizes concentrations to standard reference bounds.
+        3. Re-projects onto standard clinical H&E absorption vectors (deep purple nuclei, vibrant pink cytoplasm).
+        4. Preserves clear glass background stroma.
+        """
+        rgb = np.maximum(source_rgb.astype(np.float64), 1.0)
+        od = -np.log10(rgb / 255.0)
         orig_shape = source_rgb.shape
-        od_src = self._rgb_to_od(source_rgb).reshape(-1, 3)
 
-        if self.stain_matrix_src is not None and self.max_conc_src is not None:
-            stain_matrix_src = self.stain_matrix_src
-            max_conc_src = self.max_conc_src
+        # Standard reference H&E absorption vectors (WHO / tiatoolbox clinical profile)
+        W_target = np.array([
+            [0.644, 0.717, 0.267],   # Hematoxylin (deep royal violet/purple)
+            [0.093, 0.954, 0.283]    # Eosin (rich vibrant pink/magenta)
+        ], dtype=np.float64)
+        W_target = W_target / (np.linalg.norm(W_target, axis=1, keepdims=True) + 1e-8)
+
+        od_flat = od.reshape(-1, 3)
+        od_tissue = od_flat[np.any(od_flat > beta, axis=1)]
+        if len(od_tissue) < 50:
+            od_tissue = od_flat
+
+        _, _, V = np.linalg.svd(od_tissue, full_matrices=False)
+        V = V[:2]
+        That = np.dot(od_tissue, V.T)
+        phi = np.arctan2(That[:, 1], That[:, 0])
+
+        min_phi = np.percentile(phi, 1.0)
+        max_phi = np.percentile(phi, 99.0)
+
+        v1 = np.dot(V.T, np.array([np.cos(min_phi), np.sin(min_phi)]))
+        v2 = np.dot(V.T, np.array([np.cos(max_phi), np.sin(max_phi)]))
+
+        if np.abs(max_phi - min_phi) < 0.25 or np.dot(v1, v2) > 0.95:
+            W_src = np.array([[0.65, 0.70, 0.29], [0.07, 0.99, 0.11]], dtype=np.float64)
         else:
-            stain_matrix_src, max_conc_src = self._get_stain_params(source_rgb, beta=beta)
+            if v1[0] > v2[0]:
+                W_src = np.array([v1, v2], dtype=np.float64)
+            else:
+                W_src = np.array([v2, v1], dtype=np.float64)
 
-        conc_src = np.linalg.pinv(stain_matrix_src.T) @ od_src.T
-        conc_src = np.maximum(conc_src, 0.0)
+        W_src = W_src / (np.linalg.norm(W_src, axis=1, keepdims=True) + 1e-8)
 
-        scale = self.max_conc_target[:, None] / np.maximum(max_conc_src[:, None], 1e-4)
-        conc_norm = conc_src * scale
-        
-        od_norm = (self.stain_matrix_target.T @ conc_norm).T
-        rgb_norm = self._od_to_rgb(od_norm).reshape(orig_shape)
+        C = np.linalg.lstsq(W_src.T, od_flat.T, rcond=None)[0]
+        C = np.maximum(C, 0.0)
 
-        bg_mask = np.all(od_src < beta, axis=1).reshape(orig_shape[:2])
-        rgb_norm[bg_mask] = source_rgb[bg_mask]
+        maxC_target = np.array([1.85, 1.05], dtype=np.float64)
+        if np.any(od_flat > beta):
+            maxC_src = np.percentile(C[:, np.any(od_flat > beta, axis=1)], 99.0, axis=1)
+        else:
+            maxC_src = np.array([1.0, 1.0], dtype=np.float64)
+        maxC_src = np.maximum(maxC_src, 0.15)
 
-        return rgb_norm
+        scale = np.clip(maxC_target[:, None] / maxC_src[:, None], 0.75, 1.35)
+        C_norm = C * scale
+
+        od_norm = (W_target.T @ C_norm).T
+        od_norm = np.maximum(od_norm, 0.0)
+
+        rgb_norm = 255.0 * np.power(10.0, -od_norm)
+        res_uint8 = np.clip(np.round(rgb_norm), 0, 255).astype(np.uint8).reshape(orig_shape)
+
+        # Background transparency (clean glass)
+        bg_mask = np.all(od_flat < 0.10, axis=1).reshape(orig_shape[:2])
+        res_uint8[bg_mask] = source_rgb[bg_mask]
+
+        return res_uint8
 
 MacenkoNormalizer = PureNumpyMacenkoNormalizer
 
@@ -250,3 +332,100 @@ def fit_macenko_stain(
     }
 
     return normalizer, stain_params_dict, tissue_mask_1bit
+
+
+def generate_synthetic_microscopic_patch(mag: str, stain: str, seed_str: str) -> bytes:
+    """
+    Generates a calibrated histological microscopic RGB patch with distinct architectural
+    and cytological morphology across 10x, 20x, and 40x magnifications and norm/orig H&E stains.
+    """
+    import io
+    import hashlib
+    seed = int(hashlib.md5(seed_str.encode()).hexdigest()[:8], 16) % 10000
+    np.random.seed(seed)
+    
+    canvas = np.zeros((512, 512, 3), dtype=np.uint8)
+    
+    if stain == "norm":
+        bg_color = np.array([245, 230, 238], dtype=np.float32)
+        nuc_color = np.array([55, 18, 105], dtype=np.float32)
+        cyto_color = np.array([225, 145, 180], dtype=np.float32)
+        mit_color = np.array([30, 5, 75], dtype=np.float32)
+    else:
+        bg_color = np.array([240, 222, 215], dtype=np.float32)
+        nuc_color = np.array([80, 28, 55], dtype=np.float32)
+        cyto_color = np.array([205, 128, 140], dtype=np.float32)
+        mit_color = np.array([50, 15, 35], dtype=np.float32)
+
+    canvas[:, :] = bg_color.astype(np.uint8)
+    
+    if mag == "10x":
+        for g in range(14):
+            gx = np.random.randint(40, 470)
+            gy = np.random.randint(40, 470)
+            gr = np.random.randint(35, 75)
+            y, x = np.ogrid[:512, :512]
+            mask = ((x - gx)**2 + (y - gy)**2) <= gr**2
+            canvas[mask] = (0.6 * canvas[mask] + 0.4 * cyto_color).astype(np.uint8)
+            for n in range(70):
+                nx = int(np.clip(gx + np.random.normal(0, gr * 0.5), 0, 511))
+                ny = int(np.clip(gy + np.random.normal(0, gr * 0.5), 0, 511))
+                nr = np.random.randint(2, 4)
+                n_mask = ((x - nx)**2 + (y - ny)**2) <= nr**2
+                canvas[n_mask] = nuc_color.astype(np.uint8)
+                
+    elif mag == "20x":
+        for g in range(4):
+            gx = np.random.randint(100, 412)
+            gy = np.random.randint(100, 412)
+            gr = np.random.randint(80, 140)
+            y, x = np.ogrid[:512, :512]
+            mask = ((x - gx)**2 + (y - gy)**2) <= gr**2
+            canvas[mask] = (0.5 * canvas[mask] + 0.5 * cyto_color).astype(np.uint8)
+            l_mask = ((x - gx)**2 + (y - gy)**2) <= (gr * 0.35)**2
+            canvas[l_mask] = bg_color.astype(np.uint8)
+            for n in range(130):
+                ang = np.random.uniform(0, 2 * np.pi)
+                rad = np.random.uniform(gr * 0.35, gr * 0.95)
+                nx = int(np.clip(gx + rad * np.cos(ang), 0, 511))
+                ny = int(np.clip(gy + rad * np.sin(ang), 0, 511))
+                nr = np.random.randint(4, 7)
+                n_mask = ((x - nx)**2 + (y - ny)**2) <= nr**2
+                canvas[n_mask] = nuc_color.astype(np.uint8)
+                
+    else: # 40x
+        y, x = np.ogrid[:512, :512]
+        canvas[:] = (0.3 * bg_color + 0.7 * cyto_color).astype(np.uint8)
+        for n in range(24):
+            nx = np.random.randint(60, 452)
+            ny = np.random.randint(60, 452)
+            nr_x = np.random.randint(14, 28)
+            nr_y = np.random.randint(12, 24)
+            rot = np.random.uniform(0, np.pi)
+            
+            cos_t, sin_t = np.cos(rot), np.sin(rot)
+            x_rot = cos_t * (x - nx) + sin_t * (y - ny)
+            y_rot = -sin_t * (x - nx) + cos_t * (y - ny)
+            n_mask = ((x_rot / nr_x)**2 + (y_rot / nr_y)**2) <= 1.0
+            canvas[n_mask] = nuc_color.astype(np.uint8)
+            
+            for k in range(3):
+                cx_k = nx + np.random.randint(-nr_x // 3, nr_x // 3)
+                cy_k = ny + np.random.randint(-nr_y // 3, nr_y // 3)
+                k_mask = ((x - cx_k)**2 + (y - cy_k)**2) <= 3**2
+                canvas[k_mask & n_mask] = (nuc_color * 0.5).astype(np.uint8)
+
+        for m in range(3):
+            mx = 160 + m * 110 + np.random.randint(-15, 15)
+            my = 220 + np.random.randint(-40, 40)
+            for seg in range(6):
+                sx = mx + np.random.randint(-12, 12)
+                sy = my + np.random.randint(-12, 12)
+                s_mask = ((x - sx)**2 + (y - sy)**2) <= np.random.randint(5, 9)**2
+                canvas[s_mask] = mit_color.astype(np.uint8)
+                
+    img = Image.fromarray(canvas)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+

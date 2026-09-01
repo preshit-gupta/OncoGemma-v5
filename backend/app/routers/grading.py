@@ -7,18 +7,27 @@ patch image streaming, and clinical confirmation gate with mandatory dual-level 
 """
 
 import os
+import io
 import json
 import uuid
+import tempfile
+import shutil
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Literal
-from fastapi import APIRouter, Depends, HTTPException, status, Query
-from fastapi.responses import FileResponse
+import numpy as np
+from PIL import Image
+from fastapi import APIRouter, Depends, HTTPException, status, Query, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.core.gcs import get_local_cache_dir
+from app.core.gcs import (
+    get_gcs_client,
+    parse_gcs_uri,
+    download_blob_as_bytes,
+    download_blob_to_filename
+)
 from app.core.db import get_db
 from app.models.case import Case
 from app.models.slide import Slide
@@ -119,7 +128,7 @@ def _build_grading_stage_data_dict(
 
     if not grading_record or not grading_record.machine:
         hpf_sites = list(db.scalars(select(HpfSite).where(HpfSite.case_id == case_uid)).all())
-        total_mitoses = sum(h.mitotic_figure_count for h in hpf_sites) if hpf_sites else 0
+        total_mitoses = sum(getattr(h, "mitotic_count", 0) for h in hpf_sites) if hpf_sites else 0
         m_score = 1 if total_mitoses < 8 else (2 if total_mitoses < 16 else 3)
 
         return {
@@ -509,39 +518,34 @@ def review_grading_hpfs(payload: HpfReviewPayload, db: Session = Depends(get_db)
 @router.get("/{case_id}/patches/{patch_id}/image")
 def get_patch_image(case_id: str, patch_id: str, db: Session = Depends(get_db)):
     """
-    Stream the 512x512 normalized evidence patch PNG.
+    Stream the 512x512 normalized evidence patch PNG directly from GCS.
     Guarantees reliable high-speed streaming with on-demand extraction and fallback.
     """
-    cache_base = get_local_cache_dir()
-    patch_dir = os.path.join(cache_base, settings.GCS_ARTIFACTS_BUCKET, "cases", str(case_id), "grading_patches")
-    os.makedirs(patch_dir, exist_ok=True)
-    patch_path = os.path.join(patch_dir, f"{patch_id}.png")
-
-    if os.path.exists(patch_path):
-        return FileResponse(patch_path, media_type="image/png")
-
-    # Check alternate local paths
-    alt_dirs = [
-        os.path.join("gcs_cache", settings.GCS_ARTIFACTS_BUCKET, "cases", str(case_id), "grading_patches"),
-        f"D:/Projects/OncoGemma-v4.4 (Aug'26)/backend/gcs_cache/{settings.GCS_ARTIFACTS_BUCKET}/cases/{case_id}/grading_patches"
-    ]
-    for ad in alt_dirs:
-        ap = os.path.join(ad, f"{patch_id}.png")
-        if os.path.exists(ap):
-            return FileResponse(ap, media_type="image/png")
-
-    # Dynamic On-Demand Extraction from WSI
+    blob_name = f"cases/{case_id}/grading_patches/{patch_id}.png"
     try:
-        from worker.grading import find_slide_file, extract_10x_patch
+        patch_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, blob_name)
+        return Response(content=patch_bytes, media_type="image/png")
+    except Exception:
+        pass
+
+    # Dynamic On-Demand Extraction from WSI via transient scratch dir
+    scratch_dir = tempfile.mkdtemp(prefix="og_grading_patch_")
+    try:
+        from worker.grading import extract_10x_patch
         from pipeline.stain import PureNumpyMacenkoNormalizer
         import openslide
 
         case_uid = to_uuid(case_id)
         slide = db.scalars(select(Slide).where(Slide.case_id == case_uid)).first()
         slide_id = str(slide.id) if slide else "slide"
-        slide_path = find_slide_file(str(case_id), slide_id, getattr(slide, "local_path", None)) if slide else None
+        gcs_uri_original = getattr(slide, "gcs_uri_original", None) or f"gs://{settings.GCS_RAW_BUCKET}/cases/{case_id}/{slide_id}.svs"
+        raw_bucket_name, slide_blob = parse_gcs_uri(gcs_uri_original)
+        ext = os.path.splitext(slide_blob)[1] or ".svs"
+        local_slide_path = os.path.join(scratch_dir, f"slide{ext}")
 
-        if slide_path and os.path.exists(slide_path):
+        download_blob_to_filename(raw_bucket_name, slide_blob, local_slide_path)
+
+        if os.path.exists(local_slide_path):
             p_idx = 0
             if patch_id.startswith("p_") and patch_id[2:].isdigit():
                 p_idx = int(patch_id[2:]) - 1
@@ -566,7 +570,7 @@ def get_patch_image(case_id: str, patch_id: str, db: Session = Depends(get_db)):
                 cy_px = 18000 + row * 3000
 
             with OPENSLIDE_GLOBAL_LOCK:
-                oslide = openslide.OpenSlide(slide_path)
+                oslide = openslide.OpenSlide(local_slide_path)
                 raw_img = extract_10x_patch(
                     slide_obj=oslide,
                     center_x=cx_px,
@@ -586,10 +590,13 @@ def get_patch_image(case_id: str, patch_id: str, db: Session = Depends(get_db)):
                 norm_np = normalizer.transform(raw_np)
 
             norm_img = Image.fromarray(norm_np)
-            norm_img.save(patch_path, format="PNG", optimize=True)
-            return FileResponse(patch_path, media_type="image/png")
+            buf = io.BytesIO()
+            norm_img.save(buf, format="PNG")
+            return Response(content=buf.getvalue(), media_type="image/png")
     except Exception as e:
         print(f"[On-Demand Patch Extract Note for {case_id}/{patch_id}] {e}")
+    finally:
+        shutil.rmtree(scratch_dir, ignore_errors=True)
 
     # Fallback to high-definition histological synthetic patch
     rng = np.random.RandomState(hash(f"{case_id}_{patch_id}") % (2**32))
@@ -620,8 +627,9 @@ def get_patch_image(case_id: str, patch_id: str, db: Session = Depends(get_db)):
         n_color = (rng.randint(50, 90), rng.randint(20, 50), rng.randint(80, 120))
         draw.ellipse([nx - nr, ny - nr, nx + nr, ny + nr], fill=n_color)
 
-    pil_p.save(patch_path, format="PNG")
-    return FileResponse(patch_path, media_type="image/png")
+    buf = io.BytesIO()
+    pil_p.save(buf, format="PNG")
+    return Response(content=buf.getvalue(), media_type="image/png")
 
 
 
@@ -752,16 +760,24 @@ def confirm_grading_stage(payload: ConfirmGradingPayload, db: Session = Depends(
 
     # 8. Queue Stage 6 (Report Generation)
     next_exec = db.scalars(
-        select(StageExecution).where(StageExecution.case_id == case_uid, StageExecution.stage == "report")
+        select(StageExecution).where(
+            (StageExecution.case_id == case_uid) | (StageExecution.case_id == str(case_id)),
+            StageExecution.stage == "report"
+        )
     ).first()
     if not next_exec:
         next_exec = StageExecution(
-            case_id=case_id,
+            case_id=case_uid,
             stage="report",
             attempt=1,
             status="queued"
         )
         db.add(next_exec)
+    else:
+        next_exec.status = "queued"
+        next_exec.started_at = None
+        next_exec.completed_at = None
+        next_exec.error = None
 
     # 9. Record Audit Events
     audit_confirm = AuditEvent(

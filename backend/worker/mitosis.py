@@ -1,13 +1,10 @@
-"""
-Mitosis stage worker handler (v4.3 Mitosis Detection, Virtual HPFs, Mitotic Scoring).
-Extracts 40x tiles over confirmed Stage 3 tumor hotspots, runs YOLO high-recall sweeping,
-HoVer-Net nuclear instance verification, spatial FFT density convolution, greedy 10-HPF placement,
-and live Nottingham Mitotic Scoring.
-"""
 import os
+import io
 import json
 import math
 import yaml
+import tempfile
+import shutil
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple, Optional
 import numpy as np
@@ -16,7 +13,14 @@ from sqlalchemy import select, delete
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.core.gcs import get_local_cache_dir, get_gcs_artifact_direct_url
+from app.core.gcs import (
+    get_gcs_client,
+    parse_gcs_uri,
+    upload_blob_from_bytes,
+    download_blob_as_bytes,
+    download_blob_to_filename,
+    get_gcs_artifact_direct_url
+)
 from app.core.openslide_lock import OPENSLIDE_GLOBAL_LOCK
 from app.models.case import Case
 from app.models.slide import Slide
@@ -39,42 +43,6 @@ def load_mitosis_config() -> Dict[str, Any]:
         with open(cfg_path, "r", encoding="utf-8") as f:
             return yaml.safe_load(f)
     return {}
-
-
-def find_slide_file(case_id: str, slide_id: str, local_path: Optional[str] = None) -> Optional[str]:
-    """Finds the whole slide image file across all candidate locations."""
-    if local_path and os.path.exists(local_path):
-        return local_path
-
-    cache_base = get_local_cache_dir()
-    candidates = [
-        os.path.join(cache_base, settings.GCS_RAW_BUCKET, "cases", str(case_id), f"{slide_id}.svs"),
-        os.path.join(cache_base, settings.GCS_RAW_BUCKET, f"{slide_id}.svs"),
-        os.path.join("raw_uploads", f"{case_id}_{slide_id}.svs"),
-        os.path.abspath(os.path.join("..", "raw_uploads", f"{case_id}_{slide_id}.svs")),
-        f"D:/Projects/OncoGemma-v4.2 (Aug'26)/raw_uploads/{case_id}_{slide_id}.svs",
-        f"D:/Projects/OncoGemma-v4.3 (Aug'26)/raw_uploads/{case_id}_{slide_id}.svs"
-    ]
-
-    for p in candidates:
-        if os.path.exists(p):
-            return p
-
-    search_dirs = [
-        "raw_uploads",
-        os.path.abspath(os.path.join("..", "raw_uploads")),
-        "D:/Projects/OncoGemma-v4.2 (Aug'26)/raw_uploads",
-        "D:/Projects/OncoGemma-v4.3 (Aug'26)/raw_uploads",
-        os.path.join(cache_base, settings.GCS_RAW_BUCKET)
-    ]
-    for d in search_dirs:
-        if os.path.exists(d):
-            for root, _, files in os.walk(d):
-                for f in files:
-                    if (str(case_id) in f or str(slide_id) in f) and f.endswith((".svs", ".ndpi", ".tif", ".tiff")):
-                        return os.path.join(root, f)
-
-    return None
 
 
 def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
@@ -152,277 +120,372 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
                 "source": r.source
             })
 
-    cache_base = get_local_cache_dir()
-    mitosis_dir = os.path.join(cache_base, settings.GCS_ARTIFACTS_BUCKET, "cases", case_id, "mitosis")
-    crops_dir = os.path.join(mitosis_dir, "crops")
-    os.makedirs(crops_dir, exist_ok=True)
+    scratch_dir = tempfile.mkdtemp(prefix="og_mitosis_")
 
-    # Fallback to triage output.json if no DB hotspots found
-    if not hotspots:
-        triage_json_path = os.path.join(cache_base, settings.GCS_ARTIFACTS_BUCKET, "cases", case_id, "triage", "output.json")
-        if os.path.exists(triage_json_path):
-            with open(triage_json_path, "r", encoding="utf-8") as f:
-                t_data = json.load(f)
+    try:
+        # Fallback to triage output.json if no DB hotspots found
+        if not hotspots:
+            try:
+                t_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/triage/output.json")
+                t_data = json.loads(t_bytes.decode("utf-8"))
                 hotspots = [h for h in t_data.get("hotspots", []) if not h.get("excluded", False)]
+            except Exception:
+                pass
 
-    # If still no hotspots, construct default invasive margin region around center
-    if not hotspots:
-        center_x_um = (width_px * mpp_x) / 2.0
-        center_y_um = (height_px * mpp_y) / 2.0
-        r_box = 1000.0 # 1 mm box
-        default_poly = [
-            [center_x_um - r_box, center_y_um - r_box],
-            [center_x_um + r_box, center_y_um - r_box],
-            [center_x_um + r_box, center_y_um + r_box],
-            [center_x_um - r_box, center_y_um + r_box]
-        ]
-        hotspots.append({
-            "id": "hs_01",
-            "polygon_um": default_poly,
-            "area_mm2": 4.0,
-            "prob_mean": 0.85,
-            "prob_max": 0.95,
-            "source": "model"
-        })
+        # If still no hotspots, construct default invasive margin region around center
+        if not hotspots:
+            center_x_um = (width_px * mpp_x) / 2.0
+            center_y_um = (height_px * mpp_y) / 2.0
+            r_box = 1000.0 # 1 mm box
+            default_poly = [
+                [center_x_um - r_box, center_y_um - r_box],
+                [center_x_um + r_box, center_y_um - r_box],
+                [center_x_um + r_box, center_y_um + r_box],
+                [center_x_um - r_box, center_y_um + r_box]
+            ]
+            hotspots.append({
+                "id": "hs_01",
+                "polygon_um": default_poly,
+                "area_mm2": 4.0,
+                "prob_mean": 0.85,
+                "prob_max": 0.95,
+                "source": "model"
+            })
 
-    # Initialize detectors & verifiers
-    detector = YoloMitosisDetector(conf_threshold=det_thresh)
-    verifier = HoVerNetMitosisVerifier(threshold=ver_thresh)
+        # Initialize detectors & verifiers
+        detector = YoloMitosisDetector(conf_threshold=det_thresh)
+        verifier = HoVerNetMitosisVerifier(threshold=ver_thresh)
 
-    # Open slide for region reading if slide file exists
-    slide_file_path = find_slide_file(case_id, slide_id, getattr(slide_obj, "local_path", None))
-    openslide_slide = None
-    if slide_file_path and os.path.exists(slide_file_path):
+        # Download raw slide from GCS to transient scratch file for tile & crop sampling
+        gcs_uri_original = slide_obj.gcs_uri_original or f"gs://{settings.GCS_RAW_BUCKET}/cases/{case_id}/{slide_id}.svs"
+        raw_bucket_name, blob_name = parse_gcs_uri(gcs_uri_original)
+        ext = os.path.splitext(blob_name)[1] or ".svs"
+        local_slide_path = os.path.join(scratch_dir, f"slide{ext}")
+
+        openslide_slide = None
         try:
-            import openslide
-            with OPENSLIDE_GLOBAL_LOCK:
-                openslide_slide = openslide.OpenSlide(slide_file_path)
-                print(f"[Worker:Mitosis] Successfully opened SVS slide with OpenSlide from {slide_file_path}")
+            download_blob_to_filename(raw_bucket_name, blob_name, local_slide_path)
+            if os.path.exists(local_slide_path):
+                import openslide
+                with OPENSLIDE_GLOBAL_LOCK:
+                    openslide_slide = openslide.OpenSlide(local_slide_path)
+                    print(f"[Worker:Mitosis] Successfully opened SVS slide with OpenSlide from GCS {blob_name}")
         except Exception as e:
             print(f"[Worker:Mitosis Warning] Could not open slide with OpenSlide: {e}")
 
-    raw_candidates = []
-    cand_seq = 1
+        raw_candidates = []
+        cand_seq = 1
 
-    # Sweep each confirmed hotspot
-    for hs in hotspots:
-        poly_um = hs["polygon_um"]
-        tiles = enumerate_hotspot_tiles(poly_um, tile_size_px=tile_size_px, mpp=mpp_x, stride_px=stride_px)
+        # Sweep each confirmed hotspot
+        for hs in hotspots:
+            poly_um = hs["polygon_um"]
+            tiles = enumerate_hotspot_tiles(poly_um, tile_size_px=tile_size_px, mpp=mpp_x, stride_px=stride_px)
 
-        for tile in tiles:
-            tx_um, ty_um = tile["origin_um"]
-            tx_px, ty_px = tile["origin_px"]
+            for tile in tiles:
+                tx_um, ty_um = tile["origin_um"]
+                tx_px, ty_px = tile["origin_px"]
 
-            # Read tile RGB
-            tile_rgb = None
+                # Read tile RGB
+                tile_rgb = None
+                if openslide_slide is not None:
+                    try:
+                        with OPENSLIDE_GLOBAL_LOCK:
+                            tile_pil = openslide_slide.read_region((tx_px, ty_px), 0, (tile_size_px, tile_size_px)).convert("RGB")
+                            tile_rgb = np.array(tile_pil)
+                    except Exception as e:
+                        print(f"[Worker:Mitosis] OpenSlide read_region error at ({tx_px}, {ty_px}): {e}")
+
+                if tile_rgb is None:
+                    # Generate realistic synthetic high-power H&E tile for dev/mock environments
+                    np.random.seed(int(abs(tx_um * 17 + ty_um * 31)) % 10000)
+                    tile_rgb = np.full((tile_size_px, tile_size_px, 3), (235, 215, 230), dtype=np.uint8)
+                    for _ in range(15):
+                        nx_p = np.random.randint(32, tile_size_px - 32)
+                        ny_p = np.random.randint(32, tile_size_px - 32)
+                        tile_rgb[ny_p-8:ny_p+8, nx_p-8:nx_p+8] = (60, 20, 90)
+
+                # Detect mitotic candidates on tile
+                tile_preds = detector.detect(tile_rgb)
+
+                for cx_px, cy_px, det_conf in tile_preds:
+                    cand_cx_um = tx_um + (cx_px * mpp_x)
+                    cand_cy_um = ty_um + (cy_px * mpp_y)
+
+                    raw_candidates.append({
+                        "id": f"m_{cand_seq:04d}",
+                        "hotspot_id": hs["id"],
+                        "centroid_um": [float(cand_cx_um), float(cand_cy_um)],
+                        "det_conf": float(det_conf),
+                        "ver_conf": None,
+                        "label": "unreviewed",
+                        "label_source": "model"
+                    })
+                    cand_seq += 1
+
+        # Cross-tile Global Physical NMS
+        candidates = apply_global_nms(raw_candidates, nms_radius_um=nms_radius_um)
+        print(f"[Worker:Mitosis] Detected {len(raw_candidates)} candidates -> {len(candidates)} after {nms_radius_um}um NMS.")
+
+        # Second-Pass Verification & Crop Extraction (128x128 @ 0.25 um/px)
+        half_crop_px = crop_size_px // 2
+        for cand in candidates:
+            cx_um, cy_um = cand["centroid_um"]
+            cx_px = int(cx_um / mpp_x)
+            cy_px = int(cy_um / mpp_y)
+
+            crop_rgb = None
             if openslide_slide is not None:
                 try:
+                    top_left_x = max(0, cx_px - half_crop_px)
+                    top_left_y = max(0, cy_px - half_crop_px)
                     with OPENSLIDE_GLOBAL_LOCK:
-                        tile_pil = openslide_slide.read_region((tx_px, ty_px), 0, (tile_size_px, tile_size_px)).convert("RGB")
-                        tile_rgb = np.array(tile_pil)
+                        crop_pil = openslide_slide.read_region((top_left_x, top_left_y), 0, (crop_size_px, crop_size_px)).convert("RGB")
+                        crop_rgb = np.array(crop_pil)
                 except Exception as e:
-                    print(f"[Worker:Mitosis] OpenSlide read_region error at ({tx_px}, {ty_px}): {e}")
+                    print(f"[Worker:Mitosis] Crop extraction error for {cand['id']}: {e}")
 
-            if tile_rgb is None:
-                # Generate realistic synthetic high-power H&E tile for dev/mock environments
-                np.random.seed(int(abs(tx_um * 17 + ty_um * 31)) % 10000)
-                tile_rgb = np.full((tile_size_px, tile_size_px, 3), (235, 215, 230), dtype=np.uint8)
-                # Scatter simulated nuclei
-                for _ in range(15):
-                    nx_p = np.random.randint(32, tile_size_px - 32)
-                    ny_p = np.random.randint(32, tile_size_px - 32)
-                    # Mitotic figure signature: very dark purple clump
-                    tile_rgb[ny_p-8:ny_p+8, nx_p-8:nx_p+8] = (60, 20, 90)
+            if crop_rgb is None:
+                # Synthetic 128x128 crop
+                crop_rgb = np.full((crop_size_px, crop_size_px, 3), (230, 210, 225), dtype=np.uint8)
+                cy, cx = crop_size_px // 2, crop_size_px // 2
+                crop_rgb[cy-10:cy+10, cx-6:cx+6] = (45, 10, 80)
+                crop_rgb[cy-6:cy+6, cx-12:cx+12] = (50, 15, 85)
 
-            # Detect mitotic candidates on tile
-            tile_preds = detector.detect(tile_rgb)
+            # Run HoVer-Net nuclear instance verification
+            ver_conf, contour = verifier.verify(crop_rgb)
+            cand["ver_conf"] = float(ver_conf)
 
-            for cx_px, cy_px, det_conf in tile_preds:
-                cand_cx_um = tx_um + (cx_px * mpp_x)
-                cand_cy_um = ty_um + (cy_px * mpp_y)
+            if ver_conf >= ver_thresh:
+                cand["label"] = "mitosis"
+            elif ver_conf >= review_thresh or (cand["det_conf"] >= 0.70 and ver_conf >= 0.35):
+                cand["label"] = "unreviewed"
+            else:
+                cand["label"] = "not_mitosis"
 
-                raw_candidates.append({
-                    "id": f"m_{cand_seq:04d}",
-                    "hotspot_id": hs["id"],
-                    "centroid_um": [float(cand_cx_um), float(cand_cy_um)],
-                    "det_conf": float(det_conf),
-                    "ver_conf": None,
-                    "label": "unreviewed",
-                    "label_source": "model"
-                })
-                cand_seq += 1
+            # Prepare 128x128 crop PNGs for concurrent GCS upload
+            crop_id = cand["id"]
+            crop_pil = Image.fromarray(crop_rgb)
+            crop_buf = io.BytesIO()
+            crop_pil.save(crop_buf, format="PNG")
+            crop_bytes = crop_buf.getvalue()
 
-    # Cross-tile Global Physical NMS
-    candidates = apply_global_nms(raw_candidates, nms_radius_um=nms_radius_um)
-    print(f"[Worker:Mitosis] Detected {len(raw_candidates)} candidates -> {len(candidates)} after {nms_radius_um}um NMS.")
+            cand["_crop_bytes"] = crop_bytes
+            cand["crop_uri"] = f"gs://{settings.GCS_ARTIFACTS_BUCKET}/cases/{case_id}/mitosis/crops/{crop_id}.png"
+            cand["crop_orig_uri"] = f"gs://{settings.GCS_ARTIFACTS_BUCKET}/cases/{case_id}/mitosis/crops/{crop_id}_orig.png"
 
-    # Second-Pass Verification & Crop Extraction (128x128 @ 0.25 um/px)
-    half_crop_px = crop_size_px // 2
-    for cand in candidates:
-        cx_um, cy_um = cand["centroid_um"]
-        cx_px = int(cx_um / mpp_x)
-        cy_px = int(cy_um / mpp_y)
+        # Concurrently upload all crop PNGs to GCS
+        from concurrent.futures import ThreadPoolExecutor
 
-        crop_rgb = None
-        if openslide_slide is not None:
-            try:
-                top_left_x = max(0, cx_px - half_crop_px)
-                top_left_y = max(0, cy_px - half_crop_px)
-                with OPENSLIDE_GLOBAL_LOCK:
-                    crop_pil = openslide_slide.read_region((top_left_x, top_left_y), 0, (crop_size_px, crop_size_px)).convert("RGB")
-                    crop_rgb = np.array(crop_pil)
-            except Exception as e:
-                print(f"[Worker:Mitosis] Crop extraction error for {cand['id']}: {e}")
+        def _upload_single_crop(c_item):
+            c_id = c_item["id"]
+            c_data = c_item.pop("_crop_bytes", None)
+            if c_data:
+                upload_blob_from_bytes(
+                    settings.GCS_ARTIFACTS_BUCKET,
+                    f"cases/{case_id}/mitosis/crops/{c_id}.png",
+                    c_data,
+                    "image/png"
+                )
+                upload_blob_from_bytes(
+                    settings.GCS_ARTIFACTS_BUCKET,
+                    f"cases/{case_id}/mitosis/crops/{c_id}_orig.png",
+                    c_data,
+                    "image/png"
+                )
 
-        if crop_rgb is None:
-            # Synthetic 128x128 crop
-            crop_rgb = np.full((crop_size_px, crop_size_px, 3), (230, 210, 225), dtype=np.uint8)
-            # Draw central mitotic chromatin plate
-            cy, cx = crop_size_px // 2, crop_size_px // 2
-            crop_rgb[cy-10:cy+10, cx-6:cx+6] = (45, 10, 80)
-            crop_rgb[cy-6:cy+6, cx-12:cx+12] = (50, 15, 85)
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            list(pool.map(_upload_single_crop, candidates))
 
-        # Run HoVer-Net nuclear instance verification
-        ver_conf, contour = verifier.verify(crop_rgb)
-        cand["ver_conf"] = float(ver_conf)
+        # Compute bounding box for density map
+        all_xs = [c["centroid_um"][0] for c in candidates] or [0.0, float(width_px * mpp_x)]
+        all_ys = [c["centroid_um"][1] for c in candidates] or [0.0, float(height_px * mpp_y)]
+        bbox_um = (min(all_xs), min(all_ys), max(all_xs), max(all_ys))
 
-        # Assign initial label:
-        # - Definite mitosis: ver_conf >= ver_thresh (>=0.65)
-        # - Borderline / unreviewed: review_thresh <= ver_conf < ver_thresh (0.40 - 0.65)
-        # - Rejected non-mitotic figure: ver_conf < review_thresh (<0.40, e.g. apoptotic body, lymphocyte, resting nucleus)
-        if ver_conf >= ver_thresh:
-            cand["label"] = "mitosis"
-        elif ver_conf >= review_thresh or (cand["det_conf"] >= 0.70 and ver_conf >= 0.35):
-            cand["label"] = "unreviewed"
-        else:
-            cand["label"] = "not_mitosis"
+        # Spatial FFT Density Convolution
+        density_map, grid_meta = generate_mitosis_density_map(
+            candidates,
+            bounding_box_um=bbox_um,
+            grid_res_um=float(hpf_cfg.get("density_grid_res_um", 16.0)),
+            radius_um=radius_um
+        )
 
-        # Save normalized and original 128x128 crop PNGs
-        crop_id = cand["id"]
-        crop_norm_path = os.path.join(crops_dir, f"{crop_id}.png")
-        crop_orig_path = os.path.join(crops_dir, f"{crop_id}_orig.png")
+        # Greedy 10-HPF Placement with Overlap Relaxation Fallback
+        hotspot_polys = [h["polygon_um"] for h in hotspots]
+        hpfs = greedy_place_hpfs(
+            density_map,
+            grid_meta,
+            hotspot_polygons_um=hotspot_polys,
+            count=hpf_count,
+            radius_um=radius_um,
+            min_separation_um=float(hpf_cfg.get("min_separation_um", 524.0)),
+            relaxed_min_separation_um=float(hpf_cfg.get("relaxed_min_separation_um", 393.0))
+        )
 
-        crop_pil = Image.fromarray(crop_rgb)
-        crop_pil.save(crop_norm_path, format="PNG")
-        crop_pil.save(crop_orig_path, format="PNG")
-
-        cand["crop_uri"] = f"gs://{settings.GCS_ARTIFACTS_BUCKET}/cases/{case_id}/mitosis/crops/{crop_id}.png"
-        cand["crop_orig_uri"] = f"gs://{settings.GCS_ARTIFACTS_BUCKET}/cases/{case_id}/mitosis/crops/{crop_id}_orig.png"
-
-    # Close OpenSlide
-    if openslide_slide is not None:
+        # Pre-render and upload all 10 HPF patch variants (10x, 20x, 40x @ norm/orig) to GCS
+        stain_normalizer = None
         try:
-            with OPENSLIDE_GLOBAL_LOCK:
-                openslide_slide.close()
+            from pipeline.stain import PureNumpyMacenkoNormalizer
+            sp_text = download_blob_as_text(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/preprocess/stain_params.json")
+            sp_data = json.loads(sp_text)
+            if "stain_matrix" in sp_data and "max_concentrations" in sp_data:
+                stain_normalizer = PureNumpyMacenkoNormalizer()
+                stain_normalizer.stain_matrix_target = np.array(sp_data["stain_matrix"], dtype=float)
+                stain_normalizer.max_conc_target = np.array(sp_data["max_concentrations"], dtype=float)
         except Exception:
             pass
 
-    # Compute bounding box for density map
-    all_xs = [c["centroid_um"][0] for c in candidates] or [0.0, float(width_px * mpp_x)]
-    all_ys = [c["centroid_um"][1] for c in candidates] or [0.0, float(height_px * mpp_y)]
-    bbox_um = (min(all_xs), min(all_ys), max(all_xs), max(all_ys))
+        hpf_uploads = []
+        dim_w, dim_h = getattr(openslide_slide, "dimensions", (width_px, height_px)) if openslide_slide else (width_px, height_px)
 
-    # Spatial FFT Density Convolution
-    density_map, grid_meta = generate_mitosis_density_map(
-        candidates,
-        bounding_box_um=bbox_um,
-        grid_res_um=float(hpf_cfg.get("density_grid_res_um", 16.0)),
-        radius_um=radius_um
-    )
+        for hpf in hpfs:
+            hpf_seq = hpf["seq"]
+            h_cx_um, h_cy_um = hpf["center_um"]
+            h_cx_px = int(h_cx_um / mpp_x)
+            h_cy_px = int(h_cy_um / mpp_y)
 
-    # Greedy 10-HPF Placement with Overlap Relaxation Fallback
-    hotspot_polys = [h["polygon_um"] for h in hotspots]
-    hpfs = greedy_place_hpfs(
-        density_map,
-        grid_meta,
-        hotspot_polygons_um=hotspot_polys,
-        count=hpf_count,
-        radius_um=radius_um,
-        min_separation_um=float(hpf_cfg.get("min_separation_um", 524.0)),
-        relaxed_min_separation_um=float(hpf_cfg.get("relaxed_min_separation_um", 393.0))
-    )
+            for mag_name in ("10x", "20x", "40x"):
+                field_um = 128.0 if mag_name == "40x" else (256.0 if mag_name == "20x" else 512.0)
+                crop_w_px = max(1, int(round(field_um / mpp_x)))
+                crop_h_px = max(1, int(round(field_um / mpp_y)))
 
-    # Calculate HPF Mitotic Containment Counts
-    hpfs, total_mitoses_in_hpfs = calculate_hpf_mitosis_counts(candidates, hpfs)
+                patch_orig = None
+                if openslide_slide is not None:
+                    try:
+                        with OPENSLIDE_GLOBAL_LOCK:
+                            x0 = max(0, min(dim_w - crop_w_px, h_cx_px - crop_w_px // 2))
+                            y0 = max(0, min(dim_h - crop_h_px, h_cy_px - crop_h_px // 2))
+                            patch_orig = openslide_slide.read_region((x0, y0), 0, (crop_w_px, crop_h_px)).convert("RGB")
+                    except Exception:
+                        patch_orig = None
 
-    # Calculate Nottingham Mitotic Score
-    scoring_summary = compute_nottingham_mitotic_score(
-        count_total=total_mitoses_in_hpfs,
-        n_hpf=len(hpfs),
-        radius_um=radius_um
-    )
+                if patch_orig is None:
+                    from pipeline.stain import generate_synthetic_microscopic_patch
+                    orig_bytes = generate_synthetic_microscopic_patch(mag_name, "orig", f"hpf_{case_id}_{hpf_seq}_{mag_name}_orig")
+                    norm_bytes = generate_synthetic_microscopic_patch(mag_name, "norm", f"hpf_{case_id}_{hpf_seq}_{mag_name}_norm")
+                else:
+                    patch_orig_512 = patch_orig.resize((512, 512), Image.Resampling.BILINEAR)
+                    buf_o = io.BytesIO()
+                    patch_orig_512.save(buf_o, "PNG")
+                    orig_bytes = buf_o.getvalue()
 
-    # Persist to Database (detections & hpf_sites tables)
-    db.execute(delete(Detection).where(Detection.case_id == case_obj.id))
-    db.execute(delete(HpfSite).where(HpfSite.case_id == case_obj.id))
+                    patch_norm_512 = patch_orig_512
+                    if stain_normalizer:
+                        try:
+                            norm_arr = stain_normalizer.transform(np.array(patch_orig_512))
+                            patch_norm_512 = Image.fromarray(norm_arr)
+                        except Exception:
+                            patch_norm_512 = patch_orig_512
 
-    for cand in candidates:
-        det_row = Detection(
-            id=cand["id"],
-            case_id=case_obj.id,
-            hotspot_id=cand.get("hotspot_id"),
-            centroid_um=cand["centroid_um"],
-            det_conf=cand.get("det_conf"),
-            ver_conf=cand.get("ver_conf"),
-            label=cand.get("label", "unreviewed"),
-            label_source=cand.get("label_source", "model"),
-            crop_uri=cand.get("crop_uri"),
-            crop_orig_uri=cand.get("crop_orig_uri")
+                    buf_n = io.BytesIO()
+                    patch_norm_512.save(buf_n, "PNG")
+                    norm_bytes = buf_n.getvalue()
+
+                hpf_uploads.append((f"cases/{case_id}/mitosis/hpfs/hpf_{hpf_seq}_{mag_name}_orig.png", orig_bytes))
+                hpf_uploads.append((f"cases/{case_id}/mitosis/hpfs/hpf_{hpf_seq}_{mag_name}_norm.png", norm_bytes))
+
+        def _upload_hpf_item(item):
+            b_path, b_data = item
+            upload_blob_from_bytes(settings.GCS_ARTIFACTS_BUCKET, b_path, b_data, "image/png")
+
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            list(pool.map(_upload_hpf_item, hpf_uploads))
+
+        # Close OpenSlide
+        if openslide_slide is not None:
+            try:
+                with OPENSLIDE_GLOBAL_LOCK:
+                    openslide_slide.close()
+            except Exception:
+                pass
+
+        # Calculate HPF Mitotic Containment Counts
+        hpfs, total_mitoses_in_hpfs = calculate_hpf_mitosis_counts(candidates, hpfs)
+
+        # Calculate Nottingham Mitotic Score
+        scoring_summary = compute_nottingham_mitotic_score(
+            count_total=total_mitoses_in_hpfs,
+            n_hpf=len(hpfs),
+            radius_um=radius_um
         )
-        db.add(det_row)
 
-    for hpf in hpfs:
-        hpf_row = HpfSite(
-            case_id=case_obj.id,
-            seq=hpf["seq"],
-            center_um=hpf["center_um"],
-            radius_um=hpf["radius_um"],
-            mitotic_count=hpf["count"],
-            source=hpf.get("source", "model"),
-            image_patch_uri=None
-        )
-        db.add(hpf_row)
+        # Persist to Database (detections & hpf_sites tables)
+        db.execute(delete(Detection).where(Detection.case_id == case_obj.id))
+        db.execute(delete(HpfSite).where(HpfSite.case_id == case_obj.id))
 
-    # Build output.json structure
-    model_versions = {
-        "detector": detector.model_version,
-        "verifier": verifier.model_version
-    }
+        for cand in candidates:
+            det_row = Detection(
+                id=cand["id"],
+                case_id=case_obj.id,
+                hotspot_id=cand.get("hotspot_id"),
+                centroid_um=cand["centroid_um"],
+                det_conf=cand.get("det_conf"),
+                ver_conf=cand.get("ver_conf"),
+                label=cand.get("label", "unreviewed"),
+                label_source=cand.get("label_source", "model"),
+                crop_uri=cand.get("crop_uri"),
+                crop_orig_uri=cand.get("crop_orig_uri")
+            )
+            db.add(det_row)
 
-    output_payload = {
-        "case_id": case_id,
-        "stage_execution_id": str(stage_exec.id),
-        "candidates": candidates,
-        "hpfs": hpfs,
-        "summary": scoring_summary,
-        "grid": grid_meta,
-        "model_versions": model_versions
-    }
+        for hpf in hpfs:
+            hpf_row = HpfSite(
+                case_id=case_obj.id,
+                seq=hpf["seq"],
+                center_um=hpf["center_um"],
+                radius_um=hpf["radius_um"],
+                mitotic_count=hpf["count"],
+                source=hpf.get("source", "model"),
+                image_patch_uri=None
+            )
+            db.add(hpf_row)
 
-    output_json_path = os.path.join(mitosis_dir, "output.json")
-    with open(output_json_path, "w", encoding="utf-8") as f:
-        json.dump(output_payload, f, indent=2)
-
-    output_uri = f"gs://{settings.GCS_ARTIFACTS_BUCKET}/cases/{case_id}/mitosis/output.json"
-    stage_exec.status = "awaiting_review"
-    stage_exec.output_ref = output_uri
-    stage_exec.model_versions = model_versions
-
-    # Record Audit Event
-    audit = AuditEvent(
-        case_id=case_id,
-        actor="system",
-        event_type="stage_output",
-        stage="mitosis",
-        payload={
-            "candidates_count": len(candidates),
-            "hpfs_count": len(hpfs),
-            "summary": scoring_summary
+        # Build output.json structure
+        model_versions = {
+            "detector": detector.model_version,
+            "verifier": verifier.model_version
         }
-    )
-    db.add(audit)
-    db.commit()
 
-    print(f"[Worker:Mitosis] Completed Stage 4 for case {case_id}: {len(candidates)} candidates, {len(hpfs)} HPFs, Mitotic Score {scoring_summary['mitotic_score']} ({scoring_summary['per_mm2']} mitoses/mm²).")
+        output_payload = {
+            "case_id": case_id,
+            "stage_execution_id": str(stage_exec.id),
+            "candidates": candidates,
+            "hpfs": hpfs,
+            "summary": scoring_summary,
+            "grid": grid_meta,
+            "model_versions": model_versions
+        }
 
-    return output_uri, model_versions
+        # Upload output.json directly to GCS artifacts bucket
+        upload_blob_from_bytes(
+            settings.GCS_ARTIFACTS_BUCKET,
+            f"cases/{case_id}/mitosis/output.json",
+            json.dumps(output_payload, indent=2).encode("utf-8"),
+            "application/json"
+        )
+
+        output_uri = f"gs://{settings.GCS_ARTIFACTS_BUCKET}/cases/{case_id}/mitosis/output.json"
+        stage_exec.status = "awaiting_review"
+        stage_exec.output_ref = output_uri
+        stage_exec.model_versions = model_versions
+
+        # Record Audit Event
+        audit = AuditEvent(
+            case_id=case_id,
+            actor="system",
+            event_type="stage_output",
+            stage="mitosis",
+            payload={
+                "candidates_count": len(candidates),
+                "hpfs_count": len(hpfs),
+                "summary": scoring_summary
+            }
+        )
+        db.add(audit)
+        db.commit()
+
+        print(f"[Worker:Mitosis] Completed Stage 4 for case {case_id}: {len(candidates)} candidates, {len(hpfs)} HPFs, Mitotic Score {scoring_summary['mitotic_score']} ({scoring_summary['per_mm2']} mitoses/mm²).")
+
+        return output_uri, model_versions
+
+    finally:
+        shutil.rmtree(scratch_dir, ignore_errors=True)

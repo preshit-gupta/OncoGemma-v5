@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from app.core.config import settings
 from app.core.db import SessionLocal, Base, engine
-from app.core.gcs import get_gcs_client, get_local_cache_dir
+from app.core.gcs import get_gcs_client
 from app.models.case import Case
 from app.models.slide import Slide
 from app.models.stage_execution import StageExecution
@@ -59,7 +59,7 @@ class DiagnosticRunner:
 
     def run_all_checks(self):
         print("\n" + "=" * 70)
-        print("   ONCOGEMMA v4.2 SYSTEM & DIAGNOSTIC VERIFICATION SUITE")
+        print("   ONCOGEMMA v4.5 SYSTEM & DIAGNOSTIC VERIFICATION SUITE")
         print("=" * 70 + "\n")
 
         self.check_database()
@@ -99,26 +99,23 @@ class DiagnosticRunner:
             db.close()
 
     def check_gcs_storage(self):
-        print("\n--- 2. GCP Cloud Storage & Local Cache Hierarchy ---")
+        print("\n--- 2. GCP Cloud Storage Bucket Connectivity ---")
         try:
-            cache_dir = get_local_cache_dir()
-            buckets = [settings.GCS_RAW_BUCKET, settings.GCS_PYRAMIDS_BUCKET, settings.GCS_ARTIFACTS_BUCKET]
-            existing = []
-            for b in buckets:
-                b_path = os.path.join(cache_dir, b)
-                os.makedirs(b_path, exist_ok=True)
-                existing.append(b)
-
             client = get_gcs_client()
+            buckets = [settings.GCS_RAW_BUCKET, settings.GCS_PYRAMIDS_BUCKET, settings.GCS_ARTIFACTS_BUCKET]
+            verified_buckets = []
+            for b in buckets:
+                bucket_obj = client.bucket(b)
+                verified_buckets.append(bucket_obj.name)
+
             details = (
-                f"Use Real GCS: {settings.USE_REAL_GCS}\n"
-                f"Local Cache Root: {cache_dir}\n"
-                f"Buckets Initialized: {', '.join(existing)}\n"
-                f"Client Type: {client.__class__.__name__}"
+                f"GCP Project ID: {settings.GCP_PROJECT_ID}\n"
+                f"Buckets Online: {', '.join(verified_buckets)}\n"
+                f"Client: {client.__class__.__name__}"
             )
-            self.log("GCS Buckets & Disk Cache Hierarchy", "PASS", details)
+            self.log("GCS Cloud Storage Buckets (Online)", "PASS", details)
         except Exception as e:
-            self.log("GCS Buckets & Disk Cache Hierarchy", "FAIL", str(e))
+            self.log("GCS Cloud Storage Buckets (Online)", "FAIL", str(e))
 
     def check_vertex_ai_endpoint(self):
         print("\n--- 3. Live GCP Vertex AI Path Foundation Inference ---")

@@ -79,7 +79,7 @@ export default function CaseWorkspacePage({ params }: { params: { id: string } }
         setActiveStage("grading");
       } else if (mitosisStage && (mitosisStage.status === "running" || mitosisStage.status === "done" || mitosisStage.status === "confirmed" || mitosisStage.status === "awaiting_review")) {
         setActiveStage("mitosis");
-      } else if (triageStage && (triageStage.status === "running" || triageStage.status === "done" || triageStage.status === "confirmed" || triageStage.status === "awaiting_review") && prepStage?.status === "confirmed") {
+      } else if (triageStage && (triageStage.status === "running" || triageStage.status === "done" || triageStage.status === "confirmed" || triageStage.status === "awaiting_review") && (prepStage?.status === "confirmed" || prepStage?.status === "done")) {
         setActiveStage("triage");
       } else if (prepStage && (prepStage.status === "running" || prepStage.status === "done" || prepStage.status === "confirmed" || prepStage.status === "awaiting_review" || prepStage.status === "queued")) {
         setActiveStage("preprocess");

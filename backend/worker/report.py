@@ -1,20 +1,21 @@
-"""
-Stage 6 Background Worker Handler: CAP-Compliant Synoptic Reporting.
-
-Aggregates confirmed Stage 1-5 diagnostic outputs, computes initial deterministic AJCC staging,
-invokes MedGemma 1.5 for multi-section narrative synthesis, generates institutional clinical PDF,
-and persists Report record awaiting pathologist sign-off.
-"""
-
 import os
+import io
+import json
 import asyncio
+import tempfile
+import shutil
 from typing import Tuple, Dict, Any
 from datetime import datetime, timezone
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.core.gcs import get_local_cache_dir
+from app.core.gcs import (
+    get_gcs_client,
+    upload_blob_from_bytes,
+    download_blob_as_bytes,
+    download_blob_to_filename
+)
 from app.models.stage_execution import StageExecution
 from app.models.case import Case
 from app.models.slide import Slide
@@ -36,7 +37,12 @@ from pipeline.report_pdf import generate_clinical_cap_pdf
 
 def run_report(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str, str]]:
     """
-    Executes Stage 6 (Report Generation) pipeline.
+    Executes Stage 6 (Report Generation) pipeline:
+    1. Gathers clinical, grading, and staging parameters.
+    2. Runs MedGemma CAP-compliant synoptic report generation.
+    3. Renders high-fidelity clinical PDF using GCS-backed evidence assets.
+    4. Uploads final PDF directly to GCS artifacts bucket.
+    5. Cleans up temporary scratch directory.
     """
     case_id = str(stage_exec.case_id)
     case_uid = stage_exec.case_id
@@ -137,71 +143,112 @@ def run_report(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str, 
     )
     report_record.narrative = narrative_dict
 
-    # 5. Locate Evidence Paths for PDF Generation
-    cache_base = get_local_cache_dir()
-    case_cache_dir = os.path.join(cache_base, settings.GCS_ARTIFACTS_BUCKET, "cases", case_id)
-    pdf_out_path = os.path.join(case_cache_dir, "report", f"CAP_Report_{case_id[:8]}.pdf")
-    
-    evidence_paths = {
-        "heatmap": os.path.join(case_cache_dir, "triage", "heatmap.png"),
-        "mitotic_hpf": os.path.join(case_cache_dir, "mitosis_crops", "hpf_1.png"),
-        "grading_patch": os.path.join(case_cache_dir, "grading_patches", "p_1.png")
-    }
+    # 5. Generate Clinical PDF via temporary scratch directory
+    scratch_dir = tempfile.mkdtemp(prefix="og_report_")
 
-    report_render_dict = {
-        "case_id": case_id,
-        "procedure": report_record.procedure,
-        "laterality": report_record.laterality,
-        "tumor_site": report_record.tumor_site,
-        "histologic_type": report_record.histologic_type,
-        "tumor_size_mm": tumor_size,
-        "lvi_status": report_record.lvi_status,
-        "dcis_present": report_record.dcis_present,
-        "margins": report_record.margins,
-        "lymph_nodes": report_record.lymph_nodes,
-        "biomarkers": report_record.biomarkers,
-        "staging": report_record.staging,
-        "nottingham_grade": case_summary_payload["nottingham_grade"],
-        "narrative": narrative_dict,
-        "status": report_record.status,
-        "signed_by": report_record.signed_by,
-        "npi": report_record.npi,
-        "signed_at": report_record.signed_at.isoformat() if report_record.signed_at else None,
-        "integrity_hash": report_record.integrity_hash
-    }
+    try:
+        pdf_filename = f"CAP_Report_{case_id[:8]}.pdf"
+        pdf_out_path = os.path.join(scratch_dir, pdf_filename)
+        
+        # Download evidence files if available in GCS
+        evidence_paths = {}
+        try:
+            hm_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/triage/heatmap_triage.png")
+            hm_path = os.path.join(scratch_dir, "heatmap.png")
+            with open(hm_path, "wb") as f:
+                f.write(hm_bytes)
+            evidence_paths["heatmap"] = hm_path
+        except Exception:
+            pass
 
-    generate_clinical_cap_pdf(
-        report_data=report_render_dict,
-        output_path=pdf_out_path,
-        evidence_paths=evidence_paths
-    )
+        try:
+            hpf_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/mitosis/crops/m_0001.png")
+            hpf_path = os.path.join(scratch_dir, "mitotic_hpf.png")
+            with open(hpf_path, "wb") as f:
+                f.write(hpf_bytes)
+            evidence_paths["mitotic_hpf"] = hpf_path
+        except Exception:
+            pass
 
-    report_record.pdf_path = pdf_out_path
-    stage_exec.status = "awaiting_review"
+        try:
+            patch_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/grading_patches/p_001.png")
+            patch_path = os.path.join(scratch_dir, "grading_patch.png")
+            with open(patch_path, "wb") as f:
+                f.write(patch_bytes)
+            evidence_paths["grading_patch"] = patch_path
+        except Exception:
+            pass
 
-    # Audit event
-    audit_evt = AuditEvent(
-        case_id=case_id,
-        actor="system_worker",
-        event_type="stage_6_report_drafted",
-        stage="report",
-        payload={
-            "status": "awaiting_review",
-            "pt_stage": pt_stage,
-            "pn_stage": pn_stage,
-            "stage_group": stage_grp,
-            "pdf_path": pdf_out_path
+        report_render_dict = {
+            "case_id": case_id,
+            "procedure": report_record.procedure,
+            "laterality": report_record.laterality,
+            "tumor_site": report_record.tumor_site,
+            "histologic_type": report_record.histologic_type,
+            "tumor_size_mm": tumor_size,
+            "lvi_status": report_record.lvi_status,
+            "dcis_present": report_record.dcis_present,
+            "margins": report_record.margins,
+            "lymph_nodes": report_record.lymph_nodes,
+            "biomarkers": report_record.biomarkers,
+            "staging": report_record.staging,
+            "nottingham_grade": case_summary_payload["nottingham_grade"],
+            "narrative": narrative_dict,
+            "status": report_record.status,
+            "signed_by": report_record.signed_by,
+            "npi": report_record.npi,
+            "signed_at": report_record.signed_at.isoformat() if report_record.signed_at else None,
+            "integrity_hash": report_record.integrity_hash
         }
-    )
-    db.add(audit_evt)
-    db.commit()
 
-    model_versions = {
-        "medgemma": "1.5",
-        "prompt_cap_report": prompt_hash[:12],
-        "cap_checklist": "2026.06",
-        "ajcc": "8th/9th"
-    }
+        generate_clinical_cap_pdf(
+            report_data=report_render_dict,
+            output_path=pdf_out_path,
+            evidence_paths=evidence_paths
+        )
 
-    print(f"[Stage 6 Worker] Report generation completed for Case {case_id}. Ready for Pathologist Review.")
-    return pdf_out_path, model_versions
+        with open(pdf_out_path, "rb") as pdf_file:
+            pdf_content = pdf_file.read()
+
+        gcs_pdf_path = f"cases/{case_id}/report/{pdf_filename}"
+        upload_blob_from_bytes(
+            settings.GCS_ARTIFACTS_BUCKET,
+            gcs_pdf_path,
+            pdf_content,
+            "application/pdf"
+        )
+
+        gcs_pdf_uri = f"gs://{settings.GCS_ARTIFACTS_BUCKET}/{gcs_pdf_path}"
+        report_record.pdf_path = gcs_pdf_uri
+        stage_exec.status = "awaiting_review"
+        stage_exec.output_ref = gcs_pdf_uri
+
+        # Audit event
+        audit_evt = AuditEvent(
+            case_id=case_id,
+            actor="system_worker",
+            event_type="stage_6_report_drafted",
+            stage="report",
+            payload={
+                "status": "awaiting_review",
+                "pt_stage": pt_stage,
+                "pn_stage": pn_stage,
+                "stage_group": stage_grp,
+                "pdf_path": gcs_pdf_uri
+            }
+        )
+        db.add(audit_evt)
+        db.commit()
+
+        model_versions = {
+            "medgemma": "1.5",
+            "prompt_cap_report": prompt_hash[:12],
+            "cap_checklist": "2026.06",
+            "ajcc": "8th/9th"
+        }
+
+        print(f"[Stage 6 Worker] Report generation completed for Case {case_id}. Uploaded to GCS {gcs_pdf_uri}. Ready for Pathologist Review.")
+        return gcs_pdf_uri, model_versions
+
+    finally:
+        shutil.rmtree(scratch_dir, ignore_errors=True)

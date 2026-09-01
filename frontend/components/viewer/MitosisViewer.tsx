@@ -461,7 +461,7 @@ export function MitosisViewer({
     );
   }
 
-  const opticalPatchUrl = `${API_BASE}/api/v1/stages/mitosis/${caseId}/hpfs/${activeHpf?.seq || 1}/thumbnail?mag=40x&stain=${stainMode}`;
+  const opticalPatchUrl = `${API_BASE}/api/v1/stages/mitosis/${caseId}/hpfs/${activeHpf?.seq || 1}/thumbnail?mag=40x&stain=${stainMode}&v=1.2`;
   const wholeSlideThumbnailUrl = `${API_BASE}/api/v1/cases/${caseId}/thumbnail`;
 
   return (
@@ -532,25 +532,6 @@ export function MitosisViewer({
               title="View Standardized Density & Area Math"
             >
               <Info className="w-4 h-4" />
-            </button>
-
-            {/* Confirm Stage 4 Button */}
-            <button
-              onClick={handleConfirmStage}
-              disabled={submitting || unreviewedHighConf > 0}
-              className={`px-4 py-1.5 rounded-lg text-xs font-bold flex items-center gap-2 transition-all shadow-md ${
-                unreviewedHighConf > 0
-                  ? "bg-slate-800 text-slate-500 border border-slate-700 cursor-not-allowed"
-                  : "bg-emerald-600 hover:bg-emerald-500 text-white shadow-emerald-900/30 active:scale-95"
-              }`}
-            >
-              {submitting ? (
-                <Loader2 className="w-4 h-4 animate-spin" />
-              ) : (
-                <CheckCircle2 className="w-4 h-4" />
-              )}
-              Confirm Stage 4 & Proceed
-              <ArrowRight className="w-3.5 h-3.5" />
             </button>
           </div>
         </div>
@@ -838,6 +819,7 @@ export function MitosisViewer({
                 {/* 40x High-Res Optical Patch Container */}
                 <div className="relative w-[520px] h-[520px] rounded-2xl overflow-hidden shadow-2xl border-2 border-slate-700 bg-slate-900 flex items-center justify-center">
                   <img
+                    key={`${caseId}-${activeHpf?.seq || 1}-${stainMode}`}
                     src={opticalPatchUrl}
                     alt={`HPF ${activeHpfSeq} 40x View`}
                     className="w-full h-full object-cover select-none pointer-events-none"
@@ -848,11 +830,11 @@ export function MitosisViewer({
 
                   {/* SVG Microscopic Reticle Circle & Candidate Mitosis Markers Overlay */}
                   <svg className="absolute inset-0 w-full h-full pointer-events-none">
-                    {/* Standardized HPF Boundary (524 µm / 0.2157 mm2) */}
+                    {/* Standardized HPF Boundary (524 µm / 0.2157 mm2) with comfortable margin */}
                     <circle
                       cx="260"
                       cy="260"
-                      r="258"
+                      r="236"
                       fill="none"
                       stroke="#10b981"
                       strokeWidth="2"
@@ -860,9 +842,9 @@ export function MitosisViewer({
                       className="drop-shadow-md"
                     />
                     
-                    {/* Crosshairs */}
-                    <line x1="260" y1="4" x2="260" y2="516" stroke="rgba(16, 185, 129, 0.25)" strokeWidth="1" />
-                    <line x1="4" y1="260" x2="516" y2="260" stroke="rgba(16, 185, 129, 0.25)" strokeWidth="1" />
+                    {/* Crosshairs inside reticle */}
+                    <line x1="260" y1="24" x2="260" y2="496" stroke="rgba(16, 185, 129, 0.25)" strokeWidth="1" />
+                    <line x1="24" y1="260" x2="496" y2="260" stroke="rgba(16, 185, 129, 0.25)" strokeWidth="1" />
 
                     {/* Reticle Central Dot */}
                     <circle cx="260" cy="260" r="2.5" fill="#10b981" />
@@ -874,9 +856,11 @@ export function MitosisViewer({
                       const dx_um = cand.centroid_um[0] - cx;
                       const dy_um = cand.centroid_um[1] - cy;
                       
-                      // 524 µm field size maps exactly to 520 px canvas (Dead-center alignment)
-                      const pxX = 260 + (dx_um / 524.0) * 520.0;
-                      const pxY = 260 + (dy_um / 524.0) * 520.0;
+                      // Precise physical radius to pixel reticle mapping (262 µm -> 236 px)
+                      const reticleRadiusPx = 236.0;
+                      const hpfRadiusUm = activeHpf.radius_um || 262.0;
+                      const pxX = 260 + (dx_um / hpfRadiusUm) * reticleRadiusPx;
+                      const pxY = 260 + (dy_um / hpfRadiusUm) * reticleRadiusPx;
 
                       const isSelected = cand.id === selectedCandidateId;
                       const color = cand.label === "mitosis" ? "#10b981" : (cand.label === "not_mitosis" ? "#64748b" : "#f59e0b");
@@ -933,36 +917,60 @@ export function MitosisViewer({
                 </div>
 
                 {/* Picture-in-Picture Macro Biopsy Minimap (Never lose position sense) */}
-                <div className="absolute bottom-6 left-6 bg-slate-900/95 backdrop-blur-md rounded-xl p-2.5 border border-slate-800 shadow-2xl flex flex-col gap-1.5 w-40 select-none">
+                <div className="absolute bottom-6 left-6 bg-slate-900/95 backdrop-blur-md rounded-xl p-2.5 border border-slate-800 shadow-2xl flex flex-col gap-1.5 w-44 select-none z-10">
                   <div className="flex items-center justify-between text-[10px] font-bold text-slate-300 uppercase tracking-wider">
                     <span className="flex items-center gap-1.5 text-sky-400">
                       <MapPin className="w-3.5 h-3.5" /> Biopsy Location
                     </span>
                     <span className="text-slate-500 font-mono text-[9px]">Field #{activeHpfSeq}</span>
                   </div>
-                  <div className="relative w-full h-40 bg-slate-950 rounded-lg overflow-hidden border border-slate-800 flex items-center justify-center">
-                    <img
-                      src={wholeSlideThumbnailUrl}
-                      alt="Biopsy overview"
-                      className="w-full h-full object-contain pointer-events-none"
-                      onError={(e) => {
-                        (e.target as HTMLImageElement).src = `data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160"><rect width="100%" height="100%" fill="%230f172a"/><text x="50%" y="50%" fill="%2394a3b8" text-anchor="middle" font-size="10">Biopsy Core</text></svg>`;
-                      }}
-                    />
-                    {/* Active HPF Beacon on Minimap */}
-                    {activeHpf && (
-                      <div
-                        className="absolute transform -translate-x-1/2 -translate-y-1/2 pointer-events-none"
-                        style={{
-                          left: `${Math.min(92, Math.max(8, (activeHpf.center_um[0] / ((data?.slide?.width_px || imageWidthPx) * (data?.slide?.mpp_x || mppX))) * 100))}%`,
-                          top: `${Math.min(92, Math.max(8, (activeHpf.center_um[1] / ((data?.slide?.height_px || imageHeightPx) * (data?.slide?.mpp_y || mppY))) * 100))}%`
-                        }}
-                      >
-                        <div className="w-4 h-4 rounded-full bg-emerald-400 border-2 border-white shadow-[0_0_12px_#10b981] animate-pulse flex items-center justify-center">
-                          <div className="w-1.5 h-1.5 rounded-full bg-slate-950" />
+                  <div className="relative w-full h-44 bg-slate-950 rounded-lg overflow-hidden border border-slate-800 flex items-center justify-center p-1">
+                    {(() => {
+                      const slideW = data?.slide?.width_px || imageWidthPx || 20000;
+                      const slideH = data?.slide?.height_px || imageHeightPx || 20000;
+                      const mppXVal = data?.slide?.mpp_x || mppX || 0.25;
+                      const mppYVal = data?.slide?.mpp_y || mppY || 0.25;
+                      const totalSlideW_um = slideW * mppXVal;
+                      const totalSlideH_um = slideH * mppYVal;
+                      const slideAspect = slideW / slideH;
+
+                      const beaconLeftPct = activeHpf
+                        ? Math.min(96, Math.max(4, (activeHpf.center_um[0] / totalSlideW_um) * 100))
+                        : 50;
+                      const beaconTopPct = activeHpf
+                        ? Math.min(96, Math.max(4, (activeHpf.center_um[1] / totalSlideH_um) * 100))
+                        : 50;
+
+                      return (
+                        <div
+                          className="relative h-full max-w-full flex items-center justify-center"
+                          style={{ aspectRatio: `${slideAspect}` }}
+                        >
+                          <img
+                            src={wholeSlideThumbnailUrl}
+                            alt="Biopsy overview"
+                            className="w-full h-full object-fill rounded pointer-events-none"
+                            onError={(e) => {
+                              (e.target as HTMLImageElement).src = `data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160"><rect width="100%" height="100%" fill="%230f172a"/><text x="50%" y="50%" fill="%2394a3b8" text-anchor="middle" font-size="10">Biopsy Core</text></svg>`;
+                            }}
+                          />
+                          {/* Active HPF Beacon on Minimap */}
+                          {activeHpf && (
+                            <div
+                              className="absolute transform -translate-x-1/2 -translate-y-1/2 pointer-events-none z-10"
+                              style={{
+                                left: `${beaconLeftPct}%`,
+                                top: `${beaconTopPct}%`
+                              }}
+                            >
+                              <div className="w-4 h-4 rounded-full bg-emerald-400 border-2 border-white shadow-[0_0_12px_#10b981] animate-pulse flex items-center justify-center">
+                                <div className="w-1.5 h-1.5 rounded-full bg-slate-950" />
+                              </div>
+                            </div>
+                          )}
                         </div>
-                      </div>
-                    )}
+                      );
+                    })()}
                   </div>
                 </div>
               </div>

@@ -1,25 +1,26 @@
-"""
-FastAPI Router for Stage 6: CAP-Compliant Synoptic Reporting (v4.5).
-
-Provides endpoints for retrieving synoptic reports, live reactive updating of gross/surgical/biomarker
-elements with deterministic AJCC re-staging, MedGemma narrative re-synthesis, PDF streaming,
-structured JSON export, digital pathologist sign-off & attestation, and formal amendment tracking.
-"""
-
 import os
+import io
 import json
 import uuid
 import hashlib
+import tempfile
+import shutil
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Literal
-from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import APIRouter, Depends, HTTPException, status, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.core.gcs import get_local_cache_dir
+from app.core.gcs import (
+    get_gcs_client,
+    parse_gcs_uri,
+    upload_blob_from_bytes,
+    download_blob_as_bytes,
+    blob_exists
+)
 from app.core.db import get_db
 from app.models.case import Case
 from app.models.slide import Slide
@@ -152,6 +153,96 @@ def _ensure_report_record(case_uid: uuid.UUID, db: Session) -> Report:
     return report
 
 
+def render_and_upload_report_pdf(case_id: str, report: Report, grading: Optional[Grading], db: Session) -> str:
+    """Renders CAP PDF via transient scratch directory and uploads directly to GCS."""
+    scratch_dir = tempfile.mkdtemp(prefix="og_pdf_")
+    try:
+        pdf_filename = f"CAP_Report_{str(case_id)[:8]}.pdf"
+        pdf_scratch_path = os.path.join(scratch_dir, pdf_filename)
+
+        ng_data = {
+            "grade": grading.grade if grading and grading.grade else 2,
+            "tubule_score": grading.tubule_score if grading and grading.tubule_score else 2,
+            "tubule_percent": grading.tubule_percent if grading and grading.tubule_percent is not None else 45.0,
+            "pleo_score": grading.pleo_score if grading and grading.pleo_score else 2,
+            "mitotic_score": grading.mitotic_score if grading and grading.mitotic_score else 2,
+            "nottingham_sum": grading.nottingham_sum if grading and grading.nottingham_sum else 6
+        }
+
+        render_dict = {
+            "case_id": str(case_id),
+            "procedure": report.procedure,
+            "laterality": report.laterality,
+            "tumor_site": report.tumor_site,
+            "histologic_type": report.histologic_type,
+            "tumor_size_mm": report.tumor_size_mm,
+            "lvi_status": report.lvi_status,
+            "dcis_present": report.dcis_present,
+            "margins": report.margins,
+            "lymph_nodes": report.lymph_nodes,
+            "biomarkers": report.biomarkers,
+            "staging": report.staging,
+            "nottingham_grade": ng_data,
+            "narrative": report.narrative,
+            "status": report.status,
+            "signed_by": report.signed_by,
+            "npi": report.npi,
+            "signed_at": report.signed_at.isoformat() if report.signed_at else None,
+            "integrity_hash": report.integrity_hash
+        }
+
+        evidence_paths = {}
+        try:
+            hm_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/triage/heatmap_triage.png")
+            hm_p = os.path.join(scratch_dir, "heatmap.png")
+            with open(hm_p, "wb") as f:
+                f.write(hm_bytes)
+            evidence_paths["heatmap"] = hm_p
+        except Exception:
+            pass
+
+        try:
+            hpf_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/mitosis/crops/m_0001.png")
+            hpf_p = os.path.join(scratch_dir, "mitotic_hpf.png")
+            with open(hpf_p, "wb") as f:
+                f.write(hpf_bytes)
+            evidence_paths["mitotic_hpf"] = hpf_p
+        except Exception:
+            pass
+
+        try:
+            patch_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/grading_patches/p_001.png")
+            gp_p = os.path.join(scratch_dir, "grading_patch.png")
+            with open(gp_p, "wb") as f:
+                f.write(patch_bytes)
+            evidence_paths["grading_patch"] = gp_p
+        except Exception:
+            pass
+
+        generate_clinical_cap_pdf(
+            report_data=render_dict,
+            output_path=pdf_scratch_path,
+            evidence_paths=evidence_paths
+        )
+
+        with open(pdf_scratch_path, "rb") as f:
+            pdf_bytes = f.read()
+
+        gcs_blob_name = f"cases/{case_id}/report/{pdf_filename}"
+        upload_blob_from_bytes(
+            settings.GCS_ARTIFACTS_BUCKET,
+            gcs_blob_name,
+            pdf_bytes,
+            "application/pdf"
+        )
+        gcs_uri = f"gs://{settings.GCS_ARTIFACTS_BUCKET}/{gcs_blob_name}"
+        report.pdf_path = gcs_uri
+        db.commit()
+        return gcs_uri
+    finally:
+        shutil.rmtree(scratch_dir, ignore_errors=True)
+
+
 def _build_report_response_dict(case_id: str, db: Session) -> Dict[str, Any]:
     case_uid = to_uuid(case_id)
     case = db.scalars(select(Case).where(Case.id == case_uid)).first()
@@ -195,9 +286,6 @@ def _build_report_response_dict(case_id: str, db: Session) -> Dict[str, Any]:
         "stage_group": stage_grp
     }
 
-    cache_base = get_local_cache_dir()
-    case_cache_dir = os.path.join(cache_base, settings.GCS_ARTIFACTS_BUCKET, "cases", str(case_id))
-
     return {
         "case_id": str(case_id),
         "slide_id": str(slide.id) if slide else None,
@@ -218,9 +306,9 @@ def _build_report_response_dict(case_id: str, db: Session) -> Dict[str, Any]:
         "nottingham_grade": ng_data,
         "narrative": report.narrative,
         "visual_evidence": {
-            "has_heatmap": os.path.exists(os.path.join(case_cache_dir, "triage", "heatmap.png")),
-            "has_mitotic_hpf": os.path.exists(os.path.join(case_cache_dir, "mitosis_crops", "hpf_1.png")),
-            "has_grading_patch": os.path.exists(os.path.join(case_cache_dir, "grading_patches", "p_1.png"))
+            "has_heatmap": blob_exists(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/triage/heatmap_triage.png") or blob_exists(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/triage/heatmap.png"),
+            "has_mitotic_hpf": blob_exists(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/mitosis/crops/m_0001.png"),
+            "has_grading_patch": blob_exists(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/grading_patches/p_001.png")
         },
         "pdf_url": f"/api/v1/stages/report/{case_id}/pdf",
         "json_url": f"/api/v1/stages/report/{case_id}/json",
@@ -239,20 +327,23 @@ def _build_report_response_dict(case_id: str, db: Session) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 @router.get("/{case_id}")
-def get_report_stage_data(case_id: str, db: Session = Depends(get_db)):
+def get_report_data(case_id: str, db: Session = Depends(get_db)):
     """
-    Retrieve full Stage 6 CAP Synoptic Report data.
+    Retrieve current synoptic report state, verified grading data, staging, narrative, and PDF status.
     """
     return _build_report_response_dict(case_id, db)
 
 
+@router.post("/update")
 @router.put("/{case_id}")
-def update_report_stage_data(payload: UpdateReportPayload, db: Session = Depends(get_db)):
+def update_report_data(payload: UpdateReportPayload, db: Session = Depends(get_db)):
     """
-    Update draft synoptic fields & trigger live deterministic AJCC re-staging.
+    Live reactive update of synoptic gross, margin, nodal, and biomarker inputs.
+    Automatically recalculates AJCC staging, marks status as 'in_review', and updates PDF in GCS.
     """
     case_uid = to_uuid(payload.case_id)
     report = _ensure_report_record(case_uid, db)
+    grading = db.scalars(select(Grading).where(Grading.case_id == case_uid)).first()
 
     if report.status == "signed":
         raise HTTPException(
@@ -260,6 +351,7 @@ def update_report_stage_data(payload: UpdateReportPayload, db: Session = Depends
             detail="Report is already signed and locked. Please use the /amend endpoint to submit a formal versioned amendment."
         )
 
+    # Update gross / clinical fields
     if payload.specimen_type is not None:
         report.specimen_type = payload.specimen_type
     if payload.procedure is not None:
@@ -283,7 +375,7 @@ def update_report_stage_data(payload: UpdateReportPayload, db: Session = Depends
     if payload.narrative is not None:
         report.narrative = payload.narrative
 
-    # Deterministic Staging Update
+    # Recalculate AJCC Staging
     tumor_size = report.tumor_size_mm or 18.0
     nodes_info = report.lymph_nodes or {}
     n_exam = nodes_info.get("examined_count", 0)
@@ -305,57 +397,87 @@ def update_report_stage_data(payload: UpdateReportPayload, db: Session = Depends
     db.commit()
     db.refresh(report)
 
-    # Re-render PDF in background/cache
+    # Re-render and upload PDF to GCS
     try:
-        cache_base = get_local_cache_dir()
-        case_cache_dir = os.path.join(cache_base, settings.GCS_ARTIFACTS_BUCKET, "cases", str(payload.case_id))
-        pdf_out_path = os.path.join(case_cache_dir, "report", f"CAP_Report_{str(payload.case_id)[:8]}.pdf")
-        
-        grading = db.scalars(select(Grading).where(Grading.case_id == case_uid)).first()
-        ng_data = {
-            "grade": grading.grade if grading and grading.grade else 2,
-            "tubule_score": grading.tubule_score if grading and grading.tubule_score else 2,
-            "tubule_percent": grading.tubule_percent if grading and grading.tubule_percent is not None else 45.0,
-            "pleo_score": grading.pleo_score if grading and grading.pleo_score else 2,
-            "mitotic_score": grading.mitotic_score if grading and grading.mitotic_score else 2,
-            "nottingham_sum": grading.nottingham_sum if grading and grading.nottingham_sum else 6
-        }
-        
-        render_dict = {
-            "case_id": str(payload.case_id),
-            "procedure": report.procedure,
-            "laterality": report.laterality,
-            "tumor_site": report.tumor_site,
-            "histologic_type": report.histologic_type,
-            "tumor_size_mm": report.tumor_size_mm,
-            "lvi_status": report.lvi_status,
-            "dcis_present": report.dcis_present,
-            "margins": report.margins,
-            "lymph_nodes": report.lymph_nodes,
-            "biomarkers": report.biomarkers,
-            "staging": report.staging,
-            "nottingham_grade": ng_data,
-            "narrative": report.narrative,
-            "status": report.status,
-            "signed_by": report.signed_by,
-            "npi": report.npi,
-            "signed_at": report.signed_at.isoformat() if report.signed_at else None,
-            "integrity_hash": report.integrity_hash
-        }
-        
-        generate_clinical_cap_pdf(
-            report_data=render_dict,
-            output_path=pdf_out_path,
-            evidence_paths={
-                "heatmap": os.path.join(case_cache_dir, "triage", "heatmap.png"),
-                "mitotic_hpf": os.path.join(case_cache_dir, "mitosis_crops", "hpf_1.png"),
-                "grading_patch": os.path.join(case_cache_dir, "grading_patches", "p_1.png")
-            }
-        )
-        report.pdf_path = pdf_out_path
-        db.commit()
+        render_and_upload_report_pdf(str(payload.case_id), report, grading, db)
     except Exception as e:
-        print(f"[PDF Render Note] {e}")
+        print(f"[Update PDF Render Note] {e}")
+
+    return _build_report_response_dict(payload.case_id, db)
+
+
+@router.post("/resynthesize-narrative")
+def resynthesize_narrative(payload: UpdateReportPayload, db: Session = Depends(get_db)):
+    """
+    Triggers grounded narrative re-generation via MedGemma 1.5.
+    """
+    case_uid = to_uuid(payload.case_id)
+    report = _ensure_report_record(case_uid, db)
+    grading = db.scalars(select(Grading).where(Grading.case_id == case_uid)).first()
+
+    if report.status == "signed":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot modify a signed report narrative directly. Use amendment workflow."
+        )
+
+    # Aggregate latest context payload
+    ng_data = {
+        "grade": grading.grade if grading and grading.grade else 2,
+        "tubule_score": grading.tubule_score if grading and grading.tubule_score else 2,
+        "tubule_percent": grading.tubule_percent if grading and grading.tubule_percent is not None else 45.0,
+        "pleo_score": grading.pleo_score if grading and grading.pleo_score else 2,
+        "mitotic_score": grading.mitotic_score if grading and grading.mitotic_score else 2,
+        "nottingham_sum": grading.nottingham_sum if grading and grading.nottingham_sum else 6
+    }
+
+    tumor_size = payload.tumor_size_mm or report.tumor_size_mm or 18.0
+    nodes_info = (payload.lymph_nodes.model_dump() if payload.lymph_nodes else report.lymph_nodes) or {}
+    n_exam = nodes_info.get("examined_count", 0)
+    n_pos = nodes_info.get("positive_count", 0)
+
+    pt_stage = calculate_ajcc_pt_stage(tumor_size)
+    pn_stage = calculate_ajcc_pn_stage(n_exam, n_pos)
+    stage_grp = calculate_ajcc_stage_group(pt_stage, pn_stage)
+
+    staging_dict = {
+        "ajcc_version": "8th/9th Edition",
+        "pt_stage": pt_stage,
+        "pn_stage": pn_stage,
+        "pm_stage": "cM0",
+        "stage_group": stage_grp
+    }
+
+    case_summary = {
+        "case_id": str(payload.case_id),
+        "procedure": payload.procedure or report.procedure,
+        "laterality": payload.laterality or report.laterality,
+        "tumor_site": payload.tumor_site or report.tumor_site,
+        "histologic_type": report.histologic_type,
+        "tumor_size_mm": tumor_size,
+        "lvi_status": payload.lvi_status or report.lvi_status,
+        "nottingham_grade": ng_data,
+        "staging": staging_dict,
+        "biomarkers": payload.biomarkers.model_dump() if payload.biomarkers else report.biomarkers
+    }
+
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+    prompt_tpl, _ = load_prompt_template("cap_report", "v1")
+    medgemma = MedGemmaClient()
+    new_narrative = loop.run_until_complete(
+        medgemma.generate_cap_report_narrative(case_summary, prompt_tpl)
+    )
+
+    report.narrative = new_narrative
+    report.status = "in_review"
+    db.commit()
+    db.refresh(report)
 
     return _build_report_response_dict(payload.case_id, db)
 
@@ -411,63 +533,40 @@ async def regenerate_report_narrative(case_id: str, db: Session = Depends(get_db
 @router.get("/{case_id}/pdf")
 def get_report_pdf(case_id: str, db: Session = Depends(get_db)):
     """
-    Stream server-generated clinical PDF report.
+    Stream server-generated clinical PDF report directly from GCS.
     """
     case_uid = to_uuid(case_id)
     report = _ensure_report_record(case_uid, db)
+    grading = db.scalars(select(Grading).where(Grading.case_id == case_uid)).first()
 
-    cache_base = get_local_cache_dir()
-    case_cache_dir = os.path.join(cache_base, settings.GCS_ARTIFACTS_BUCKET, "cases", str(case_id))
-    pdf_path = report.pdf_path or os.path.join(case_cache_dir, "report", f"CAP_Report_{str(case_id)[:8]}.pdf")
-
-    if not os.path.exists(pdf_path):
-        grading = db.scalars(select(Grading).where(Grading.case_id == case_uid)).first()
-        ng_data = {
-            "grade": grading.grade if grading and grading.grade else 2,
-            "tubule_score": grading.tubule_score if grading and grading.tubule_score else 2,
-            "tubule_percent": grading.tubule_percent if grading and grading.tubule_percent is not None else 45.0,
-            "pleo_score": grading.pleo_score if grading and grading.pleo_score else 2,
-            "mitotic_score": grading.mitotic_score if grading and grading.mitotic_score else 2,
-            "nottingham_sum": grading.nottingham_sum if grading and grading.nottingham_sum else 6
-        }
-        render_dict = {
-            "case_id": str(case_id),
-            "procedure": report.procedure,
-            "laterality": report.laterality,
-            "tumor_site": report.tumor_site,
-            "histologic_type": report.histologic_type,
-            "tumor_size_mm": report.tumor_size_mm,
-            "lvi_status": report.lvi_status,
-            "dcis_present": report.dcis_present,
-            "margins": report.margins,
-            "lymph_nodes": report.lymph_nodes,
-            "biomarkers": report.biomarkers,
-            "staging": report.staging,
-            "nottingham_grade": ng_data,
-            "narrative": report.narrative,
-            "status": report.status,
-            "signed_by": report.signed_by,
-            "npi": report.npi,
-            "signed_at": report.signed_at.isoformat() if report.signed_at else None,
-            "integrity_hash": report.integrity_hash
-        }
-        generate_clinical_cap_pdf(
-            report_data=render_dict,
-            output_path=pdf_path,
-            evidence_paths={
-                "heatmap": os.path.join(case_cache_dir, "triage", "heatmap.png"),
-                "mitotic_hpf": os.path.join(case_cache_dir, "mitosis_crops", "hpf_1.png"),
-                "grading_patch": os.path.join(case_cache_dir, "grading_patches", "p_1.png")
-            }
+    blob_name = f"cases/{case_id}/report/CAP_Report_{str(case_id)[:8]}.pdf"
+    try:
+        pdf_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, blob_name)
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'inline; filename="CAP_Report_{str(case_id)[:8]}.pdf"'}
         )
+    except Exception:
+        pass
 
-    return FileResponse(pdf_path, media_type="application/pdf", filename=f"CAP_Report_{str(case_id)[:8]}.pdf")
+    # Generate on the fly and upload to GCS
+    try:
+        render_and_upload_report_pdf(str(case_id), report, grading, db)
+        pdf_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, blob_name)
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'inline; filename="CAP_Report_{str(case_id)[:8]}.pdf"'}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to render PDF: {e}")
 
 
 @router.get("/{case_id}/json")
 def get_report_json(case_id: str, db: Session = Depends(get_db)):
     """
-    Download structured CAP eCC / FHIR-compatible JSON payload.
+    Export full synoptic report in HL7/FHIR-compliant structured JSON format.
     """
     data = _build_report_response_dict(case_id, db)
     headers = {"Content-Disposition": f"attachment; filename=CAP_Synoptic_{str(case_id)[:8]}.json"}
@@ -475,25 +574,46 @@ def get_report_json(case_id: str, db: Session = Depends(get_db)):
 
 
 @router.post("/sign")
-def sign_and_finalize_report(payload: SignReportPayload, db: Session = Depends(get_db)):
+def sign_final_report(payload: SignReportPayload, db: Session = Depends(get_db)):
     """
-    Pathologist Sign-Off Gate:
-    Enforces mandatory digital attestation and credentials, computes SHA-256 integrity hash,
-    locks report to 'signed', advances Case status to 'done', marks StageExecution as 'confirmed'.
+    Pathologist Digital Sign-Off & Attestation Gate.
+    Calculates cryptographic SHA-256 integrity hash over all elements, seals report,
+    advances Stage 6 status to 'completed', and logs full immutable audit event.
     """
     case_uid = to_uuid(payload.case_id)
     report = _ensure_report_record(case_uid, db)
     case = db.scalars(select(Case).where(Case.id == case_uid)).first()
-    if not case:
-        raise HTTPException(status_code=404, detail=f"Case {payload.case_id} not found")
+    grading = db.scalars(select(Grading).where(Grading.case_id == case_uid)).first()
+
+    if report.status == "signed":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Report is already finalized and signed. Use the amendment endpoint if modifications are required."
+        )
 
     now_utc = datetime.now(timezone.utc)
     now_iso = now_utc.isoformat()
 
-    # Generate cryptographic SHA-256 integrity hash
-    hash_payload = f"{payload.case_id}_{payload.signed_by}_{now_iso}_{json.dumps(report.staging)}_{json.dumps(report.narrative)}"
-    integrity_hash = hashlib.sha256(hash_payload.encode("utf-8")).hexdigest()
+    # Compute Cryptographic SHA-256 Integrity Hash over all synoptic elements
+    canonical_payload = {
+        "case_id": str(payload.case_id),
+        "procedure": report.procedure,
+        "laterality": report.laterality,
+        "histologic_type": report.histologic_type,
+        "tumor_size_mm": report.tumor_size_mm,
+        "margins": report.margins,
+        "lymph_nodes": report.lymph_nodes,
+        "biomarkers": report.biomarkers,
+        "staging": report.staging,
+        "narrative": report.narrative,
+        "signed_by": payload.signed_by,
+        "npi": payload.npi,
+        "signed_at": now_iso
+    }
+    canonical_str = json.dumps(canonical_payload, sort_keys=True, separators=(',', ':'))
+    integrity_hash = hashlib.sha256(canonical_str.encode('utf-8')).hexdigest()
 
+    # Seal report
     report.status = "signed"
     report.signed_by = payload.signed_by
     report.npi = payload.npi
@@ -501,18 +621,19 @@ def sign_and_finalize_report(payload: SignReportPayload, db: Session = Depends(g
     report.signed_at = now_utc
     report.integrity_hash = integrity_hash
 
-    # Advance Case status to done
-    case.status = "done"
+    if case:
+        case.status = "done"
 
-    # Advance StageExecution to confirmed
+    # Advance stage execution to completed
     stage_exec = db.scalars(
         select(StageExecution).where(StageExecution.case_id == case_uid, StageExecution.stage == "report")
     ).first()
     if stage_exec:
         stage_exec.status = "confirmed"
         stage_exec.completed_at = now_utc
+        stage_exec.reviewed_at = now_utc
+        stage_exec.reviewed_by = payload.signed_by
 
-    # Audit log
     audit_evt = AuditEvent(
         case_id=str(payload.case_id),
         actor=payload.signed_by,
@@ -532,55 +653,9 @@ def sign_and_finalize_report(payload: SignReportPayload, db: Session = Depends(g
     db.commit()
     db.refresh(report)
 
-    # Re-render finalized PDF with signature block
+    # Re-render finalized PDF with signature block and upload to GCS
     try:
-        cache_base = get_local_cache_dir()
-        case_cache_dir = os.path.join(cache_base, settings.GCS_ARTIFACTS_BUCKET, "cases", str(payload.case_id))
-        pdf_out_path = os.path.join(case_cache_dir, "report", f"CAP_Report_{str(payload.case_id)[:8]}.pdf")
-        
-        grading = db.scalars(select(Grading).where(Grading.case_id == case_uid)).first()
-        ng_data = {
-            "grade": grading.grade if grading and grading.grade else 2,
-            "tubule_score": grading.tubule_score if grading and grading.tubule_score else 2,
-            "tubule_percent": grading.tubule_percent if grading and grading.tubule_percent is not None else 45.0,
-            "pleo_score": grading.pleo_score if grading and grading.pleo_score else 2,
-            "mitotic_score": grading.mitotic_score if grading and grading.mitotic_score else 2,
-            "nottingham_sum": grading.nottingham_sum if grading and grading.nottingham_sum else 6
-        }
-        
-        render_dict = {
-            "case_id": str(payload.case_id),
-            "procedure": report.procedure,
-            "laterality": report.laterality,
-            "tumor_site": report.tumor_site,
-            "histologic_type": report.histologic_type,
-            "tumor_size_mm": report.tumor_size_mm,
-            "lvi_status": report.lvi_status,
-            "dcis_present": report.dcis_present,
-            "margins": report.margins,
-            "lymph_nodes": report.lymph_nodes,
-            "biomarkers": report.biomarkers,
-            "staging": report.staging,
-            "nottingham_grade": ng_data,
-            "narrative": report.narrative,
-            "status": "signed",
-            "signed_by": report.signed_by,
-            "npi": report.npi,
-            "signed_at": now_iso,
-            "integrity_hash": integrity_hash
-        }
-        
-        generate_clinical_cap_pdf(
-            report_data=render_dict,
-            output_path=pdf_out_path,
-            evidence_paths={
-                "heatmap": os.path.join(case_cache_dir, "triage", "heatmap.png"),
-                "mitotic_hpf": os.path.join(case_cache_dir, "mitosis_crops", "hpf_1.png"),
-                "grading_patch": os.path.join(case_cache_dir, "grading_patches", "p_1.png")
-            }
-        )
-        report.pdf_path = pdf_out_path
-        db.commit()
+        render_and_upload_report_pdf(str(payload.case_id), report, grading, db)
     except Exception as e:
         print(f"[Final PDF Render Note] {e}")
 

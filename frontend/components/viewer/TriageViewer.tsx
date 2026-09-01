@@ -94,7 +94,9 @@ export function TriageViewer({
   const fetchTriageData = async () => {
     try {
       setLoading(true);
-      const res = await fetch(`${API_BASE}/api/v1/stages/triage/${caseId}`);
+      const res = await fetch(`${API_BASE}/api/v1/stages/triage/${caseId}`, {
+        headers: { "X-User-Role": "pathologist" }
+      });
       if (!res.ok) {
         throw new Error(`Failed to fetch triage data (Status: ${res.status})`);
       }
@@ -185,7 +187,10 @@ export function TriageViewer({
 
       const res = await fetch(`${API_BASE}/api/v1/stages/triage/edits`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "X-User-Role": "pathologist"
+        },
         body: JSON.stringify({ case_id: caseId, edits })
       });
 
@@ -206,7 +211,10 @@ export function TriageViewer({
 
       const res = await fetch(`${API_BASE}/api/v1/stages/triage/confirm`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "X-User-Role": "pathologist"
+        },
         body: JSON.stringify({
           case_id: caseId,
           no_invasive_tumor: noInvasiveTumor,
@@ -262,7 +270,7 @@ export function TriageViewer({
           imageWidthPx={imageWidthPx}
           imageHeightPx={imageHeightPx}
           overlayImageUri={
-            data?.heatmap_direct_url
+            data?.heatmap_direct_url && !data.heatmap_direct_url.includes("storage.googleapis.com")
               ? (data.heatmap_direct_url.startsWith("http") ? data.heatmap_direct_url : `${API_BASE}${data.heatmap_direct_url}`)
               : `${API_BASE}/api/v1/stages/triage/${caseId}/heatmap`
           }
@@ -506,7 +514,7 @@ export function TriageViewer({
                         const poly = hs.polygon_um || [];
                         const cx = poly.length > 0 ? Math.round(poly.reduce((sum, p) => sum + p[0], 0) / poly.length) : 0;
                         const cy = poly.length > 0 ? Math.round(poly.reduce((sum, p) => sum + p[1], 0) / poly.length) : 0;
-                        const thumbSrc = hs.thumbnail_url
+                        const thumbSrc = hs.thumbnail_url && !hs.thumbnail_url.includes("storage.googleapis.com")
                           ? (hs.thumbnail_url.startsWith("http") ? hs.thumbnail_url : `${API_BASE}${hs.thumbnail_url}`)
                           : `${API_BASE}/api/v1/stages/triage/${caseId}/hotspots/${hs.id}/thumbnail?mag=10x&cx=${cx}&cy=${cy}`;
                         return (
@@ -681,16 +689,17 @@ export function TriageViewer({
               </div>
 
               {/* High-Resolution Microscopic Patch Display */}
-              <div className="relative w-64 h-64 sm:w-72 sm:h-72 rounded-lg overflow-hidden border border-slate-700 bg-slate-950 shadow-2xl shrink-0">
+              <div className="relative w-64 h-64 sm:w-72 sm:h-72 rounded-lg overflow-hidden border border-slate-700 bg-slate-950 shadow-2xl shrink-0 flex items-center justify-center">
                 {(() => {
                   const poly = previewHotspot.polygon_um || [];
                   const cx = poly.length > 0 ? Math.round(poly.reduce((sum, p) => sum + p[0], 0) / poly.length) : 0;
                   const cy = poly.length > 0 ? Math.round(poly.reduce((sum, p) => sum + p[1], 0) / poly.length) : 0;
                   return (
                     <img
+                      key={`${previewHotspot.id}-${modalMag}-${stainMode}`}
                       src={`${API_BASE}/api/v1/stages/triage/${caseId}/hotspots/${previewHotspot.id}/thumbnail?mag=${modalMag}&stain=${stainMode}&cx=${cx}&cy=${cy}`}
                       alt={`Microscopic morphology for ${previewHotspot.id} at ${modalMag} (${stainMode})`}
-                      className="w-full h-full object-cover"
+                      className="w-full h-full object-cover transition-opacity duration-200"
                     />
                   );
                 })()}

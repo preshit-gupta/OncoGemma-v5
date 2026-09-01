@@ -147,7 +147,7 @@ export function MitosisGallery({
             const isRejected = cand.label === "not_mitosis";
             const isUnreviewed = cand.label === "unreviewed";
 
-            const cropUrl = `${API_BASE}/api/v1/stages/mitosis/${caseId}/candidates/${cand.id}/crop?stain=${stainMode}`;
+            const cropUrl = `${API_BASE}/api/v1/stages/mitosis/${caseId}/candidates/${cand.id}/crop?stain=${stainMode}&v=1.2`;
 
             return (
               <div

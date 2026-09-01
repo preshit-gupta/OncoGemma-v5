@@ -1,6 +1,10 @@
 import uuid
 import os
+import io
+import json
 import math
+import tempfile
+import shutil
 import threading
 from io import BytesIO
 import numpy as np
@@ -12,7 +16,13 @@ from sqlalchemy import select
 from app.core.db import get_db
 from app.core.auth import get_current_user, CurrentUser
 from app.core.config import settings
-from app.core.gcs import get_gcs_client, get_local_cache_dir
+from app.core.gcs import (
+    get_gcs_client,
+    parse_gcs_uri,
+    download_blob_as_bytes,
+    download_blob_as_text,
+    download_blob_to_filename
+)
 from app.core.openslide_lock import OPENSLIDE_GLOBAL_LOCK
 from app.models.case import Case
 from app.models.slide import Slide
@@ -80,16 +90,13 @@ def generate_tile_on_the_fly(
 
         if layer == "norm":
             try:
-                local_cache_dir = get_local_cache_dir()
-                stain_params_path = os.path.join(local_cache_dir, settings.GCS_ARTIFACTS_BUCKET, "cases", str(slide_obj.case_id), "preprocess", "stain_params.json")
-                if os.path.exists(stain_params_path):
-                    with open(stain_params_path, "r", encoding="utf-8") as f:
-                        stain_params = json.load(f)
-                    from pipeline.stain import PureNumpyMacenkoNormalizer
-                    norm_obj = PureNumpyMacenkoNormalizer()
-                    norm_obj.stain_matrix_target = np.array(stain_params["stain_matrix"])
-                    norm_obj.max_conc_target = np.array(stain_params["max_concentrations"])
-                    tile_arr = norm_obj.transform(tile_arr)
+                stain_text = download_blob_as_text(settings.GCS_ARTIFACTS_BUCKET, f"cases/{slide_obj.case_id}/preprocess/stain_params.json")
+                stain_params = json.loads(stain_text)
+                from pipeline.stain import PureNumpyMacenkoNormalizer
+                norm_obj = PureNumpyMacenkoNormalizer()
+                norm_obj.stain_matrix_target = np.array(stain_params["stain_matrix"])
+                norm_obj.max_conc_target = np.array(stain_params["max_concentrations"])
+                tile_arr = norm_obj.transform(tile_arr)
             except Exception as norm_err:
                 print(f"[Tile Router Warning] On-the-fly norm transform note: {norm_err}")
 
@@ -124,20 +131,7 @@ def stream_slide_tile(slide: Slide, layer: str, z: int, filename: str, case_id: 
         "X-Tile-Zoom": str(target_z)
     }
 
-    local_cache_dir = get_local_cache_dir()
-    slide_dir = os.path.join(local_cache_dir, settings.GCS_PYRAMIDS_BUCKET, str(slide.id))
-    layer_dir = os.path.join(slide_dir, target_layer)
-
-    # 1. Local disk cache check (fast read path: 0.0005s)
-    for check_ext in [ext, ".png", ".jpg"]:
-        tile_path = os.path.join(layer_dir, str(target_z), f"{stem}{check_ext}")
-        if os.path.exists(tile_path):
-            with open(tile_path, "rb") as f:
-                tile_bytes = f.read()
-            m_type = "image/png" if check_ext.lower() == ".png" else "image/jpeg"
-            return Response(content=tile_bytes, media_type=m_type, headers=no_cache_headers)
-
-    # 2. Stream directly from Real GCP Cloud Storage Bucket (oncogemma-dev-pyramids)
+    # 1. Stream directly from Real GCP Cloud Storage Bucket (oncogemma-dev-pyramids)
     try:
         client = get_gcs_client()
         bucket = client.bucket(settings.GCS_PYRAMIDS_BUCKET)
@@ -147,9 +141,6 @@ def stream_slide_tile(slide: Slide, layer: str, z: int, filename: str, case_id: 
             if hasattr(blob, "download_as_bytes"):
                 try:
                     tile_bytes = blob.download_as_bytes()
-                    os.makedirs(os.path.join(layer_dir, str(target_z)), exist_ok=True)
-                    with open(os.path.join(layer_dir, str(target_z), f"{stem}{check_ext}"), "wb") as f:
-                        f.write(tile_bytes)
                     m_type = "image/png" if check_ext.lower() == ".png" else "image/jpeg"
                     return Response(content=tile_bytes, media_type=m_type, headers=no_cache_headers)
                 except Exception:
@@ -157,22 +148,22 @@ def stream_slide_tile(slide: Slide, layer: str, z: int, filename: str, case_id: 
     except Exception as gcs_err:
         print(f"[Tile Router Warning] Real GCS fetch note: {gcs_err}")
 
-    # 3. Dynamic On-The-Fly Tile Generation Fallback
+    # 2. Dynamic On-The-Fly Tile Generation Fallback from GCS raw bucket
+    scratch_dir = tempfile.mkdtemp(prefix="og_tile_dyn_")
     try:
         parts = stem.split("_")
         if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
             c, r = int(parts[0]), int(parts[1])
             cid = str(case_id or slide.case_id)
-            raw_dir = os.path.join(local_cache_dir, settings.GCS_RAW_BUCKET, "cases", cid)
-            raw_file = None
-            if os.path.exists(raw_dir):
-                files = [os.path.join(raw_dir, f) for f in os.listdir(raw_dir) if os.path.isfile(os.path.join(raw_dir, f))]
-                if files:
-                    raw_file = files[0]
+            gcs_uri_original = slide.gcs_uri_original or f"gs://{settings.GCS_RAW_BUCKET}/cases/{cid}/{slide.id}.svs"
+            raw_bucket_name, blob_name = parse_gcs_uri(gcs_uri_original)
+            slide_ext = os.path.splitext(blob_name)[1] or ".svs"
+            local_slide_path = os.path.join(scratch_dir, f"slide{slide_ext}")
 
-            if raw_file and os.path.exists(raw_file):
+            download_blob_to_filename(raw_bucket_name, blob_name, local_slide_path)
+            if os.path.exists(local_slide_path):
                 tile_bytes = generate_tile_on_the_fly(
-                    slide_file_path=raw_file,
+                    slide_file_path=local_slide_path,
                     slide_obj=slide,
                     z=target_z,
                     c=c,
@@ -180,24 +171,29 @@ def stream_slide_tile(slide: Slide, layer: str, z: int, filename: str, case_id: 
                     layer=target_layer
                 )
                 if tile_bytes:
-                    os.makedirs(os.path.join(layer_dir, str(target_z)), exist_ok=True)
-                    cache_tile_path = os.path.join(layer_dir, str(target_z), f"{stem}.png")
-                    with open(cache_tile_path, "wb") as f:
-                        f.write(tile_bytes)
                     return Response(content=tile_bytes, media_type="image/png", headers=no_cache_headers)
     except Exception as dynamic_err:
         print(f"[Tile Router Warning] Dynamic tile extraction fallback error: {dynamic_err}")
+    finally:
+        shutil.rmtree(scratch_dir, ignore_errors=True)
 
-    # 4. Fallback for 'norm' to 'orig'
+    # 3. Fallback for 'norm' to 'orig' in GCS
     if target_layer == "norm":
-        orig_dir = os.path.join(slide_dir, "orig")
-        for check_ext in [ext, ".jpg", ".png"]:
-            tile_path = os.path.join(orig_dir, str(target_z), f"{stem}{check_ext}")
-            if os.path.exists(tile_path):
-                with open(tile_path, "rb") as f:
-                    tile_bytes = f.read()
-                m_type = "image/png" if check_ext.lower() == ".png" else "image/jpeg"
-                return Response(content=tile_bytes, media_type=m_type, headers=no_cache_headers)
+        try:
+            client = get_gcs_client()
+            bucket = client.bucket(settings.GCS_PYRAMIDS_BUCKET)
+            for check_ext in [ext, ".jpg", ".png"]:
+                blob_name = f"{slide.id}/orig/{target_z}/{stem}{check_ext}"
+                blob = bucket.blob(blob_name)
+                if hasattr(blob, "download_as_bytes"):
+                    try:
+                        tile_bytes = blob.download_as_bytes()
+                        m_type = "image/png" if check_ext.lower() == ".png" else "image/jpeg"
+                        return Response(content=tile_bytes, media_type=m_type, headers=no_cache_headers)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     raise HTTPException(status_code=404, detail="Tile missing")
 
@@ -229,3 +225,4 @@ def get_tile_direct(
     if not slide:
         raise HTTPException(status_code=404, detail="Slide not found")
     return stream_slide_tile(slide, layer, z, filename)
+

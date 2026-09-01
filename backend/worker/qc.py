@@ -8,7 +8,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.core.gcs import get_gcs_client, get_local_cache_dir
+from app.core.gcs import (
+    get_gcs_client,
+    parse_gcs_uri,
+    upload_blob_from_bytes,
+    download_blob_to_filename
+)
 from app.models.case import Case
 from app.models.slide import Slide
 from app.models.stage_execution import StageExecution
@@ -19,13 +24,11 @@ from pipeline.qc_checks import run_all_qc_checks
 def run_qc(stage_execution: StageExecution, session: Session) -> tuple[str, dict]:
     """
     QC worker handler:
-    1. Loads slide object & tissue mask parameters.
+    1. Downloads slide directly from GCS.
     2. Runs simplified QC checks suite (coverage & focus sharpness).
     3. Evaluates overall verdict ('pass', 'warn', 'fail').
-    4. Updates stage status:
-       - 'pass' -> stage status = 'done' -> auto-queues downstream stage ('triage').
-       - 'warn' -> stage status = 'awaiting_review'.
-       - 'fail' -> stage status = 'failed' -> sets case.status = 'needs_rescan'.
+    4. Uploads qc/output.json directly to GCS.
+    5. Updates stage status.
     """
     input_ref = stage_execution.input_ref or {}
     slide_id = input_ref.get("slide_id")
@@ -43,17 +46,17 @@ def run_qc(stage_execution: StageExecution, session: Session) -> tuple[str, dict
     scratch_dir = tempfile.mkdtemp(prefix="og_qc_")
 
     try:
-        ext = os.path.splitext(slide_obj.gcs_uri_original or ".svs")[1]
+        gcs_uri_original = slide_obj.gcs_uri_original or f"gs://{settings.GCS_RAW_BUCKET}/cases/{case_id}/{slide_id}.svs"
+        raw_bucket_name, blob_name = parse_gcs_uri(gcs_uri_original)
+        
+        ext = os.path.splitext(blob_name)[1] or ".svs"
         local_slide_path = os.path.join(scratch_dir, f"slide{ext}")
 
-        raw_uploads_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../raw_uploads"))
-        cached_files = [os.path.join(raw_uploads_dir, f) for f in os.listdir(raw_uploads_dir) if str(case_id) in f or str(slide_id) in f] if os.path.exists(raw_uploads_dir) else []
+        # Download directly from GCS raw bucket to transient scratch file
+        download_blob_to_filename(raw_bucket_name, blob_name, local_slide_path)
 
-        if cached_files and os.path.exists(cached_files[0]):
-            shutil.copy2(cached_files[0], local_slide_path)
-        else:
-            img = Image.new("RGB", (2048, 2048), color=(240, 220, 235))
-            img.save(local_slide_path, "JPEG")
+        if not os.path.exists(local_slide_path):
+            raise FileNotFoundError(f"Raw slide file not found in GCS for QC stage in case {case_id}")
 
         try:
             import openslide
@@ -88,33 +91,20 @@ def run_qc(stage_execution: StageExecution, session: Session) -> tuple[str, dict
 
         verdict = qc_result["verdict"]
 
-        # Persist qc/output.json artifact to GCP storage with local disk cache
-        cache_dir = get_local_cache_dir()
-        artifacts_dir = os.path.join(cache_dir, settings.GCS_ARTIFACTS_BUCKET, "cases", str(case_id), "qc")
-        os.makedirs(artifacts_dir, exist_ok=True)
-
-        output_json_path = os.path.join(artifacts_dir, "qc_output.json")
-        with open(output_json_path, "w", encoding="utf-8") as f:
-            json.dump(qc_result, f, indent=2)
-
+        # Persist qc/output.json directly to GCS artifacts bucket
         output_ref = f"gs://{settings.GCS_ARTIFACTS_BUCKET}/cases/{case_id}/qc/output.json"
-        
-        try:
-            client = get_gcs_client()
-            bucket = client.bucket(settings.GCS_ARTIFACTS_BUCKET)
-            blob = bucket.blob(f"cases/{case_id}/qc/output.json")
-            if hasattr(blob, "upload_from_filename"):
-                blob.upload_from_filename(output_json_path, content_type="application/json", timeout=10)
-        except Exception as ge:
-            print(f"[QC Worker Note] Parallel GCP cloud artifact upload note: {ge}")
+        upload_blob_from_bytes(
+            settings.GCS_ARTIFACTS_BUCKET,
+            f"cases/{case_id}/qc/output.json",
+            json.dumps(qc_result, indent=2).encode("utf-8"),
+            "application/json"
+        )
 
         # Update stage status & case status based on QC verdict
         case_obj = session.get(Case, case_id)
 
         if verdict == "pass":
             stage_execution.status = "awaiting_review"
-            # Pauses for Pathologist sign-off on Stage 2 (v4.1 Stain & QC Gate)
-            # Stage 3 (v4.2 Hotspot Triage) will be queued when pathologist clicks "Approve Slide & Proceed to Step 3"
         elif verdict == "warn":
             stage_execution.status = "awaiting_review"
         elif verdict == "fail":
@@ -142,3 +132,4 @@ def run_qc(stage_execution: StageExecution, session: Session) -> tuple[str, dict
 
     finally:
         shutil.rmtree(scratch_dir, ignore_errors=True)
+

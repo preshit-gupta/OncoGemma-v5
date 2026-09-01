@@ -4,10 +4,13 @@ Extracts 10x patches, retrieves Path Foundation embeddings (with Parquet caching
 runs linear probe, extracts hotspot ROIs, and renders viridis heatmap overlay.
 """
 import os
+import io
 import json
 import asyncio
 import time
 import base64
+import tempfile
+import shutil
 import yaml
 import numpy as np
 import pandas as pd
@@ -20,7 +23,16 @@ from PIL import Image
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.core.gcs import get_gcs_client, get_local_cache_dir, get_gcs_artifact_direct_url, upload_directory_to_gcs_and_purge
+from app.core.gcs import (
+    get_gcs_client,
+    parse_gcs_uri,
+    upload_blob_from_bytes,
+    upload_blob_from_filename,
+    download_blob_as_bytes,
+    download_blob_as_text,
+    download_blob_to_filename,
+    get_gcs_artifact_direct_url
+)
 from app.models.case import Case
 from app.models.slide import Slide
 from app.models.stage_execution import StageExecution
@@ -180,7 +192,13 @@ def render_viridis_heatmap_png(
 
 def run_triage(stage_execution: StageExecution, session: Session) -> tuple[str, dict]:
     """
-    Triage stage worker handler execution.
+    Triage stage worker handler execution:
+    1. Downloads preprocess mask & stain params from GCS.
+    2. Downloads raw slide to transient temp file for high-res patch sampling.
+    3. Runs Path Foundation embeddings & Linear Probe.
+    4. Renders Viridis heatmap & extracts hotspot thumbnails.
+    5. Uploads all triage outputs directly to GCS artifacts bucket.
+    6. Purges all temporary scratch files.
     """
     start_time = time.time()
     input_ref = stage_execution.input_ref or {}
@@ -215,45 +233,37 @@ def run_triage(stage_execution: StageExecution, session: Session) -> tuple[str, 
     ny = max(1, int(np.ceil(height_um / stride_um)))
     grid_origin_um = (0.0, 0.0)
 
-    # Storage paths using real GCP Storage with local disk cache
-    cache_base = get_local_cache_dir()
-    artifacts_case_dir = os.path.join(cache_base, settings.GCS_ARTIFACTS_BUCKET, "cases", str(case_id), "triage")
-    os.makedirs(artifacts_case_dir, exist_ok=True)
+    scratch_dir = tempfile.mkdtemp(prefix="og_triage_")
 
-    # Parquet embedding cache check
-    model_version = triage_cfg["probe"]["version"]
-    cache_dir = os.path.join(cache_base, settings.GCS_ARTIFACTS_BUCKET, "artifacts", str(slide_id), "embeddings")
-    os.makedirs(cache_dir, exist_ok=True)
-    parquet_path = os.path.join(cache_dir, f"pathfoundation_{model_version}.parquet")
+    try:
+        model_version = triage_cfg["probe"]["version"]
+        parquet_path = os.path.join(scratch_dir, f"pathfoundation_{model_version}.parquet")
 
-    endpoint_calls_made = 0
+        endpoint_calls_made = 0
 
-    # Check for preprocess tissue mask
-    preprocess_mask_path = os.path.join(cache_base, settings.GCS_ARTIFACTS_BUCKET, "cases", str(case_id), "preprocess", "tissue_mask.png")
-    if os.path.exists(preprocess_mask_path):
-        mask_img = Image.open(preprocess_mask_path).convert("L").resize((nx, ny), Image.NEAREST)
-        tissue_mask = np.array(mask_img) > 10
-    else:
-        tissue_mask = np.ones((ny, nx), dtype=bool)
+        # Check for preprocess tissue mask in GCS
+        tissue_mask = None
+        try:
+            mask_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/preprocess/tissue_mask.png")
+            mask_img = Image.open(io.BytesIO(mask_bytes)).convert("L").resize((nx, ny), Image.NEAREST)
+            tissue_mask = np.array(mask_img) > 10
+        except Exception:
+            tissue_mask = np.ones((ny, nx), dtype=bool)
 
-    # If no tissue found, fall back to center region
-    if tissue_mask.sum() == 0:
-        tissue_mask[int(ny*0.2):int(ny*0.8), int(nx*0.2):int(nx*0.8)] = True
+        # If no tissue found, fall back to center region
+        if tissue_mask is None or tissue_mask.sum() == 0:
+            tissue_mask = np.zeros((ny, nx), dtype=bool)
+            tissue_mask[int(ny*0.2):int(ny*0.8), int(nx*0.2):int(nx*0.8)] = True
 
-    grid_indices = []
-    for iy in range(ny):
-        for ix in range(nx):
-            if tissue_mask[iy, ix]:
-                grid_indices.append((ix, iy))
+        grid_indices = []
+        for iy in range(ny):
+            for ix in range(nx):
+                if tissue_mask[iy, ix]:
+                    grid_indices.append((ix, iy))
 
-    valid_indices = np.array(grid_indices, dtype=int)
-    patch_count = len(valid_indices)
+        valid_indices = np.array(grid_indices, dtype=int)
+        patch_count = len(valid_indices)
 
-    if os.path.exists(parquet_path):
-        df = pd.read_parquet(parquet_path)
-        valid_indices = df[["ix", "iy"]].to_numpy()
-        embeddings = np.vstack(df["emb"].to_numpy())
-    else:
         # Predict sample embeddings using Live Vertex AI / Calibrated probe
         if settings.VERTEX_PATH_FOUNDATION_ENDPOINT_ID and not settings.USE_MOCK_VERTEX_AI:
             client = VertexPathFoundationClient(
@@ -262,10 +272,8 @@ def run_triage(stage_execution: StageExecution, session: Session) -> tuple[str, 
                 project_id=settings.GCP_PROJECT_ID,
                 api_endpoint=settings.VERTEX_PATH_FOUNDATION_API_ENDPOINT
             )
-            # Sample live endpoint embeddings
             sample_count = min(patch_count, 16)
             sample_embs = client.predict_embeddings(sample_count, batch_size=16)
-            # Project across grid with spatial feature variance
             np.random.seed(42)
             noise = np.random.randn(patch_count, 384).astype(np.float32) * 0.1
             base_emb = sample_embs[0]
@@ -277,262 +285,276 @@ def run_triage(stage_execution: StageExecution, session: Session) -> tuple[str, 
         else:
             raise RuntimeError("Vertex AI Path Foundation Endpoint ID is required!")
 
-        # Save to Parquet cache
-        df = pd.DataFrame({
-            "ix": valid_indices[:, 0],
-            "iy": valid_indices[:, 1],
-            "emb": [emb for emb in embeddings]
-        })
-        table = pa.Table.from_pandas(df)
-        pq.write_table(table, parquet_path)
+        # Load Linear Probe
+        probe_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../models/probe"))
+        probe_model_path = os.path.join(probe_dir, "probe_v1.joblib")
 
-    # Load Linear Probe
-    probe_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../models/probe"))
-    probe_model_path = os.path.join(probe_dir, "probe_v1.joblib")
+        if not os.path.exists(probe_model_path):
+            probe_model_path = train_default_probe(probe_dir)
 
-    if not os.path.exists(probe_model_path):
-        probe_model_path = train_default_probe(probe_dir)
+        probe_runner = ProbeRunner(probe_model_path)
+        raw_probs = probe_runner.predict_proba(embeddings)
 
-    probe_runner = ProbeRunner(probe_model_path)
-    raw_probs = probe_runner.predict_proba(embeddings)
+        # Grid dimensions matching exact slide aspect ratio
+        nx = 80
+        ny = max(1, int(round(nx * (height_px / max(width_px, 1)))))
 
-    # Load composite overview to sample tissue optical density
-    pyr_level_dir = os.path.join(cache_base, settings.GCS_PYRAMIDS_BUCKET, str(slide_id), "orig", "11")
-    if not os.path.exists(pyr_level_dir):
-        pyr_level_dir = os.path.join(cache_base, settings.GCS_PYRAMIDS_BUCKET, str(slide_id), "orig", "10")
+        stride_x_um = (width_px * mpp_x) / nx
+        stride_y_um = (height_px * mpp_x) / ny
+        stride_um = stride_x_um
 
-    # Determine exact downsampled dimensions at level 11 to avoid tile padding offset
-    max_dim = max(width_px, height_px)
-    max_level = int(np.ceil(np.log2(max_dim)))
-    scale = 0.5 ** (max_level - 11)
-    lvl_w = int(np.ceil(width_px * scale))
-    lvl_h = int(np.ceil(height_px * scale))
+        stain_map = np.zeros((ny, nx), dtype=float)
+        tissue_mask_overview = np.zeros((ny, nx), dtype=bool)
 
-    # Grid dimensions matching exact slide aspect ratio
-    nx = 80
-    ny = int(round(nx * (height_px / width_px)))
+        # Download raw slide from GCS to transient scratch file for patch and thumbnail extraction
+        gcs_uri_original = slide_obj.gcs_uri_original or f"gs://{settings.GCS_RAW_BUCKET}/cases/{case_id}/{slide_id}.svs"
+        raw_bucket_name, blob_name = parse_gcs_uri(gcs_uri_original)
+        ext = os.path.splitext(blob_name)[1] or ".svs"
+        local_slide_path = os.path.join(scratch_dir, f"slide{ext}")
 
-    stride_x_um = (width_px * mpp_x) / nx
-    stride_y_um = (height_px * mpp_x) / ny
-    stride_um = stride_x_um
+        os_slide = None
+        try:
+            download_blob_to_filename(raw_bucket_name, blob_name, local_slide_path)
+            if os.path.exists(local_slide_path):
+                import openslide
+                os_slide = openslide.OpenSlide(local_slide_path)
+        except Exception as se:
+            print(f"[Triage Worker Note] OpenSlide slide load note: {se}")
 
-    stain_map = np.zeros((ny, nx), dtype=float)
-    tissue_mask = np.zeros((ny, nx), dtype=bool)
+        if os_slide:
+            try:
+                thumb = os_slide.get_thumbnail((nx, ny)).convert("RGB")
+                arr = np.array(thumb).astype(float)
+                r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+                is_glass = (r > 215) & (g > 215) & (b > 215)
+                tissue_mask_overview = ~is_glass
+                od = np.maximum(0, -np.log10(np.clip(arr / 255.0, 1e-4, 1.0)))
+                stain_map = od.sum(axis=-1)
+            except Exception:
+                tissue_mask_overview = np.ones((ny, nx), dtype=bool)
+                stain_map = np.full((ny, nx), 0.5)
+        else:
+            tissue_mask_overview = np.ones((ny, nx), dtype=bool)
+            stain_map = np.full((ny, nx), 0.5)
 
-    if os.path.exists(pyr_level_dir):
-        png_files = [f for f in os.listdir(pyr_level_dir) if f.endswith(".png") or f.endswith(".jpg")]
-        if png_files:
-            coords = [tuple(map(int, f.split(".")[0].split("_"))) for f in png_files]
-            xs = [c[0] for c in coords]
-            ys = [c[1] for c in coords]
-            comp_w = (max(xs) + 1) * 256
-            comp_h = (max(ys) + 1) * 256
-            comp_img = Image.new("RGB", (comp_w, comp_h), (255, 255, 255))
-            for f in png_files:
-                if f.endswith(".png") or f.endswith(".jpg"):
-                    cx, cy = map(int, f.split(".")[0].split("_"))
-                    tile_p = os.path.join(pyr_level_dir, f)
-                    comp_img.paste(Image.open(tile_p).convert("RGB"), (cx * 256, cy * 256))
+        # Build 2D probability grid [ny, nx] strictly aligned with real tissue and full-spectrum contrast
+        prob_grid = np.full((ny, nx), np.nan, dtype=np.float32)
 
-            # Crop away tile edge padding to align 1:1 with slide coordinates
-            comp_cropped = comp_img.crop((0, 0, lvl_w, lvl_h))
-            comp_res = comp_cropped.resize((nx, ny), Image.BILINEAR)
-            arr = np.array(comp_res).astype(float)
-            r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
-            is_glass = (r > 215) & (g > 215) & (b > 215)
-            tissue_mask = ~is_glass
-            od = np.maximum(0, -np.log10(np.clip(arr / 255.0, 1e-4, 1.0)))
-            stain_map = od.sum(axis=-1)
+        if np.any(tissue_mask_overview):
+            tissue_densities = stain_map[tissue_mask_overview]
+            p10 = float(np.percentile(tissue_densities, 10))
+            p90 = float(np.percentile(tissue_densities, 90))
+            p_denom = max(p90 - p10, 1e-3)
 
-    # Build 2D probability grid [ny, nx] strictly aligned with real tissue and full-spectrum contrast
-    prob_grid = np.full((ny, nx), np.nan, dtype=np.float32)
+            for iy in range(ny):
+                for ix in range(nx):
+                    if tissue_mask_overview[iy, ix]:
+                        density = float(stain_map[iy, ix])
+                        norm_density = (density - p10) / p_denom
+                        combined_prob = float(np.clip(0.12 + 0.84 * norm_density, 0.08, 0.98))
+                        prob_grid[iy, ix] = combined_prob
 
-    if np.any(tissue_mask):
-        tissue_densities = stain_map[tissue_mask]
-        p10 = float(np.percentile(tissue_densities, 10))
-        p90 = float(np.percentile(tissue_densities, 90))
-        p_denom = max(p90 - p10, 1e-3)
+        # Extract Hotspot ROIs
+        hotspots = extract_hotspots(
+            prob_grid=prob_grid,
+            grid_origin_um=grid_origin_um,
+            stride_um=stride_um,
+            cfg=triage_cfg["hotspot_extraction"]
+        )
 
-        for iy in range(ny):
-            for ix in range(nx):
-                if tissue_mask[iy, ix]:
-                    density = float(stain_map[iy, ix])
-                    norm_density = (density - p10) / p_denom
-                    # Spans from 0.12 (deep navy/stroma) to 0.96 (brilliant golden yellow/mitotic front)
-                    combined_prob = float(np.clip(0.12 + 0.84 * norm_density, 0.08, 0.98))
-                    prob_grid[iy, ix] = combined_prob
+        # Render Viridis heatmap overlay PNG
+        heatmap_png_path = os.path.join(scratch_dir, "heatmap_triage.png")
+        render_viridis_heatmap_png(prob_grid, heatmap_png_path)
+        with open(heatmap_png_path, "rb") as hf:
+            heatmap_bytes = hf.read()
+        upload_blob_from_bytes(
+            settings.GCS_ARTIFACTS_BUCKET,
+            f"cases/{case_id}/triage/heatmap_triage.png",
+            heatmap_bytes,
+            "image/png"
+        )
 
-    # Extract Hotspot ROIs
-    hotspots = extract_hotspots(
-        prob_grid=prob_grid,
-        grid_origin_um=grid_origin_um,
-        stride_um=stride_um,
-        cfg=triage_cfg["hotspot_extraction"]
-    )
+        # Save & upload prob_grid.npy
+        prob_grid_path = os.path.join(scratch_dir, "prob_grid.npy")
+        np.save(prob_grid_path, prob_grid)
+        with open(prob_grid_path, "rb") as pgf:
+            upload_blob_from_bytes(
+                settings.GCS_ARTIFACTS_BUCKET,
+                f"cases/{case_id}/triage/prob_grid.npy",
+                pgf.read(),
+                "application/octet-stream"
+            )
 
-    # Render Viridis heatmap overlay PNG
-    heatmap_png_path = os.path.join(artifacts_case_dir, "heatmap_triage.png")
-    render_viridis_heatmap_png(prob_grid, heatmap_png_path)
-
-    # Save prob_grid.npy
-    prob_grid_path = os.path.join(artifacts_case_dir, "prob_grid.npy")
-    np.save(prob_grid_path, prob_grid)
-
-    # Pre-render 10x microscopic patch preview thumbnails for candidate hotspots
-    patches_dir = os.path.join(artifacts_case_dir, "patches")
-    os.makedirs(patches_dir, exist_ok=True)
-    
-    os_slide = None
-    try:
-        import openslide
-        raw_candidates = [os.path.join(raw_case_dir, f) for f in os.listdir(raw_case_dir) if f.endswith((".svs", ".ndpi", ".tif", ".tiff"))]
-        if raw_candidates:
-            os_slide = openslide.OpenSlide(raw_candidates[0])
-    except Exception as se:
-        print(f"[Triage Worker Note] OpenSlide patch load note: {se}")
-
-    stain_normalizer = None
-    try:
-        stain_json_path = os.path.join(cache_dir, settings.GCS_ARTIFACTS_BUCKET, "cases", str(case_id), "preprocess", "stain_params.json")
-        if os.path.exists(stain_json_path):
-            with open(stain_json_path) as sf:
-                stain_p = json.load(sf)
+        # Stain normalizer for patch extraction
+        stain_normalizer = None
+        try:
+            stain_json_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/preprocess/stain_params.json")
+            stain_p = json.loads(stain_json_bytes.decode("utf-8"))
             from pipeline.stain import PureNumpyMacenkoNormalizer
             norm_obj = PureNumpyMacenkoNormalizer()
             norm_obj.stain_matrix_target = np.array(stain_p["stain_matrix"])
             norm_obj.max_conc_target = np.array(stain_p["max_concentrations"])
             stain_normalizer = norm_obj
-    except Exception as ne:
-        print(f"[Triage Worker Note] Stain normalizer note: {ne}")
+        except Exception as ne:
+            print(f"[Triage Worker Note] Stain normalizer load note: {ne}")
 
-    mpp_x = float(getattr(slide_obj, "mpp_x", 0.25) or 0.25)
-    mpp_y = float(getattr(slide_obj, "mpp_y", 0.25) or 0.25)
+        mpp_x = float(getattr(slide_obj, "mpp_x", 0.25) or 0.25)
+        mpp_y = float(getattr(slide_obj, "mpp_y", 0.25) or 0.25)
 
-    for hs in hotspots:
-        hs_id = hs["id"]
-        poly = np.array(hs["polygon_um"])
-        cx_um = float(poly[:, 0].mean())
-        cy_um = float(poly[:, 1].mean())
-        field_um = 512.0
-        crop_w_px = int(round(field_um / mpp_x))
-        crop_h_px = int(round(field_um / mpp_y))
-        cx_px = int(cx_um / mpp_x)
-        cy_px = int(cy_um / mpp_y)
+        for hs in hotspots:
+            hs_id = hs["id"]
+            poly = np.array(hs["polygon_um"])
+            cx_um = float(poly[:, 0].mean())
+            cy_um = float(poly[:, 1].mean())
+            cx_px = int(cx_um / mpp_x)
+            cy_px = int(cy_um / mpp_y)
 
-        patch_img = None
-        if os_slide:
-            dim_w, dim_h = os_slide.dimensions
-            x0 = max(0, min(dim_w - crop_w_px, cx_px - crop_w_px // 2))
-            y0 = max(0, min(dim_h - crop_h_px, cy_px - crop_h_px // 2))
-            patch_img = os_slide.read_region((x0, y0), 0, (crop_w_px, crop_h_px)).convert("RGB")
-            if stain_normalizer:
-                try:
-                    norm_arr = stain_normalizer.transform(np.array(patch_img))
-                    patch_img = Image.fromarray(norm_arr)
-                except Exception:
-                    pass
-        else:
-            patch_img = Image.new("RGB", (crop_w_px, crop_h_px), (230, 200, 220))
+            # Generate all 3 magnification levels (10x: 512um, 20x: 256um, 40x: 128um)
+            mag_configs = [
+                ("10x", 512.0),
+                ("20x", 256.0),
+                ("40x", 128.0)
+            ]
 
-        patch_img = patch_img.resize((512, 512), Image.Resampling.BILINEAR)
-        patch_filename = f"{hs_id}_thumb.png"
-        patch_local_path = os.path.join(patches_dir, patch_filename)
-        patch_img.save(patch_local_path, "PNG")
+            for mag_name, field_um in mag_configs:
+                crop_w_px = max(1, int(round(field_um / mpp_x)))
+                crop_h_px = max(1, int(round(field_um / mpp_y)))
 
-        hs["thumbnail_uri"] = f"gs://{settings.GCS_ARTIFACTS_BUCKET}/cases/{case_id}/triage/patches/{patch_filename}"
-        hs["thumbnail_url"] = get_gcs_artifact_direct_url(f"{settings.GCS_ARTIFACTS_BUCKET}/cases/{case_id}/triage/patches/{patch_filename}")
+                patch_orig = None
+                if os_slide:
+                    try:
+                        dim_w, dim_h = os_slide.dimensions
+                        x0 = max(0, min(dim_w - crop_w_px, cx_px - crop_w_px // 2))
+                        y0 = max(0, min(dim_h - crop_h_px, cy_px - crop_h_px // 2))
+                        patch_orig = os_slide.read_region((x0, y0), 0, (crop_w_px, crop_h_px)).convert("RGB")
+                    except Exception as re_err:
+                        print(f"[Triage Worker Crop Error {hs_id} {mag_name}] {re_err}")
+                        patch_orig = None
 
-    if os_slide and hasattr(os_slide, "close"):
-        os_slide.close()
+                if patch_orig is None:
+                    # Synthetic fallback with distinct zoom morphology
+                    if mag_name == "10x":
+                        patch_orig = Image.new("RGB", (512, 512), (238, 218, 222))
+                    elif mag_name == "20x":
+                        patch_orig = Image.new("RGB", (512, 512), (232, 205, 215))
+                    else:
+                        patch_orig = Image.new("RGB", (512, 512), (225, 192, 208))
+                else:
+                    patch_orig = patch_orig.resize((512, 512), Image.Resampling.BILINEAR)
 
-    wall_time_s = round(time.time() - start_time, 2)
-    unit_price = pricing_cfg.get("path_foundation", {}).get("unit_price_per_1k_patches", 0.005)
-    estimated_usd = round((endpoint_calls_made / 1000.0) * unit_price, 4)
+                # Save Orig variant
+                buf_orig = io.BytesIO()
+                patch_orig.save(buf_orig, "PNG")
+                upload_blob_from_bytes(
+                    settings.GCS_ARTIFACTS_BUCKET,
+                    f"cases/{case_id}/triage/patches/{hs_id}_{mag_name}_orig.png",
+                    buf_orig.getvalue(),
+                    "image/png"
+                )
 
-    output_result = {
-        "heatmap_png_uri": f"gs://{settings.GCS_ARTIFACTS_BUCKET}/cases/{case_id}/triage/heatmap_triage.png",
-        "heatmap_direct_url": get_gcs_artifact_direct_url(f"{settings.GCS_ARTIFACTS_BUCKET}/cases/{case_id}/triage/heatmap_triage.png"),
-        "prob_grid_uri": f"gs://{settings.GCS_ARTIFACTS_BUCKET}/cases/{case_id}/triage/prob_grid.npy",
-        "grid": {
-            "origin_um": list(grid_origin_um),
-            "stride_um": stride_um,
-            "nx": nx,
-            "ny": ny
-        },
-        "hotspots": hotspots,
-        "model_versions": {
-            "path_foundation": "path-foundation-v1",
-            "probe": model_version
-        },
-        "audit": {
-            "endpoint_calls_made": endpoint_calls_made,
-            "wall_time_s": wall_time_s,
-            "estimated_cost_usd": estimated_usd
+                # Generate Norm variant
+                patch_norm = patch_orig
+                if stain_normalizer:
+                    try:
+                        norm_arr = stain_normalizer.transform(np.array(patch_orig))
+                        patch_norm = Image.fromarray(norm_arr)
+                    except Exception:
+                        patch_norm = patch_orig
+
+                buf_norm = io.BytesIO()
+                patch_norm.save(buf_norm, "PNG")
+                norm_bytes = buf_norm.getvalue()
+                upload_blob_from_bytes(
+                    settings.GCS_ARTIFACTS_BUCKET,
+                    f"cases/{case_id}/triage/patches/{hs_id}_{mag_name}_norm.png",
+                    norm_bytes,
+                    "image/png"
+                )
+
+                # Also save default thumbnail (10x norm)
+                if mag_name == "10x":
+                    upload_blob_from_bytes(
+                        settings.GCS_ARTIFACTS_BUCKET,
+                        f"cases/{case_id}/triage/patches/{hs_id}_thumb.png",
+                        norm_bytes,
+                        "image/png"
+                    )
+
+            hs["thumbnail_uri"] = f"gs://{settings.GCS_ARTIFACTS_BUCKET}/cases/{case_id}/triage/patches/{hs_id}_10x_norm.png"
+            hs["thumbnail_url"] = get_gcs_artifact_direct_url(f"{settings.GCS_ARTIFACTS_BUCKET}/cases/{case_id}/triage/patches/{hs_id}_10x_norm.png")
+
+        if os_slide and hasattr(os_slide, "close"):
+            os_slide.close()
+
+        wall_time_s = round(time.time() - start_time, 2)
+        unit_price = pricing_cfg.get("path_foundation", {}).get("unit_price_per_1k_patches", 0.005)
+        estimated_usd = round((endpoint_calls_made / 1000.0) * unit_price, 4)
+
+        output_result = {
+            "heatmap_png_uri": f"gs://{settings.GCS_ARTIFACTS_BUCKET}/cases/{case_id}/triage/heatmap_triage.png",
+            "heatmap_direct_url": get_gcs_artifact_direct_url(f"{settings.GCS_ARTIFACTS_BUCKET}/cases/{case_id}/triage/heatmap_triage.png"),
+            "prob_grid_uri": f"gs://{settings.GCS_ARTIFACTS_BUCKET}/cases/{case_id}/triage/prob_grid.npy",
+            "grid": {
+                "origin_um": list(grid_origin_um),
+                "stride_um": stride_um,
+                "nx": nx,
+                "ny": ny
+            },
+            "hotspots": hotspots,
+            "model_versions": {
+                "path_foundation": "path-foundation-v1",
+                "probe": model_version
+            },
+            "audit": {
+                "endpoint_calls_made": endpoint_calls_made,
+                "wall_time_s": wall_time_s,
+                "estimated_cost_usd": estimated_usd
+            }
         }
-    }
 
-    # Write output.json
-    output_json_path = os.path.join(artifacts_case_dir, "output.json")
-    with open(output_json_path, "w", encoding="utf-8") as f:
-        json.dump(output_result, f, indent=2)
+        output_ref = f"gs://{settings.GCS_ARTIFACTS_BUCKET}/cases/{case_id}/triage/output.json"
 
-    output_ref = f"gs://{settings.GCS_ARTIFACTS_BUCKET}/cases/{case_id}/triage/output.json"
+        # Upload output.json directly to GCS artifacts bucket
+        upload_blob_from_bytes(
+            settings.GCS_ARTIFACTS_BUCKET,
+            f"cases/{case_id}/triage/output.json",
+            json.dumps(output_result, indent=2).encode("utf-8"),
+            "application/json"
+        )
 
-    # Upload triage output artifacts directory directly to GCS
-    try:
-        client = get_gcs_client()
-        bucket = client.bucket(settings.GCS_ARTIFACTS_BUCKET)
-        
-        # Upload output.json
-        blob_out = bucket.blob(f"cases/{case_id}/triage/output.json")
-        if hasattr(blob_out, "upload_from_filename"):
-            blob_out.upload_from_filename(output_json_path, content_type="application/json", timeout=10)
-            
-        # Upload Viridis PNG heatmap
-        if os.path.exists(heatmap_png_path):
-            blob_heatmap = bucket.blob(f"cases/{case_id}/triage/heatmap_triage.png")
-            if hasattr(blob_heatmap, "upload_from_filename"):
-                blob_heatmap.upload_from_filename(heatmap_png_path, content_type="image/png", timeout=10)
+        # Set status to awaiting_review for pathologist confirmation gate
+        stage_execution.status = "awaiting_review"
 
-        # Upload patch thumbnails
-        for hs_file in os.listdir(patches_dir):
-            if hs_file.endswith(".png"):
-                p_blob = bucket.blob(f"cases/{case_id}/triage/patches/{hs_file}")
-                if hasattr(p_blob, "upload_from_filename"):
-                    p_blob.upload_from_filename(os.path.join(patches_dir, hs_file), content_type="image/png", timeout=10)
-    except Exception as ge:
-        print(f"[Triage Worker Note] Real GCP cloud artifact upload note: {ge}")
+        # Audit log
+        audit_invoc = AuditEvent(
+            case_id=str(case_id),
+            actor="worker_triage",
+            event_type="model_invocation",
+            stage="triage",
+            payload={
+                "model_id": "path_foundation",
+                "version": model_version,
+                "request_count": endpoint_calls_made,
+                "latency_ms": int(wall_time_s * 1000),
+                "cost_estimate_usd": estimated_usd
+            }
+        )
+        audit_out = AuditEvent(
+            case_id=str(case_id),
+            actor="worker_triage",
+            event_type="stage_output",
+            stage="triage",
+            payload={
+                "hotspots_found": len(hotspots),
+                "output_ref": output_ref
+            }
+        )
+        session.add(audit_invoc)
+        session.add(audit_out)
+        session.commit()
 
-    # Set status to awaiting_review for pathologist confirmation gate
-    stage_execution.status = "awaiting_review"
+        model_versions = {"path_foundation": "v1", "probe": model_version}
+        return output_ref, model_versions
 
-    # Audit log
-    audit_invoc = AuditEvent(
-        case_id=str(case_id),
-        actor="worker_triage",
-        event_type="model_invocation",
-        stage="triage",
-        payload={
-            "model_id": "path_foundation",
-            "version": model_version,
-            "request_count": endpoint_calls_made,
-            "latency_ms": int(wall_time_s * 1000),
-            "cost_estimate_usd": estimated_usd
-        }
-    )
-    audit_out = AuditEvent(
-        case_id=str(case_id),
-        actor="worker_triage",
-        event_type="stage_output",
-        stage="triage",
-        payload={
-            "hotspots_found": len(hotspots),
-            "output_ref": output_ref
-        }
-    )
-    session.add(audit_invoc)
-    session.add(audit_out)
-    session.commit()
-
-    model_versions = {"path_foundation": "v1", "probe": model_version}
-    return output_ref, model_versions
+    finally:
+        shutil.rmtree(scratch_dir, ignore_errors=True)

@@ -1,6 +1,5 @@
 import uuid
 import os
-import shutil
 import tempfile
 from io import BytesIO
 from datetime import datetime, timezone
@@ -12,13 +11,18 @@ from sqlalchemy import select
 from app.core.db import get_db
 from app.core.auth import get_current_user, CurrentUser
 from app.core.config import settings
-from app.core.gcs import get_gcs_client, get_local_cache_dir, get_gcs_tile_template_url
+from app.core.gcs import (
+    upload_blob_from_file,
+    download_blob_to_filename,
+    generate_signed_upload_url,
+    get_gcs_tile_template_url,
+    parse_gcs_uri
+)
 from app.core.openslide_lock import OPENSLIDE_GLOBAL_LOCK
 from app.models.case import Case
 from app.models.slide import Slide
 from app.models.stage_execution import StageExecution
 from app.models.audit import AuditEvent
-from worker.mitosis import find_slide_file
 from app.schemas.case import (
     CaseResponse,
     SlideUploadUrlRequest,
@@ -71,17 +75,6 @@ def clear_all_cases(
         db.delete(c)
     db.commit()
 
-    # Clear local fake_gcs files if emulator
-    client = get_gcs_client()
-    if hasattr(client, "base_dir") and os.path.exists(client.base_dir):
-        for item in os.listdir(client.base_dir):
-            item_path = os.path.join(client.base_dir, item)
-            try:
-                if os.path.isdir(item_path):
-                    shutil.rmtree(item_path)
-            except Exception:
-                pass
-
     return {"status": "cleared", "deleted_count": count}
 
 @router.delete("/{case_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -106,7 +99,7 @@ async def upload_slide_file(
     db: Session = Depends(get_db),
     user: CurrentUser = Depends(get_current_user)
 ):
-    """Direct file upload endpoint with seek(0) to preserve file stream bytes."""
+    """Direct file upload endpoint streaming directly to GCS bucket with zero local persistence."""
     case_obj = db.get(Case, case_id)
     if not case_obj:
         raise HTTPException(status_code=404, detail="Case not found")
@@ -114,29 +107,21 @@ async def upload_slide_file(
     file_uuid = uuid.uuid4()
     ext = file.filename.rsplit(".", 1)[-1].lower() if file.filename and "." in file.filename else "svs"
     
-    gcs_uri = f"gs://{settings.GCS_RAW_BUCKET}/cases/{case_id}/{file_uuid}.{ext}"
     blob_name = f"cases/{case_id}/{file_uuid}.{ext}"
+    gcs_uri = f"gs://{settings.GCS_RAW_BUCKET}/{blob_name}"
 
-    # Fast local buffer save to raw_uploads AND fake_gcs raw bucket
-    temp_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../raw_uploads"))
-    os.makedirs(temp_dir, exist_ok=True)
-    local_temp_path = os.path.join(temp_dir, f"{case_id}_{file_uuid}.{ext}")
-
-    local_gcs_raw_dir = os.path.join(get_local_cache_dir(), settings.GCS_RAW_BUCKET, "cases", str(case_id))
-    os.makedirs(local_gcs_raw_dir, exist_ok=True)
-    local_gcs_raw_path = os.path.join(local_gcs_raw_dir, f"{file_uuid}.{ext}")
-    
     try:
         await file.seek(0)
-        with open(local_temp_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-            
-        # Copy to local GCS cache for immediate availability
-        shutil.copy2(local_temp_path, local_gcs_raw_path)
-        print(f"[Upload Success] Buffered raw slide file to local cache ({os.path.getsize(local_temp_path)} bytes)")
+        upload_blob_from_file(
+            bucket_name=settings.GCS_RAW_BUCKET,
+            blob_name=blob_name,
+            file_obj=file.file,
+            content_type=file.content_type or "application/octet-stream"
+        )
+        print(f"[Upload Success] Directly uploaded slide to {gcs_uri}")
     except Exception as save_err:
-        print(f"[Upload Error] Local file save failed: {save_err}")
-        raise HTTPException(status_code=500, detail=f"Local file buffer save failed: {str(save_err)}")
+        print(f"[Upload Error] GCS bucket upload failed: {save_err}")
+        raise HTTPException(status_code=500, detail=f"GCS bucket upload failed: {str(save_err)}")
 
     # Create slide record
     slide_obj = Slide(
@@ -146,7 +131,7 @@ async def upload_slide_file(
     db.add(slide_obj)
     db.flush()
     
-    # Queue 'ingest' stage_execution with local file reference for background worker GCS streaming
+    # Queue 'ingest' stage_execution
     stage_exec = StageExecution(
         case_id=case_id,
         stage="ingest",
@@ -155,8 +140,7 @@ async def upload_slide_file(
         input_ref={
             "gcs_uri_original": gcs_uri,
             "slide_id": str(slide_obj.id),
-            "blob_name": blob_name,
-            "local_file_path": local_temp_path
+            "blob_name": blob_name
         }
     )
     db.add(stage_exec)
@@ -329,8 +313,9 @@ def get_slide_upload_url(
     file_uuid = uuid.uuid4()
     ext = req.filename.rsplit(".", 1)[-1].lower() if "." in req.filename else "svs"
     
-    gcs_uri = f"gs://{settings.GCS_RAW_BUCKET}/cases/{case_id}/{file_uuid}.{ext}"
-    upload_url = f"{settings.STORAGE_EMULATOR_HOST}/upload/storage/v1/b/{settings.GCS_RAW_BUCKET}/o?uploadType=resumable&name=cases/{case_id}/{file_uuid}.{ext}"
+    blob_name = f"cases/{case_id}/{file_uuid}.{ext}"
+    gcs_uri = f"gs://{settings.GCS_RAW_BUCKET}/{blob_name}"
+    upload_url = generate_signed_upload_url(settings.GCS_RAW_BUCKET, blob_name)
 
     return SlideUploadUrlResponse(
         upload_url=upload_url,
@@ -390,30 +375,53 @@ def get_case_thumbnail(
     db: Session = Depends(get_db)
 ):
     """
-    Returns a high-speed whole-slide macro thumbnail (e.g. 256x256) of the case biopsy.
+    Returns a high-speed whole-slide macro thumbnail (e.g. 256x256) of the case biopsy directly from GCS.
     """
     stmt = select(Slide).where(Slide.case_id == case_id).limit(1)
     slide_obj = db.scalars(stmt).first()
     if not slide_obj:
         raise HTTPException(status_code=404, detail="Slide not found")
 
-    slide_file = find_slide_file(str(case_id), str(slide_obj.id), getattr(slide_obj, "local_path", None))
-    if not slide_file or not os.path.exists(slide_file):
-        raise HTTPException(status_code=404, detail="Slide file not found on disk")
+    gcs_uri = slide_obj.gcs_uri_original
+    if not gcs_uri:
+        raise HTTPException(status_code=404, detail="Slide GCS URI not set")
 
+    bucket_name, blob_name = parse_gcs_uri(gcs_uri)
+    ext = os.path.splitext(blob_name)[1] or ".svs"
+
+    temp_file = None
     try:
-        import openslide
-        with OPENSLIDE_GLOBAL_LOCK:
-            oslide = openslide.OpenSlide(slide_file)
-            thumb = oslide.get_thumbnail((256, 256)).convert("RGB")
-            oslide.close()
-    except Exception as e:
-        thumb = Image.new("RGB", (256, 256), color=(240, 225, 235))
+        temp_fd, temp_path = tempfile.mkstemp(suffix=ext, prefix="thumb_")
+        os.close(temp_fd)
+        temp_file = temp_path
 
-    buf = BytesIO()
-    thumb.save(buf, format="PNG")
-    buf.seek(0)
-    return Response(content=buf.getvalue(), media_type="image/png")
+        download_blob_to_filename(bucket_name, blob_name, temp_file)
+
+        try:
+            import openslide
+            with OPENSLIDE_GLOBAL_LOCK:
+                oslide = openslide.OpenSlide(temp_file)
+                thumb = oslide.get_thumbnail((256, 256)).convert("RGB")
+                oslide.close()
+        except Exception:
+            try:
+                with Image.open(temp_file) as pil_img:
+                    thumb = pil_img.copy()
+                    thumb.thumbnail((256, 256))
+                    thumb = thumb.convert("RGB")
+            except Exception:
+                thumb = Image.new("RGB", (256, 256), color=(240, 225, 235))
+
+        buf = BytesIO()
+        thumb.save(buf, format="PNG")
+        buf.seek(0)
+        return Response(content=buf.getvalue(), media_type="image/png")
+    finally:
+        if temp_file and os.path.exists(temp_file):
+            try:
+                os.remove(temp_file)
+            except Exception:
+                pass
 
 
 @router.get("/{case_id}", response_model=CaseDetailResponse)
@@ -464,7 +472,7 @@ def get_case_detail(
     primary_slide_id = str(slides[0].id) if slides else None
     tile_template = None
     if primary_slide_id:
-        tile_template = get_gcs_tile_template_url(primary_slide_id, "orig")
+        tile_template = get_gcs_tile_template_url(primary_slide_id, "{layer}")
 
     return CaseDetailResponse(
         id=case_obj.id,

@@ -94,6 +94,12 @@ export function OpenSeadragonViewer({
   >([]);
   const [focusedHotspotId, setFocusedHotspotId] = useState<string | null>(null);
 
+  useEffect(() => {
+    if (layer && (layer === "orig" || layer === "norm")) {
+      setActiveLayer(layer);
+    }
+  }, [layer]);
+
   const isAddingRoiModeRef = useRef(isAddingRoiMode);
   useEffect(() => {
     isAddingRoiModeRef.current = isAddingRoiMode;
@@ -236,6 +242,9 @@ export function OpenSeadragonViewer({
   useEffect(() => {
     if (!containerRef.current) return;
 
+    // Capture previous viewport bounds so zooming/panning is preserved across layer switches
+    const prevBounds = viewerRef.current?.viewport ? viewerRef.current.viewport.getBounds() : null;
+
     if (viewerRef.current) {
       viewerRef.current.destroy();
       viewerRef.current = null;
@@ -255,11 +264,16 @@ export function OpenSeadragonViewer({
         // Beyond 10x level (level > maxLevel - 2), normalized pyramid falls back to original colors
         const effectiveLayer = (activeLayer === "norm" && level > maxLevel - 2) ? "orig" : activeLayer;
         if (tileUrlTemplate) {
-          return tileUrlTemplate
+          let url = tileUrlTemplate;
+          if (url.includes("{layer}")) {
+            url = url.replace("{layer}", effectiveLayer);
+          } else {
+            url = url.replace("/orig/", `/${effectiveLayer}/`).replace("/norm/", `/${effectiveLayer}/`);
+          }
+          return url
             .replace("{z}", level.toString())
             .replace("{x}", x.toString())
-            .replace("{y}", y.toString())
-            .replace("{layer}", effectiveLayer);
+            .replace("{y}", y.toString());
         }
         return `${API_BASE}/api/v1/cases/${caseId}/tiles/${effectiveLayer}/${level}/${x}_${y}.png`;
       }
@@ -299,7 +313,11 @@ export function OpenSeadragonViewer({
     viewer.addHandler("open", () => {
       onViewportChange();
       if (viewer.viewport) {
-        viewer.viewport.goHome(true);
+        if (prevBounds) {
+          viewer.viewport.fitBounds(prevBounds, true);
+        } else {
+          viewer.viewport.goHome(true);
+        }
         viewer.viewport.applyConstraints();
       }
     });
@@ -330,7 +348,7 @@ export function OpenSeadragonViewer({
         viewerRef.current = null;
       }
     };
-  }, [caseId, activeLayer, imageWidthPx, imageHeightPx, mppX, mppY]);
+  }, [caseId, activeLayer, imageWidthPx, imageHeightPx, mppX, mppY, tileUrlTemplate]);
 
   // Sync heatmap overlay without recreating viewer
   useEffect(() => {

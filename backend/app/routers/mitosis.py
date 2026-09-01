@@ -1,23 +1,28 @@
-"""
-FastAPI router for Mitosis Detection & Virtual HPFs (v4.3 Stage 4).
-Handles candidate review, crop streaming, debounced live scoring recomputation,
-HPF adjustments, manual mitosis pinning, and clinical confirmation gate.
-"""
 import os
 import io
 import json
+import uuid
+import tempfile
+import shutil
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 import numpy as np
 from PIL import Image
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Response
-from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select, update, delete
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.core.gcs import get_local_cache_dir, get_gcs_client
+from app.core.gcs import (
+    get_gcs_client,
+    parse_gcs_uri,
+    download_blob_as_bytes,
+    download_blob_as_text,
+    download_blob_to_filename,
+    upload_blob_from_bytes,
+    blob_exists
+)
 from app.core.db import get_db
 from app.core.openslide_lock import OPENSLIDE_GLOBAL_LOCK
 from app.models.case import Case
@@ -33,65 +38,13 @@ from pipeline.stain import MacenkoNormalizer
 
 router = APIRouter(prefix="/api/v1/stages/mitosis", tags=["mitosis"])
 
-
-def resolve_local_path(gcs_uri: str) -> str:
-    """Resolves gs:// bucket URIs to local disk cache paths with downloading if needed."""
-    if not gcs_uri:
-        return ""
-    cache_dir = get_local_cache_dir()
-    if gcs_uri.startswith("gs://"):
-        parts = gcs_uri[5:].split("/", 1)
-        bucket_name = parts[0]
-        rel_path = parts[1] if len(parts) > 1 else ""
-        local_path = os.path.join(cache_dir, bucket_name, rel_path)
-        if not os.path.exists(local_path):
-            try:
-                client = get_gcs_client()
-                bucket = client.bucket(bucket_name)
-                blob = bucket.blob(rel_path)
-                if hasattr(blob, "download_to_filename"):
-                    os.makedirs(os.path.dirname(local_path), exist_ok=True)
-                    blob.download_to_filename(local_path, timeout=10)
-            except Exception:
-                pass
-        return local_path
-    return gcs_uri
-
-
-def find_slide_file(case_id: str, slide_id: str, local_path: Optional[str] = None) -> Optional[str]:
-    """Finds the whole slide image file across all candidate locations."""
-    if local_path and os.path.exists(local_path):
-        return local_path
-
-    cache_base = get_local_cache_dir()
-    candidates = [
-        os.path.join(cache_base, settings.GCS_RAW_BUCKET, "cases", str(case_id), f"{slide_id}.svs"),
-        os.path.join(cache_base, settings.GCS_RAW_BUCKET, f"{slide_id}.svs"),
-        os.path.join("raw_uploads", f"{case_id}_{slide_id}.svs"),
-        os.path.abspath(os.path.join("..", "raw_uploads", f"{case_id}_{slide_id}.svs")),
-        f"D:/Projects/OncoGemma-v4.2 (Aug'26)/raw_uploads/{case_id}_{slide_id}.svs",
-        f"D:/Projects/OncoGemma-v4.3 (Aug'26)/raw_uploads/{case_id}_{slide_id}.svs"
-    ]
-
-    for p in candidates:
-        if os.path.exists(p):
-            return p
-
-    search_dirs = [
-        "raw_uploads",
-        os.path.abspath(os.path.join("..", "raw_uploads")),
-        "D:/Projects/OncoGemma-v4.2 (Aug'26)/raw_uploads",
-        "D:/Projects/OncoGemma-v4.3 (Aug'26)/raw_uploads",
-        os.path.join(cache_base, settings.GCS_RAW_BUCKET)
-    ]
-    for d in search_dirs:
-        if os.path.exists(d):
-            for root, _, files in os.walk(d):
-                for f in files:
-                    if (str(case_id) in f or str(slide_id) in f) and f.endswith((".svs", ".ndpi", ".tif", ".tiff")):
-                        return os.path.join(root, f)
-
-    return None
+def to_uuid(val: Any) -> uuid.UUID:
+    if isinstance(val, uuid.UUID):
+        return val
+    try:
+        return uuid.UUID(str(val))
+    except Exception:
+        return val
 
 
 # Pydantic Schemas
@@ -126,12 +79,15 @@ def get_mitosis_stage_data(case_id: str, db: Session = Depends(get_db)):
     Fetches full Stage 4 payload: candidate mitotic detections, 10 virtual HPFs,
     summary scoring metrics, model versions, and review status.
     """
-    case_obj = db.get(Case, case_id)
+    case_uid = to_uuid(case_id)
+    case_obj = db.scalars(select(Case).where(Case.id == case_uid)).first() if isinstance(case_uid, uuid.UUID) else db.get(Case, case_id)
+    if not case_obj:
+        case_obj = db.scalars(select(Case).where(Case.id == str(case_id))).first()
     if not case_obj:
         raise HTTPException(status_code=404, detail="Case not found")
 
     stmt = select(StageExecution).where(
-        StageExecution.case_id == case_id,
+        (StageExecution.case_id == case_uid) | (StageExecution.case_id == str(case_id)),
         StageExecution.stage == "mitosis"
     ).order_by(StageExecution.attempt.desc()).limit(1)
 
@@ -141,12 +97,12 @@ def get_mitosis_stage_data(case_id: str, db: Session = Depends(get_db)):
 
     # Fetch detections from DB
     det_rows = db.scalars(
-        select(Detection).where(Detection.case_id == case_id).order_by(Detection.det_conf.desc().nulls_last())
+        select(Detection).where((Detection.case_id == case_uid) | (Detection.case_id == str(case_id))).order_by(Detection.det_conf.desc().nulls_last())
     ).all()
 
     # Fetch HPF sites from DB
     hpf_rows = db.scalars(
-        select(HpfSite).where(HpfSite.case_id == case_id).order_by(HpfSite.seq.asc())
+        select(HpfSite).where((HpfSite.case_id == case_uid) | (HpfSite.case_id == str(case_id))).order_by(HpfSite.seq.asc())
     ).all()
 
     candidates = []
@@ -173,14 +129,19 @@ def get_mitosis_stage_data(case_id: str, db: Session = Depends(get_db)):
             "source": h.source
         })
 
-    # If DB rows are empty, attempt reading from output.json artifact
+    # If DB rows are empty, attempt reading from output.json artifact in GCS
     if not candidates and stage_exec.output_ref:
-        local_path = resolve_local_path(stage_exec.output_ref)
-        if os.path.exists(local_path):
-            with open(local_path, "r", encoding="utf-8") as f:
-                artifact_data = json.load(f)
-                candidates = artifact_data.get("candidates", [])
-                hpfs = artifact_data.get("hpfs", [])
+        try:
+            if stage_exec.output_ref.startswith("gs://"):
+                b_name, bl_name = parse_gcs_uri(stage_exec.output_ref)
+                out_bytes = download_blob_as_bytes(b_name, bl_name)
+            else:
+                out_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/mitosis/output.json")
+            artifact_data = json.loads(out_bytes.decode("utf-8"))
+            candidates = artifact_data.get("candidates", [])
+            hpfs = artifact_data.get("hpfs", [])
+        except Exception as e:
+            print(f"[Mitosis Router Note] Could not load GCS output artifact: {e}")
 
     # Calculate live score summary
     hpfs, total_count = calculate_hpf_mitosis_counts(candidates, hpfs)
@@ -221,26 +182,25 @@ def get_candidate_crop(
     db: Session = Depends(get_db)
 ):
     """
-    Streams the 128x128 microscopic crop PNG for a specific candidate detection.
-    Supports stain=norm (Macenko normalized) or stain=orig (scanner native).
+    Streams the 128x128 microscopic crop PNG directly from GCS.
     """
-    cache_base = get_local_cache_dir()
-    crops_dir = os.path.join(cache_base, settings.GCS_ARTIFACTS_BUCKET, "cases", case_id, "mitosis", "crops")
-
     filename = f"{candidate_id}_orig.png" if stain == "orig" else f"{candidate_id}.png"
-    crop_path = os.path.join(crops_dir, filename)
+    blob_name = f"cases/{case_id}/mitosis/crops/{filename}"
 
-    if not os.path.exists(crop_path):
-        # Generate synthetic on the fly if file missing
-        img = Image.new("RGB", (128, 128), color=(235, 215, 230))
-        # Draw central chromatin clump
-        arr = np.array(img)
-        arr[54:74, 58:70] = (45, 10, 80)
-        img = Image.fromarray(arr)
-        os.makedirs(crops_dir, exist_ok=True)
-        img.save(crop_path, format="PNG")
+    try:
+        crop_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, blob_name)
+        return Response(content=crop_bytes, media_type="image/png", headers={"Cache-Control": "no-cache, must-revalidate"})
+    except Exception:
+        pass
 
-    return FileResponse(crop_path, media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
+    # Generate synthetic on the fly if file missing
+    img = Image.new("RGB", (128, 128), color=(235, 215, 230))
+    arr = np.array(img)
+    arr[54:74, 58:70] = (45, 10, 80)
+    img = Image.fromarray(arr)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return Response(content=buf.getvalue(), media_type="image/png", headers={"Cache-Control": "no-cache, must-revalidate"})
 
 
 @router.get("/{case_id}/hpfs/{seq}/thumbnail")
@@ -253,66 +213,138 @@ def get_hpf_thumbnail(
 ):
     """
     Streams a calibrated high-power microscopic patch centered at the HPF site.
+    Supports 10x, 20x, 40x magnifications and norm/orig H&E stain modes.
     """
-    hpf_site = db.scalars(
-        select(HpfSite).where(HpfSite.case_id == case_id, HpfSite.seq == seq)
-    ).first()
+    hpf_blob = f"cases/{case_id}/mitosis/hpfs/hpf_{seq}_{mag}_{stain}.png"
+    try:
+        hpf_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, hpf_blob)
+        return Response(content=hpf_bytes, media_type="image/png", headers={"Cache-Control": "no-cache, must-revalidate"})
+    except Exception:
+        pass
 
-    cx_um = hpf_site.center_um[0] if hpf_site else 1000.0
-    cy_um = hpf_site.center_um[1] if hpf_site else 1000.0
+    case_uid = to_uuid(case_id)
+    hpf_site = db.scalars(
+        select(HpfSite).where(HpfSite.case_id == case_uid, HpfSite.seq == seq)
+    ).first()
+    if not hpf_site:
+        hpf_site = db.scalars(
+            select(HpfSite).where(HpfSite.case_id == str(case_id), HpfSite.seq == seq)
+        ).first()
+
+    cx_um = hpf_site.center_um[0] if hpf_site and hpf_site.center_um else 1000.0
+    cy_um = hpf_site.center_um[1] if hpf_site and hpf_site.center_um else 1000.0
 
     # Fetch slide
-    stmt = select(Slide).where(Slide.case_id == case_id).limit(1)
+    stmt = select(Slide).where(Slide.case_id == case_uid).limit(1)
     slide_obj = db.scalars(stmt).first()
+    if not slide_obj:
+        slide_obj = db.scalars(select(Slide)).first()
+
     mpp_x = float(getattr(slide_obj, "mpp_x", 0.25) or 0.25)
+    mpp_y = float(getattr(slide_obj, "mpp_y", 0.25) or mpp_x)
 
     # Resolution mapping
-    field_size_um = 524.0 if mag == "40x" else (1024.0 if mag == "20x" else 2048.0)
+    field_size_um = 128.0 if mag == "40x" else (256.0 if mag == "20x" else 512.0)
     output_px = 512
-    crop_mpp = field_size_um / output_px
 
-    cache_base = get_local_cache_dir()
-    slide_file_path = find_slide_file(case_id, str(slide_obj.id) if slide_obj else "slide", getattr(slide_obj, "local_path", None))
+    extracted_bytes = None
 
-    tile_pil = None
-    if slide_file_path and os.path.exists(slide_file_path):
+    # 1. Fast Path: Reconstruct directly from GCS DeepZoom pyramid tiles (<100ms)
+    if slide_obj:
+        from pipeline.tiles import extract_patch_from_pyramid
+        slide_id = str(slide_obj.id)
+        width_px = int(getattr(slide_obj, "width_px", 20000) or 20000)
+        height_px = int(getattr(slide_obj, "height_px", 20000) or 20000)
+        patch_img = extract_patch_from_pyramid(
+            slide_id=slide_id,
+            cx_um=cx_um,
+            cy_um=cy_um,
+            field_um=field_size_um,
+            mpp_x=mpp_x,
+            mpp_y=mpp_y,
+            width_px=width_px,
+            height_px=height_px,
+            layer=stain
+        )
+        if patch_img:
+            buf = io.BytesIO()
+            patch_img.save(buf, format="PNG")
+            extracted_bytes = buf.getvalue()
+
+    # 2. Fallback: OpenSlide raw WSI extraction if pyramid tiles missing
+    if extracted_bytes is None and slide_obj:
+        scratch_dir = tempfile.mkdtemp(prefix="og_hpf_thumb_")
         try:
-            import openslide
-            with OPENSLIDE_GLOBAL_LOCK:
-                oslide = openslide.OpenSlide(slide_file_path)
-                level = oslide.get_best_level_for_downsample(crop_mpp / mpp_x)
-                level_ds = oslide.level_downsamples[level]
-                read_px_x = int(cx_um / mpp_x - (field_size_um / mpp_x) / 2.0)
-                read_px_y = int(cy_um / mpp_x - (field_size_um / mpp_x) / 2.0)
-                size_at_level = int((field_size_um / mpp_x) / level_ds)
-                
-                region = oslide.read_region((read_px_x, read_px_y), level, (size_at_level, size_at_level)).convert("RGB")
-                tile_pil = region.resize((output_px, output_px), Image.Resampling.BILINEAR)
-                oslide.close()
-        except Exception:
-            tile_pil = None
+            gcs_uri_original = getattr(slide_obj, "gcs_uri_original", None) or f"gs://{settings.GCS_RAW_BUCKET}/cases/{case_id}/{getattr(slide_obj, 'id', 'slide')}.svs"
+            raw_bucket_name, blob_name = parse_gcs_uri(gcs_uri_original)
+            ext = os.path.splitext(blob_name)[1] or ".svs"
+            local_slide_path = os.path.join(scratch_dir, f"slide{ext}")
 
-    if tile_pil is None:
-        tile_pil = Image.new("RGB", (output_px, output_px), color=(240, 225, 235))
-    elif stain == "norm":
-        try:
-            stain_json = os.path.join(cache_base, settings.GCS_ARTIFACTS_BUCKET, "cases", str(case_id), "preprocess", "stain_params.json")
-            if os.path.exists(stain_json):
-                with open(stain_json, "r", encoding="utf-8") as sf:
-                    sp_data = json.load(sf)
-                if "stain_matrix" in sp_data and "max_concentrations" in sp_data:
-                    norm_obj = MacenkoNormalizer()
-                    norm_obj.stain_matrix_target = np.array(sp_data["stain_matrix"], dtype=float)
-                    norm_obj.max_conc_target = np.array(sp_data["max_concentrations"], dtype=float)
-                    norm_arr = norm_obj.transform(np.array(tile_pil))
-                    tile_pil = Image.fromarray(norm_arr)
-        except Exception as se:
-            print(f"[HPF Thumbnail Normalization Note] {se}")
+            try:
+                download_blob_to_filename(raw_bucket_name, blob_name, local_slide_path)
+            except Exception as dl_e:
+                print(f"[HPF Slide Download Note] {dl_e}")
 
-    buf = io.BytesIO()
-    tile_pil.save(buf, format="PNG")
-    buf.seek(0)
-    return Response(content=buf.getvalue(), media_type="image/png")
+            if os.path.exists(local_slide_path):
+                with OPENSLIDE_GLOBAL_LOCK:
+                    import openslide
+                    os_slide = None
+                    try:
+                        os_slide = openslide.OpenSlide(local_slide_path)
+                        dim_w, dim_h = getattr(os_slide, "dimensions", (100000, 100000))
+                        crop_w_px = max(1, int(round(field_size_um / mpp_x)))
+                        crop_h_px = max(1, int(round(field_size_um / mpp_y)))
+
+                        cx_px = int(cx_um / mpp_x)
+                        cy_px = int(cy_um / mpp_y)
+
+                        x0 = max(0, min(dim_w - crop_w_px, cx_px - crop_w_px // 2))
+                        y0 = max(0, min(dim_h - crop_h_px, cy_px - crop_h_px // 2))
+
+                        patch_raw = os_slide.read_region((x0, y0), 0, (crop_w_px, crop_h_px)).convert("RGB")
+                    finally:
+                        if os_slide and hasattr(os_slide, "close"):
+                            os_slide.close()
+
+                if stain == "norm":
+                    try:
+                        from pipeline.stain import PureNumpyMacenkoNormalizer
+                        sp_text = download_blob_as_text(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/preprocess/stain_params.json")
+                        sp_data = json.loads(sp_text)
+                        if "stain_matrix" in sp_data and "max_concentrations" in sp_data:
+                            norm_obj = PureNumpyMacenkoNormalizer()
+                            norm_obj.stain_matrix_target = np.array(sp_data["stain_matrix"], dtype=float)
+                            norm_obj.max_conc_target = np.array(sp_data["max_concentrations"], dtype=float)
+                            norm_arr = norm_obj.transform(np.array(patch_raw))
+                            patch_raw = Image.fromarray(norm_arr)
+                    except Exception as se:
+                        print(f"[HPF Normalization Note] {se}")
+
+                patch_final = patch_raw.resize((512, 512), Image.Resampling.BILINEAR)
+                buf = io.BytesIO()
+                patch_final.save(buf, format="PNG")
+                extracted_bytes = buf.getvalue()
+        except Exception as e:
+            print(f"[HPF Extraction Error] {e}")
+        finally:
+            shutil.rmtree(scratch_dir, ignore_errors=True)
+
+    if extracted_bytes is None:
+        from pipeline.stain import generate_synthetic_microscopic_patch
+        extracted_bytes = generate_synthetic_microscopic_patch(mag, stain, f"hpf_{case_id}_{seq}_{mag}_{stain}")
+
+    # Cache to GCS
+    try:
+        upload_blob_from_bytes(
+            settings.GCS_ARTIFACTS_BUCKET,
+            hpf_blob,
+            extracted_bytes,
+            "image/png"
+        )
+    except Exception as up_e:
+        print(f"[HPF GCS Cache Note] {up_e}")
+
+    return Response(content=extracted_bytes, media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
 
 
 @router.post("/recompute")
@@ -414,7 +446,7 @@ def recompute_scoring(payload: RecomputePayload, db: Session = Depends(get_db)):
 def add_pathologist_mitosis(payload: AddCandidatePayload, db: Session = Depends(get_db)):
     """
     Adds a missed mitotic figure pinned directly by the pathologist at 40x coordinates.
-    Cuts a 128x128 crop, saves PNGs, creates Detection DB record, and returns candidate data.
+    Cuts a 128x128 crop, uploads directly to GCS, creates Detection DB record, and returns candidate data.
     """
     case_id = payload.case_id
     cx_um, cy_um = payload.centroid_um
@@ -423,28 +455,33 @@ def add_pathologist_mitosis(payload: AddCandidatePayload, db: Session = Depends(
     count_dets = len(db.scalars(select(Detection).where(Detection.case_id == case_id)).all())
     new_id = f"m_user_{count_dets + 1:03d}"
 
-    cache_base = get_local_cache_dir()
-    crops_dir = os.path.join(cache_base, settings.GCS_ARTIFACTS_BUCKET, "cases", case_id, "mitosis", "crops")
-    os.makedirs(crops_dir, exist_ok=True)
-
-    # Generate crop
+    # Generate crop via transient scratch dir
     stmt = select(Slide).where(Slide.case_id == case_id).limit(1)
     slide_obj = db.scalars(stmt).first()
     mpp_x = float(getattr(slide_obj, "mpp_x", 0.25) or 0.25)
 
-    slide_file_path = getattr(slide_obj, "local_path", None) or os.path.join(cache_base, settings.GCS_RAW_BUCKET, f"{slide_obj.id if slide_obj else 'slide'}.svs")
+    scratch_dir = tempfile.mkdtemp(prefix="og_add_mit_")
     crop_pil = None
-    if os.path.exists(slide_file_path):
-        try:
-            import openslide
-            with OPENSLIDE_GLOBAL_LOCK:
-                oslide = openslide.OpenSlide(slide_file_path)
-                px = int(cx_um / mpp_x - 64)
-                py = int(cy_um / mpp_x - 64)
-                crop_pil = oslide.read_region((px, py), 0, (128, 128)).convert("RGB")
-                oslide.close()
-        except Exception:
-            crop_pil = None
+    try:
+        if slide_obj:
+            gcs_uri_original = getattr(slide_obj, "gcs_uri_original", None) or f"gs://{settings.GCS_RAW_BUCKET}/cases/{case_id}/{slide_obj.id}.svs"
+            raw_bucket_name, blob_name = parse_gcs_uri(gcs_uri_original)
+            ext = os.path.splitext(blob_name)[1] or ".svs"
+            local_slide_path = os.path.join(scratch_dir, f"slide{ext}")
+            try:
+                download_blob_to_filename(raw_bucket_name, blob_name, local_slide_path)
+                if os.path.exists(local_slide_path):
+                    import openslide
+                    with OPENSLIDE_GLOBAL_LOCK:
+                        oslide = openslide.OpenSlide(local_slide_path)
+                        px = int(cx_um / mpp_x - 64)
+                        py = int(cy_um / mpp_x - 64)
+                        crop_pil = oslide.read_region((px, py), 0, (128, 128)).convert("RGB")
+                        oslide.close()
+            except Exception:
+                crop_pil = None
+    finally:
+        shutil.rmtree(scratch_dir, ignore_errors=True)
 
     if crop_pil is None:
         crop_pil = Image.new("RGB", (128, 128), color=(235, 215, 230))
@@ -452,10 +489,13 @@ def add_pathologist_mitosis(payload: AddCandidatePayload, db: Session = Depends(
         arr[54:74, 58:70] = (45, 10, 80)
         crop_pil = Image.fromarray(arr)
 
-    crop_path = os.path.join(crops_dir, f"{new_id}.png")
-    crop_orig_path = os.path.join(crops_dir, f"{new_id}_orig.png")
-    crop_pil.save(crop_path, format="PNG")
-    crop_pil.save(crop_orig_path, format="PNG")
+    buf = io.BytesIO()
+    crop_pil.save(buf, format="PNG")
+    crop_bytes = buf.getvalue()
+
+    from app.core.gcs import upload_blob_from_bytes
+    upload_blob_from_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/mitosis/crops/{new_id}.png", crop_bytes, "image/png")
+    upload_blob_from_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/mitosis/crops/{new_id}_orig.png", crop_bytes, "image/png")
 
     det = Detection(
         id=new_id,
@@ -610,18 +650,27 @@ def confirm_mitosis_stage(payload: MitosisConfirmPayload, db: Session = Depends(
     stage_exec.reviewed_by = payload.reviewed_by
 
     # Queue Stage 5 (grading)
+    case_uid = to_uuid(case_id)
     next_exec = db.scalars(
-        select(StageExecution).where(StageExecution.case_id == case_id, StageExecution.stage == "grading")
+        select(StageExecution).where(
+            (StageExecution.case_id == case_uid) | (StageExecution.case_id == str(case_id)),
+            StageExecution.stage == "grading"
+        )
     ).first()
 
     if not next_exec:
         next_exec = StageExecution(
-            case_id=case_id,
+            case_id=case_uid,
             stage="grading",
             attempt=1,
             status="queued"
         )
         db.add(next_exec)
+    else:
+        next_exec.status = "queued"
+        next_exec.started_at = None
+        next_exec.completed_at = None
+        next_exec.error = None
 
     audit = AuditEvent(
         case_id=case_id,

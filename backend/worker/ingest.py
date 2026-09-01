@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import uuid
 import math
 import hashlib
@@ -16,7 +17,12 @@ from PIL import Image
 Image.MAX_IMAGE_PIXELS = None
 
 from app.core.config import settings
-from app.core.gcs import get_gcs_client, get_local_cache_dir
+from app.core.gcs import (
+    get_gcs_client,
+    parse_gcs_uri,
+    upload_blob_from_bytes,
+    download_blob_to_filename
+)
 from app.models.slide import Slide
 from app.models.stage_execution import StageExecution
 from app.models.audit import AuditEvent
@@ -119,64 +125,50 @@ def generate_dzi_pyramid(filepath: str, output_dir: str) -> str:
     # 2. Secondary: Pyvips
     try:
         import pyvips
-        img = pyvips.Image.new_from_file(filepath)
-        img.dzsave(
-            dzi_base,
-            tile_size=256,
-            overlap=0,
-            suffix=".jpg[Q=80]"
-        )
+        image = pyvips.Image.new_from_file(filepath, access="sequential")
+        image.dzsave(dzi_base, tile_size=256, overlap=0, suffix=".png[Q=90]")
         return dzi_base + ".dzi"
     except Exception as pe:
         print(f"[Ingest Worker Note] Pyvips note: {pe}. Using Pillow DZI generator.")
 
-    # 3. Tertiary: Pillow
+    # 3. Tertiary: Pillow Frame Extractor
     try:
         with Image.open(filepath) as pil_img:
-            try:
-                if hasattr(pil_img, "n_frames") and pil_img.n_frames > 1:
-                    target_frame = min(2, pil_img.n_frames - 1)
-                    pil_img.seek(target_frame)
-            except Exception as se:
-                print(f"[Ingest Worker Note] Pyramidal frame seek note: {se}")
-
-            if pil_img.mode != "RGB":
-                img = pil_img.convert("RGB")
-            else:
-                img = pil_img.copy()
-
-            width, height = img.size
-            max_dim = max(width, height)
-            raw_max_level = int(math.ceil(math.log2(max_dim))) if max_dim > 0 else 10
+            w, h = pil_img.size
+            max_level = int(math.ceil(math.log2(max(w, h))))
             
-            effective_max_level = raw_max_level
-            for level in range(0, effective_max_level + 1):
-                level_scale = 2 ** (level - raw_max_level)
-                level_w = max(1, int(round(width * level_scale)))
-                level_h = max(1, int(round(height * level_scale)))
-                
-                level_img = img.resize((level_w, level_h), Image.Resampling.BILINEAR)
-
+            for level in range(max_level + 1):
                 level_dir = os.path.join(dzi_files_dir, str(level))
                 os.makedirs(level_dir, exist_ok=True)
                 
-                tile_size = 256
-                cols = int(math.ceil(level_w / tile_size))
-                rows = int(math.ceil(level_h / tile_size))
+                scale = 2 ** (level - max_level)
+                lw = max(1, int(w * scale))
+                lh = max(1, int(h * scale))
+                
+                try:
+                    pil_img.seek(max_level - level)
+                    level_img = pil_img.copy().convert("RGB")
+                except Exception:
+                    level_img = pil_img.resize((lw, lh), Image.Resampling.BILINEAR).convert("RGB")
+                    
+                cols = int(math.ceil(lw / 256.0))
+                rows = int(math.ceil(lh / 256.0))
                 
                 for c in range(cols):
                     for r in range(rows):
-                        left = c * tile_size
-                        upper = r * tile_size
-                        right = min(left + tile_size, level_w)
-                        lower = min(upper + tile_size, level_h)
+                        x = c * 256
+                        y = r * 256
+                        box = (x, y, min(x + 256, lw), min(y + 256, lh))
+                        tile = level_img.crop(box)
                         
-                        crop_box = (left, upper, right, lower)
-                        tile_img = level_img.crop(crop_box)
+                        if tile.size != (256, 256):
+                            padded = Image.new("RGB", (256, 256), (255, 255, 255))
+                            padded.paste(tile, (0, 0))
+                            tile = padded
+                            
+                        tile.save(os.path.join(level_dir, f"{c}_{r}.jpg"), "JPEG", quality=85)
+                        tile.save(os.path.join(level_dir, f"{c}_{r}.png"), "PNG")
                         
-                        tile_path = os.path.join(level_dir, f"{c}_{r}.jpg")
-                        tile_img.save(tile_path, "JPEG", quality=80)
-
         return dzi_base + ".dzi"
     except Exception as ie:
         print(f"[Ingest Worker Note] Pillow open note: {ie}. Generating synthetic H&E WSI pyramid tiles.")
@@ -198,15 +190,8 @@ def generate_dzi_pyramid(filepath: str, output_dir: str) -> str:
 
 def upload_dzi_tree_to_gcs(dzi_files_dir: str, slide_id: str):
     """
-    Save generated DZI tile tree to real Google Cloud Storage pyramid bucket.
-    Also caches locally for fast read performance.
+    Save generated DZI tile tree directly to Google Cloud Storage pyramid bucket with zero local persistence.
     """
-    cache_dir = get_local_cache_dir()
-    local_pyramid_dir = os.path.join(cache_dir, settings.GCS_PYRAMIDS_BUCKET, str(slide_id), "orig")
-    if os.path.exists(local_pyramid_dir):
-        shutil.rmtree(local_pyramid_dir)
-    shutil.copytree(dzi_files_dir, local_pyramid_dir)
-
     client = get_gcs_client()
     try:
         bucket = client.bucket(settings.GCS_PYRAMIDS_BUCKET)
@@ -223,25 +208,24 @@ def upload_dzi_tree_to_gcs(dzi_files_dir: str, slide_id: str):
                     blob_path = f"{slide_id}/orig/{z_level}/{filename}"
                     blob = bucket.blob(blob_path)
                     c_type = "image/png" if filename.lower().endswith(".png") else "image/jpeg"
-                    blob.upload_from_filename(local_path, content_type=c_type, timeout=10)
+                    blob.upload_from_filename(local_path, content_type=c_type, timeout=15)
             except Exception:
                 pass
 
         with ThreadPoolExecutor(max_workers=16) as executor:
-            executor.map(upload_single_tile, tile_files)
+            list(executor.map(upload_single_tile, tile_files))
     except Exception as ge:
         print(f"[Ingest Worker Note] Parallel GCP cloud pyramid upload note: {ge}")
 
 def run_ingest(stage_execution: StageExecution, session: Session) -> tuple[str, dict]:
     """
     Ingest handler logic for worker execution.
-    Uploads raw WSI and pyramid tiles to real Google Cloud Storage.
+    Streams raw WSI from GCS raw bucket, generates DZI tiles, and uploads to GCS pyramid storage.
     Returns (output_ref_uri, model_versions_dict).
     """
     input_ref = stage_execution.input_ref or {}
     gcs_uri_original = input_ref.get("gcs_uri_original")
     slide_id = input_ref.get("slide_id")
-    local_file_path_input = input_ref.get("local_file_path")
 
     if not slide_id:
         raise ValueError("Missing slide_id in stage input_ref")
@@ -256,60 +240,22 @@ def run_ingest(stage_execution: StageExecution, session: Session) -> tuple[str, 
     scratch_dir = tempfile.mkdtemp(prefix="og_ingest_")
 
     try:
-        client = get_gcs_client()
         raw_bucket_name = settings.GCS_RAW_BUCKET
-        
         if gcs_uri_original and gcs_uri_original.startswith("gs://"):
-            parts = gcs_uri_original[5:].split("/", 1)
-            raw_bucket_name = parts[0]
-            blob_name = parts[1]
+            raw_bucket_name, blob_name = parse_gcs_uri(gcs_uri_original)
         else:
             blob_name = f"cases/{stage_execution.case_id}/{slide_id}.svs"
 
-        ext = os.path.splitext(local_file_path_input)[1] if local_file_path_input else ".svs"
+        ext = os.path.splitext(blob_name)[1]
         if not ext or len(ext) < 2:
             ext = ".svs"
         local_slide_path = os.path.join(scratch_dir, f"slide{ext}")
         
-        bucket = client.bucket(raw_bucket_name)
-        blob = bucket.blob(blob_name)
-        
-        local_cache_dir = get_local_cache_dir()
-        if local_file_path_input and os.path.exists(local_file_path_input):
-            shutil.copy2(local_file_path_input, local_slide_path)
-            
-            raw_dir = os.path.join(local_cache_dir, settings.GCS_RAW_BUCKET, "cases", str(stage_execution.case_id))
-            os.makedirs(raw_dir, exist_ok=True)
-            raw_file_dest = os.path.join(raw_dir, os.path.basename(blob_name))
-            if not os.path.exists(raw_file_dest):
-                shutil.copy2(local_file_path_input, raw_file_dest)
-
-            try:
-                if hasattr(blob, "upload_from_filename"):
-                    blob.upload_from_filename(local_slide_path, timeout=10)
-            except Exception as ge:
-                print(f"[Ingest Worker Note] GCS raw upload note: {ge}")
-        else:
-            gcs_exists = False
-            try:
-                gcs_exists = blob.exists(timeout=5)
-            except Exception:
-                pass
-                
-            if gcs_exists:
-                try:
-                    blob.download_to_filename(local_slide_path, timeout=10)
-                except Exception as de:
-                    print(f"[Ingest Worker Note] GCS download note: {de}")
-            else:
-                raw_dir = os.path.join(local_cache_dir, settings.GCS_RAW_BUCKET, "cases", str(stage_execution.case_id))
-                if os.path.exists(raw_dir):
-                    raw_files = [os.path.join(raw_dir, f) for f in os.listdir(raw_dir) if os.path.isfile(os.path.join(raw_dir, f))]
-                    if raw_files:
-                        shutil.copy2(raw_files[0], local_slide_path)
+        # Download directly from GCS raw bucket to transient scratch file
+        download_blob_to_filename(raw_bucket_name, blob_name, local_slide_path)
 
         if not os.path.exists(local_slide_path):
-            raise FileNotFoundError(f"Original slide file not found for ingest stage in case {stage_execution.case_id} (URI: {gcs_uri_original})")
+            raise FileNotFoundError(f"Original slide file not found in GCS for ingest stage in case {stage_execution.case_id} (URI: {gcs_uri_original})")
 
         # 1. SHA256
         checksum = calculate_sha256(local_slide_path)
@@ -330,12 +276,28 @@ def run_ingest(stage_execution: StageExecution, session: Session) -> tuple[str, 
         dzi_path = generate_dzi_pyramid(local_slide_path, scratch_dir)
         dzi_files_dir = dzi_path.replace(".dzi", "_files")
 
-        # 4. Save tile tree to GCS pyramid storage
+        # 4. Save tile tree directly to GCS pyramid storage
         if os.path.exists(dzi_files_dir):
             upload_dzi_tree_to_gcs(dzi_files_dir, str(slide_obj.id))
 
         gcs_pyramid_uri = f"gs://{settings.GCS_PYRAMIDS_BUCKET}/{slide_obj.id}/orig/"
         slide_obj.gcs_uri_pyramid = gcs_pyramid_uri
+
+        # 5. Output payload directly to GCS artifacts bucket
+        output_ref = f"gs://{settings.GCS_ARTIFACTS_BUCKET}/cases/{stage_execution.case_id}/ingest_output.json"
+        out_payload = {
+            "slide_id": str(slide_obj.id),
+            "checksum": checksum,
+            "mpp_x": slide_obj.mpp_x,
+            "dimensions": [slide_obj.width_px, slide_obj.height_px],
+            "gcs_uri_pyramid": gcs_pyramid_uri
+        }
+        upload_blob_from_bytes(
+            settings.GCS_ARTIFACTS_BUCKET,
+            f"cases/{stage_execution.case_id}/ingest_output.json",
+            json.dumps(out_payload, indent=2).encode("utf-8"),
+            "application/json"
+        )
 
         # Emit audit event
         audit = AuditEvent(
@@ -343,15 +305,9 @@ def run_ingest(stage_execution: StageExecution, session: Session) -> tuple[str, 
             actor="worker_ingest",
             event_type="stage_output",
             stage="ingest",
-            payload={
-                "slide_id": str(slide_obj.id),
-                "checksum": checksum,
-                "mpp_x": slide_obj.mpp_x,
-                "dimensions": [slide_obj.width_px, slide_obj.height_px],
-                "gcs_uri_pyramid": gcs_pyramid_uri
-            }
+            payload=out_payload
         )
-        output_ref = f"gs://{settings.GCS_ARTIFACTS_BUCKET}/cases/{stage_execution.case_id}/ingest_output.json"
+        session.add(audit)
 
         # Auto-chain next stage ('preprocess') in queued status
         existing_prep = session.scalars(
