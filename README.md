@@ -35,6 +35,27 @@
   * Generates dual-magnification inputs ($40\times$ reticle focus crop + $10\times$ HPF overview context).
   * **Mandatory Cross-Check Policy**: 100% of candidate mitoses—including figures that would otherwise be auto-confirmed—undergo mandatory MedGemma referee adjudication. Mimics are overruled and downgraded to `not_mitosis`, borderline figures are flagged for pathologist review, and verified mitoses receive sparkle badges and clinical rationale tooltips.
 
+### 🎯 MIDOG-Standard NMS & Optical Reticle Calibration (Latest)
+These fixes resolve coinciding / overlapping / duplicate mitotic figure counts — the most critical accuracy improvement to date.
+
+* **MIDOG 2022 Challenge–Standard 20 µm NMS** ([arXiv:2204.03742](https://arxiv.org/abs/2204.03742)):
+  * `configs/mitosis.yaml`: `nms_radius_um` raised from `7.5` → **`20.0` µm**, matching the MICCAI MIDOG challenge benchmark. A mitotic cell nucleus in IDC-NST measures 15–25 µm; any two detections within 20 µm are physically the same cell.
+  * **Intra-tile NMS**: Added local 80 px (= 20 µm @ 0.25 µm/px) suppression inside `YoloMitosisDetector.detect` to eliminate multi-contour fragments (metaphase / anaphase poles) of the same dividing cell before global merge.
+  * **Priority-sorted global NMS**: `apply_global_nms` now ranks candidates by label priority (`mitosis` > `unreviewed` > `not_mitosis`) and then by detection confidence before suppression, ensuring the best representative survives each cluster.
+  * **Post-MedGemma NMS (Double Pass)**: A second `apply_global_nms(candidates, 20.0)` is executed *after* the MedGemma referee in `backend/worker/mitosis.py`, permanently eliminating any spatial duplicates that could survive referee adjudication.
+
+* **Optical Reticle Calibration — 577.29 µm HPF Patch**:
+  * Root cause: the backend was extracting only a **128 µm × 128 µm** optical patch per HPF, while the frontend `MitosisViewer` canvas (520 × 520 px) with a reticle radius of 236 px represents a **577.29 µm** field of view ($520 \times 262.0/236.0 = 577.29\,\mu\text{m}$). This created a **4.5× scale mismatch** — pins landed on completely wrong cells, and detections beyond 64 µm from center were off-screen.
+  * Fix in `backend/worker/mitosis.py` and `backend/app/routers/mitosis.py`:
+    ```python
+    field_um = 577.29 if mag == "40x" else (1154.58 if mag == "20x" else 2309.15)
+    ```
+  * HPF background image pixels now align **1:1** with candidate pin overlays in the viewer at all magnifications.
+
+* **Frontend Candidate Filtering (MitosisViewer)**:
+  * `activeFieldCandidates` now filters strictly to the exact HPF circle ($r \le 262\,\mu\text{m}$) — the previous 15% spill margin was including candidates from adjacent fields.
+  * Candidates within each HPF are sorted by clinical priority: confirmed mitoses first, then unreviewed, then not_mitosis — descending by confidence within each group.
+
 ### 📊 Stage 5: Pixel-Level Morphometric Nottingham Grading
 * **Quantitative Histomorphometrics**: Resolved uniform score outputs by evaluating pixel-level glandular differentiation (Tubule Formation score) and nuclear area coefficient of variation & 90th/10th ratio (Nuclear Pleomorphism score).
 
