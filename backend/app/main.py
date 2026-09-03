@@ -49,10 +49,25 @@ async def background_pipeline_worker():
             logger.error(f"[Always-On Worker Exception] {exc}")
             await asyncio.sleep(2.0)
 
+
+def ensure_schema_up_to_date():
+    """Ensure newly added columns exist in Postgres production tables."""
+    from sqlalchemy import text
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE detections ADD COLUMN IF NOT EXISTS medgemma_verdict VARCHAR;"))
+            conn.execute(text("ALTER TABLE detections ADD COLUMN IF NOT EXISTS medgemma_rationale TEXT;"))
+            conn.execute(text("ALTER TABLE detections ADD COLUMN IF NOT EXISTS medgemma_confidence DOUBLE PRECISION;"))
+            logger.info("[Database Schema] Verified all columns exist on 'detections' table.")
+    except Exception as e:
+        logger.warning(f"[Database Schema Migration Note] {e}")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Ensure database tables exist for dev
     Base.metadata.create_all(bind=engine)
+    # Ensure newly added columns exist in existing tables
+    ensure_schema_up_to_date()
     # Ensure GCS buckets exist for local dev
     ensure_buckets_exist()
     # Launch persistent background worker task inside the Cloud Run process
