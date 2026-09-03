@@ -17,13 +17,54 @@ from app.routers import (
     cases_router, tiles_router, audit_router, triage_router, mitosis_router, grading_router, report_router, worker_webhook_router
 )
 
+import logging
+
+logger = logging.getLogger("oncogemma.daemon")
+
+async def background_pipeline_worker():
+    """
+    Self-healing, always-on background worker daemon running inside Cloud Run.
+    Continuously monitors the database for any 'queued' pipeline stages and executes
+    them immediately without relying on external task queues.
+    """
+    logger.info("[Always-On Worker] Initializing in-process pipeline worker daemon...")
+    from worker.main import poll_and_execute_single_task, reset_stuck_running_stages
+    try:
+        await asyncio.to_thread(reset_stuck_running_stages)
+    except Exception as e:
+        logger.warning(f"[Always-On Worker Reset Note] {e}")
+
+    while True:
+        try:
+            had_work = await asyncio.to_thread(poll_and_execute_single_task)
+            if not had_work:
+                await asyncio.sleep(1.5)
+            else:
+                # Chained stages execute immediately with minimal latency
+                await asyncio.sleep(0.05)
+        except asyncio.CancelledError:
+            logger.info("[Always-On Worker] Background worker cancelled gracefully.")
+            break
+        except Exception as exc:
+            logger.error(f"[Always-On Worker Exception] {exc}")
+            await asyncio.sleep(2.0)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Ensure database tables exist for dev
     Base.metadata.create_all(bind=engine)
     # Ensure GCS buckets exist for local dev
     ensure_buckets_exist()
-    yield
+    # Launch persistent background worker task inside the Cloud Run process
+    worker_task = asyncio.create_task(background_pipeline_worker())
+    try:
+        yield
+    finally:
+        worker_task.cancel()
+        try:
+            await worker_task
+        except asyncio.CancelledError:
+            pass
 
 app = FastAPI(
     title="OncoGemma v4.5 API",
