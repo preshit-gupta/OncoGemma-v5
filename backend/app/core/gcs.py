@@ -5,7 +5,9 @@ import glob
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from google.cloud import storage
+import google.oauth2.service_account
 from app.core.config import settings
+
 
 _gcs_client: storage.Client | None = None
 
@@ -91,47 +93,90 @@ def delete_blob(bucket_name: str, blob_name: str):
     if blob.exists():
         blob.delete()
 
-def generate_signed_upload_url(bucket_name: str, blob_name: str, expiration_minutes: int = 60) -> str:
-    """Generates a signed upload URL for direct browser-to-bucket upload."""
-    bucket = get_bucket(bucket_name)
-    blob = bucket.blob(blob_name)
-    client = get_gcs_client()
-    creds = client._credentials
-
-    if hasattr(creds, "valid") and not creds.valid:
-        try:
-            from google.auth.transport.requests import Request
-            creds.refresh(Request())
-        except Exception:
-            pass
-
-    sa_email = getattr(creds, "service_account_email", None) or "oncogemma-cloudrun-sa@oncogemma.iam.gserviceaccount.com"
-    token = getattr(creds, "token", None)
+def get_service_account_email() -> str:
+    """
+    Resolves the canonical service account email for signing.
+    Avoids using 'default' which is returned by compute_engine credentials.
+    """
+    sa_override = os.getenv("SERVICE_ACCOUNT_EMAIL")
+    if sa_override and "@" in sa_override:
+        return sa_override
 
     try:
-        kwargs = {
-            "version": "v4",
-            "expiration": timedelta(minutes=expiration_minutes),
-            "method": "PUT",
-            "content_type": "application/octet-stream",
-        }
-        if sa_email:
-            kwargs["service_account_email"] = sa_email
-        if token:
-            kwargs["access_token"] = token
+        import urllib.request
+        req = urllib.request.Request(
+            "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email",
+            headers={"Metadata-Flavor": "Google"}
+        )
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
+            email = resp.read().decode("utf-8").strip()
+            if "@" in email:
+                return email
+    except Exception:
+        pass
 
-        return blob.generate_signed_url(**kwargs)
-    except Exception as e:
-        print(f"[Signed URL Warning] Primary sign failed ({e}), attempting standard signed URL...")
-        try:
+    return "oncogemma-cloudrun-sa@oncogemma.iam.gserviceaccount.com"
+
+
+def generate_signed_upload_url(bucket_name: str, blob_name: str, expiration_minutes: int = 60) -> str:
+    """
+    Generates a V4 signed upload URL for direct browser-to-GCS upload.
+    Uses IAM Credentials API with explicit cloud-platform scope for Cloud Run compatibility.
+    """
+    import google.auth
+    from google.auth.transport.requests import Request
+    from google.auth.iam import Signer as IAMSigner
+
+    expiration = timedelta(minutes=expiration_minutes)
+
+    # 1. Strategy 1: Explicit private key signer (local dev with service account JSON file)
+    try:
+        client = get_gcs_client()
+        creds = client._credentials
+        sa_email = getattr(creds, "service_account_email", "")
+        if hasattr(creds, "signer") and "@" in sa_email:
+            bucket = get_bucket(bucket_name)
+            blob = bucket.blob(blob_name)
             return blob.generate_signed_url(
                 version="v4",
-                expiration=timedelta(minutes=expiration_minutes),
+                expiration=expiration,
                 method="PUT",
                 content_type="application/octet-stream",
             )
-        except Exception as err2:
-            raise RuntimeError(f"Could not generate signed upload URL: {e} / {err2}")
+    except Exception as e:
+        print(f"[Signed URL] Strategy 1 (SA private key) not available: {e}")
+
+    # 2. Strategy 2: IAM Credentials API Signer (Cloud Run / GCE / Workload Identity)
+    try:
+        sa_email = get_service_account_email()
+        iam_auth_creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+        req = Request()
+        if not iam_auth_creds.valid:
+            iam_auth_creds.refresh(req)
+
+        iam_signer = IAMSigner(req, iam_auth_creds, sa_email)
+        signing_creds = google.oauth2.service_account.Credentials(
+            signer=iam_signer,
+            service_account_email=sa_email,
+            token_uri="https://oauth2.googleapis.com/token",
+        )
+
+        iam_client = storage.Client(project=settings.GCP_PROJECT_ID, credentials=signing_creds)
+        iam_bucket = iam_client.bucket(bucket_name)
+        iam_blob = iam_bucket.blob(blob_name)
+
+        return iam_blob.generate_signed_url(
+            version="v4",
+            expiration=expiration,
+            method="PUT",
+            content_type="application/octet-stream",
+        )
+    except Exception as e2:
+        print(f"[Signed URL] Strategy 2 (IAM Signer) failed: {e2}")
+        raise RuntimeError(
+            f"Could not generate signed upload URL via IAM Credentials API: {e2}\n"
+            f"Ensure {sa_email} has roles/iam.serviceAccountTokenCreator on project {settings.GCP_PROJECT_ID}."
+        )
 
 def upload_directory_to_gcs_and_purge(local_dir: str, bucket_name: str, dest_prefix: str, max_workers: int = 16):
     """

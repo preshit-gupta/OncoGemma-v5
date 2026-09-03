@@ -72,7 +72,12 @@ export async function uploadSlideDirectToGCS(
   });
 
   if (!urlRes.ok) {
-    throw new Error(`Failed to acquire direct upload URL: ${urlRes.statusText}`);
+    let errDetail = urlRes.statusText;
+    try {
+      const body = await urlRes.json();
+      if (body.detail) errDetail = body.detail;
+    } catch (_) {}
+    throw new Error(`Failed to acquire direct upload URL (HTTP ${urlRes.status}): ${errDetail}`);
   }
 
   const { upload_url, gcs_uri } = await urlRes.json();
