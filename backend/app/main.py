@@ -16,6 +16,7 @@ from app.core.db import Base, engine
 from app.routers import (
     cases_router, tiles_router, audit_router, triage_router, mitosis_router, grading_router, report_router, worker_webhook_router
 )
+from app.routers.admin import router as admin_router
 
 import logging
 
@@ -105,6 +106,7 @@ app.include_router(mitosis_router)
 app.include_router(grading_router)
 app.include_router(report_router)
 app.include_router(worker_webhook_router)
+app.include_router(admin_router)
 
 @app.get("/healthz")
 def health_check():
