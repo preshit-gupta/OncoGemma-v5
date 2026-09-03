@@ -3,6 +3,7 @@ import io
 import json
 import math
 import yaml
+import asyncio
 import tempfile
 import shutil
 from datetime import datetime, timezone
@@ -292,7 +293,7 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
                     else:
                         f_crop_b = crop_bytes
 
-                    mg_resp = asyncio.run(medgemma_client.evaluate_mitosis_confirmation(f_crop_b, ctx_b))
+                    mg_resp = medgemma_client.evaluate_mitosis_confirmation_sync(f_crop_b, ctx_b)
                     cand["medgemma_verdict"] = mg_resp.verdict
                     cand["medgemma_rationale"] = mg_resp.rationale
                     cand["medgemma_confidence"] = mg_resp.confidence

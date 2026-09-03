@@ -57,7 +57,8 @@ def ensure_schema_up_to_date():
         with engine.begin() as conn:
             conn.execute(text("ALTER TABLE detections ADD COLUMN IF NOT EXISTS medgemma_verdict VARCHAR;"))
             conn.execute(text("ALTER TABLE detections ADD COLUMN IF NOT EXISTS medgemma_rationale TEXT;"))
-            conn.execute(text("ALTER TABLE detections ADD COLUMN IF NOT EXISTS medgemma_confidence DOUBLE PRECISION;"))
+            conn.execute(text("ALTER TABLE detections ADD COLUMN IF NOT EXISTS medgemma_confidence VARCHAR;"))
+            conn.execute(text("ALTER TABLE detections ALTER COLUMN medgemma_confidence TYPE VARCHAR USING medgemma_confidence::VARCHAR;"))
             logger.info("[Database Schema] Verified all columns exist on 'detections' table.")
     except Exception as e:
         logger.warning(f"[Database Schema Migration Note] {e}")

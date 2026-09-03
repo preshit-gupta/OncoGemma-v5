@@ -369,6 +369,36 @@ class MedGemmaClient:
 
         return self._morphometric_mitosis_fallback(candidate_crop_bytes)
 
+    def evaluate_mitosis_confirmation_sync(
+        self,
+        candidate_crop_bytes: bytes,
+        hpf_context_bytes: Optional[bytes] = None,
+        prompt_tpl: Optional[str] = None
+    ) -> MitosisConfirmationResponse:
+        """Synchronous referee evaluation for candidate mitotic figure via MedGemma 1.5."""
+        try:
+            # Check if there is an active event loop in this thread
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = None
+
+            if loop is not None and loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(
+                        asyncio.run,
+                        self.evaluate_mitosis_confirmation(candidate_crop_bytes, hpf_context_bytes, prompt_tpl)
+                    )
+                    return future.result()
+            else:
+                return asyncio.run(
+                    self.evaluate_mitosis_confirmation(candidate_crop_bytes, hpf_context_bytes, prompt_tpl)
+                )
+        except Exception as e:
+            return self._morphometric_mitosis_fallback(candidate_crop_bytes)
+
+
     def _morphometric_mitosis_fallback(self, candidate_crop_bytes: bytes) -> MitosisConfirmationResponse:
         """Morphometric van Diest referee fallback directly from crop image bytes."""
         try:
