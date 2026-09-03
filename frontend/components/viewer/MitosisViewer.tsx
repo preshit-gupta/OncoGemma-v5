@@ -278,15 +278,25 @@ export function MitosisViewer({
     return hpfs.find(h => h.seq === activeHpfSeq) || hpfs[0] || null;
   }, [hpfs, activeHpfSeq]);
 
-  // Candidates filtered strictly to the active HPF (with slight boundary margin)
+  // Candidates filtered strictly to the active HPF circle (r <= 262 um)
   const activeFieldCandidates = useMemo(() => {
     if (!activeHpf) return candidates;
     const [cx, cy] = activeHpf.center_um;
-    const r = (activeHpf.radius_um || 262.0) * 1.15; // 15% margin
-    return candidates.filter(cand => {
+    const r = activeHpf.radius_um || 262.0;
+    const filtered = candidates.filter(cand => {
       const dx = cand.centroid_um[0] - cx;
       const dy = cand.centroid_um[1] - cy;
       return (dx * dx + dy * dy) <= (r * r);
+    });
+
+    // Sort: confirmed mitoses first, then unreviewed, then not_mitosis; descending by confidence
+    return filtered.sort((a, b) => {
+      const rank = (c: MitosisCandidate) => (c.label === "mitosis" ? 2 : (c.label === "unreviewed" ? 1 : 0));
+      const diff = rank(b) - rank(a);
+      if (diff !== 0) return diff;
+      const confA = a.ver_conf || a.det_conf || 0;
+      const confB = b.ver_conf || b.det_conf || 0;
+      return confB - confA;
     });
   }, [candidates, activeHpf]);
 

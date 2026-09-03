@@ -96,8 +96,8 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
     stride_px = det_cfg.get("stride_px", 960)
     det_thresh = float(det_cfg.get("det_threshold", 0.35))
     review_thresh = float(det_cfg.get("review_threshold", 0.40))
-    ver_thresh = float(ver_cfg.get("ver_threshold", 0.65))
-    nms_radius_um = float(det_cfg.get("nms_radius_um", 7.5))
+    ver_thresh = float(ver_cfg.get("ver_threshold", 0.70))
+    nms_radius_um = float(det_cfg.get("nms_radius_um", 20.0))
     crop_size_px = ver_cfg.get("crop_size_px", 128)
     radius_um = float(hpf_cfg.get("radius_um", 262.0))
     hpf_count = int(hpf_cfg.get("count", 10))
@@ -312,6 +312,10 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
                 except Exception as mge:
                     print(f"[Worker:Mitosis] MedGemma referee note for {cand['id']}: {mge}")
 
+        # Post-referee physical NMS (20 um) to eliminate any residual coinciding/overlapping detections
+        candidates = apply_global_nms(candidates, nms_radius_um=nms_radius_um)
+        print(f"[Worker:Mitosis] Retained {len(candidates)} spatially distinct candidates after MedGemma refereeing and 20um NMS.")
+
         # Concurrently upload all crop PNGs to GCS
         from concurrent.futures import ThreadPoolExecutor
 
@@ -376,6 +380,10 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
         hpf_uploads = []
         dim_w, dim_h = getattr(openslide_slide, "dimensions", (width_px, height_px)) if openslide_slide else (width_px, height_px)
 
+        # Reticle optical patch calibration:
+        # HPF radius is 262.0 um. The viewer displays a 520x520 px canvas with reticle radius = 236 px.
+        # For candidate pins (px = 260 + dx/radius * 236) to perfectly match the underlying patch imagery:
+        # 40x patch field width must be 520 * (262.0 / 236.0) = 577.29 um!
         for hpf in hpfs:
             hpf_seq = hpf["seq"]
             h_cx_um, h_cy_um = hpf["center_um"]
@@ -383,7 +391,7 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
             h_cy_px = int(h_cy_um / mpp_y)
 
             for mag_name in ("10x", "20x", "40x"):
-                field_um = 128.0 if mag_name == "40x" else (256.0 if mag_name == "20x" else 512.0)
+                field_um = 577.29 if mag_name == "40x" else (1154.58 if mag_name == "20x" else 2309.15)
                 crop_w_px = max(1, int(round(field_um / mpp_x)))
                 crop_h_px = max(1, int(round(field_um / mpp_y)))
 

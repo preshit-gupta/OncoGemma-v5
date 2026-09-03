@@ -115,9 +115,13 @@ class YoloMitosisDetector:
                         ))
                         candidates.append((cx, cy, conf))
 
-            # Sort by confidence descending and return top candidate peaks
+            # Apply intra-tile NMS (radius 80 px = 20 um at 0.25 um/px) to avoid multi-contour fragments of same cell
             candidates.sort(key=lambda c: c[2], reverse=True)
-            return candidates[:6]
+            suppressed = []
+            for c in candidates:
+                if not any(math.hypot(c[0] - s[0], c[1] - s[1]) < 80.0 for s in suppressed):
+                    suppressed.append(c)
+            return suppressed[:6]
         except ImportError:
             # Fallback if OpenCV is not available
             stride = 48
@@ -133,26 +137,31 @@ class YoloMitosisDetector:
                         conf = float(np.clip(0.35 + (max_val - chromatin_thresh) * 0.4, self.conf_threshold, 0.90))
                         candidates.append((actual_x, actual_y, conf))
             candidates.sort(key=lambda c: c[2], reverse=True)
-            return candidates[:12]
+            suppressed = []
+            for c in candidates:
+                if not any(math.hypot(c[0] - s[0], c[1] - s[1]) < 80.0 for s in suppressed):
+                    suppressed.append(c)
+            return suppressed[:12]
 
 
 def apply_global_nms(
     candidates: List[Dict[str, Any]],
-    nms_radius_um: float = 7.5
+    nms_radius_um: float = 20.0
 ) -> List[Dict[str, Any]]:
     """
     Applies greedy Non-Maximum Suppression across candidate mitotic figures in physical micrometer space.
-    Suppresses lower-confidence detections within nms_radius_um (mitotic figure ~10-15 um diameter).
+    Suppresses lower-confidence detections within nms_radius_um (MIDOG challenge standard: 15-20 um cell diameter).
     """
     if not candidates:
         return []
 
-    # Sort candidates by confidence descending (det_conf or max(det_conf, ver_conf))
-    sorted_cands = sorted(
-        candidates,
-        key=lambda c: c.get("det_conf", 0.0),
-        reverse=True
-    )
+    def _cand_priority(c: Dict[str, Any]) -> Tuple[int, float]:
+        lbl = c.get("label", "unreviewed")
+        rank = 2 if lbl == "mitosis" else (1 if lbl == "unreviewed" else 0)
+        conf = float(c.get("ver_conf") if c.get("ver_conf") is not None else c.get("det_conf", 0.0))
+        return (rank, conf)
+
+    sorted_cands = sorted(candidates, key=_cand_priority, reverse=True)
 
     kept: List[Dict[str, Any]] = []
     kept_coords: List[Tuple[float, float]] = []

@@ -246,8 +246,8 @@ def get_hpf_thumbnail(
     mpp_x = float(getattr(slide_obj, "mpp_x", 0.25) or 0.25)
     mpp_y = float(getattr(slide_obj, "mpp_y", 0.25) or mpp_x)
 
-    # Resolution mapping
-    field_size_um = 128.0 if mag == "40x" else (256.0 if mag == "20x" else 512.0)
+    # Resolution mapping calibrated to frontend 520x520 canvas (r=236 px -> radius_um=262.0)
+    field_size_um = 577.29 if mag == "40x" else (1154.58 if mag == "20x" else 2309.15)
     output_px = 512
 
     extracted_bytes = None

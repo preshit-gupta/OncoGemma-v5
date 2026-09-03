@@ -10,7 +10,7 @@ detector:
   overlap_px: 64
   det_threshold: 0.35 # High-recall candidate sweep threshold (recall ~0.88-0.90 on MIDOG++)
   review_threshold: 0.40 # Gating threshold for pathologist confirmation (0.40 - 0.65 is unreviewed)
-  nms_radius_um: 7.5 # Cross-tile greedy NMS suppression radius (mitotic figure ~10-15 um)
+  nms_radius_um: 20.0 # Cross-tile greedy NMS suppression radius (MIDOG standard: 15-20 um cell diameter)
   batch_size: 16
   fp16: true
 
