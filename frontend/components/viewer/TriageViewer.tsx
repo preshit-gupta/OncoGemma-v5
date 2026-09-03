@@ -63,6 +63,7 @@ interface TriageViewerProps {
   imageHeightPx?: number;
   onRefreshCase?: () => void;
   tileUrlTemplate?: string | null;
+  onAdvanceToMitosis?: () => void;
 }
 
 export function TriageViewer({
@@ -72,7 +73,8 @@ export function TriageViewer({
   imageWidthPx = 2048,
   imageHeightPx = 2048,
   onRefreshCase,
-  tileUrlTemplate = null
+  tileUrlTemplate = null,
+  onAdvanceToMitosis
 }: TriageViewerProps) {
   const [data, setData] = useState<TriageData | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
@@ -114,11 +116,11 @@ export function TriageViewer({
     try {
       setReprocessing(true);
       await retryStage(caseId, "triage");
-      alert("Stage 3 (Hotspot Triage) re-queued! Re-evaluating 10× Path Foundation features...");
       if (onRefreshCase) onRefreshCase();
       await fetchTriageData();
     } catch (err: any) {
-      alert(`Failed to re-process triage: ${err.message}`);
+      console.error(err);
+      setError(`Failed to re-process triage: ${err.message}`);
     } finally {
       setReprocessing(false);
     }
@@ -237,10 +239,14 @@ export function TriageViewer({
       }
 
       const json = await res.json();
-      alert(`Hotspot Triage Confirmed! Queued next stage: ${json.next_stage_queued}`);
-      window.location.reload();
+      if (onAdvanceToMitosis) {
+        onAdvanceToMitosis();
+      } else if (onRefreshCase) {
+        onRefreshCase();
+      }
     } catch (err: any) {
-      alert(`Error confirming triage: ${err.message}`);
+      console.error(err);
+      setError(`Error confirming triage: ${err.message}`);
     } finally {
       setSubmitting(false);
     }

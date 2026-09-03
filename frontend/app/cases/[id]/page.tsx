@@ -98,6 +98,8 @@ export default function CaseWorkspacePage({ params }: { params: { id: string } }
 
   const isPreprocessDone = preprocessStage?.status === "done" || preprocessStage?.status === "confirmed" || preprocessStage?.status === "awaiting_review";
   const isTriageDone = triageStage?.status === "done" || triageStage?.status === "confirmed" || triageStage?.status === "awaiting_review";
+  const mitosisStage = caseDetail?.stages?.find((s) => s.stage === "mitosis");
+  const isMitosisDone = mitosisStage?.status === "done" || mitosisStage?.status === "confirmed" || mitosisStage?.status === "awaiting_review";
 
   const handleRetryIngest = async () => {
     try {
@@ -105,7 +107,6 @@ export default function CaseWorkspacePage({ params }: { params: { id: string } }
       await loadData();
     } catch (err) {
       console.error(err);
-      alert("Failed to retry ingest stage");
     }
   };
 
@@ -118,7 +119,6 @@ export default function CaseWorkspacePage({ params }: { params: { id: string } }
       await loadData();
     } catch (err) {
       console.error(err);
-      alert("Failed to approve slide");
     } finally {
       setActionLoading(false);
     }
@@ -133,7 +133,6 @@ export default function CaseWorkspacePage({ params }: { params: { id: string } }
       await loadData();
     } catch (err) {
       console.error(err);
-      alert("Failed to re-process slide");
     } finally {
       setActionLoading(false);
     }
@@ -146,7 +145,6 @@ export default function CaseWorkspacePage({ params }: { params: { id: string } }
       await loadData();
     } catch (err) {
       console.error(err);
-      alert("Failed to re-process hotspot triage");
     } finally {
       setActionLoading(false);
     }
@@ -161,7 +159,32 @@ export default function CaseWorkspacePage({ params }: { params: { id: string } }
       await loadData();
     } catch (err) {
       console.error(err);
-      alert("Failed to confirm triage");
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
+  const handleApproveMitosis = async () => {
+    setActionLoading(true);
+    try {
+      await approveStage(caseId, "mitosis");
+      setHasUserNavigated(true);
+      setActiveStage("grading");
+      await loadData();
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
+  const handleReprocessMitosis = async () => {
+    setActionLoading(true);
+    try {
+      await retryStage(caseId, "mitosis");
+      await loadData();
+    } catch (err) {
+      console.error(err);
     } finally {
       setActionLoading(false);
     }
@@ -236,6 +259,41 @@ export default function CaseWorkspacePage({ params }: { params: { id: string } }
               >
                 <RotateCcw className={`w-3.5 h-3.5 ${actionLoading ? "animate-spin" : ""}`} />
                 <span>Re-Assess Hotspots</span>
+              </button>
+
+              <button
+                onClick={handleApproveTriage}
+                disabled={actionLoading}
+                className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg transition text-xs font-semibold flex items-center space-x-1.5 shadow border border-emerald-400/50"
+                title="Confirm hotspots & proceed to Step 4 (v4.3 Mitosis Counting)"
+              >
+                <CheckCircle2 className="w-3.5 h-3.5" />
+                <span>Confirm Hotspots & Proceed to Step 4</span>
+              </button>
+            </div>
+          )}
+
+          {/* Pathologist Action Buttons for Step 4 (v4.3) */}
+          {isMitosisDone && activeStage === "mitosis" && (
+            <div className="flex items-center space-x-2 border-r border-slate-700 pr-3 mr-1">
+              <button
+                onClick={handleReprocessMitosis}
+                disabled={actionLoading}
+                className="px-3 py-1.5 bg-amber-600/90 hover:bg-amber-600 text-white rounded-lg transition text-xs font-semibold flex items-center space-x-1.5 shadow border border-amber-500/50"
+                title="Re-run mitosis detection and virtual HPF placement"
+              >
+                <RotateCcw className={`w-3.5 h-3.5 ${actionLoading ? "animate-spin" : ""}`} />
+                <span>Re-Count Mitoses</span>
+              </button>
+
+              <button
+                onClick={handleApproveMitosis}
+                disabled={actionLoading}
+                className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg transition text-xs font-semibold flex items-center space-x-1.5 shadow border border-emerald-400/50"
+                title="Confirm mitoses & proceed to Step 5 (v4.4 Nottingham Grading)"
+              >
+                <CheckCircle2 className="w-3.5 h-3.5" />
+                <span>Confirm Mitoses & Proceed to Step 5</span>
               </button>
             </div>
           )}
@@ -348,6 +406,11 @@ export default function CaseWorkspacePage({ params }: { params: { id: string } }
               imageWidthPx={slide?.width_px || 2048}
               imageHeightPx={slide?.height_px || 2048}
               onRefreshCase={loadData}
+              onAdvanceToMitosis={() => {
+                setHasUserNavigated(true);
+                setActiveStage("mitosis");
+                loadData();
+              }}
               tileUrlTemplate={caseDetail?.tile_url_template}
             />
           ) : (
