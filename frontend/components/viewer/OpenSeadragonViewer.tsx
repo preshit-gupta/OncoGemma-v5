@@ -121,6 +121,10 @@ export function OpenSeadragonViewer({
     updateMarkers(detectionMarkers);
   }, [detectionMarkers]);
 
+  const overlayItemRef = useRef<any>(null);
+  const currentOverlayUriRef = useRef<string | null>(null);
+  const isAddingOverlayRef = useRef<boolean>(false);
+
   // Programmatic smooth camera fly-to when focusPointUm changes
   useEffect(() => {
     if (!focusPointUm || !viewerRef.current?.viewport) return;
@@ -294,16 +298,6 @@ export function OpenSeadragonViewer({
 
     viewerRef.current = viewer;
 
-    if (overlayImageUri) {
-      viewer.addSimpleImage({
-        url: overlayImageUri,
-        opacity: showOverlay ? overlayOpacity : 0.0,
-        x: 0,
-        y: 0,
-        width: 1.0
-      });
-    }
-
     const onViewportChange = () => {
       updateScalebar();
       updatePolygons();
@@ -343,6 +337,9 @@ export function OpenSeadragonViewer({
     });
 
     return () => {
+      overlayItemRef.current = null;
+      currentOverlayUriRef.current = null;
+      isAddingOverlayRef.current = false;
       if (viewerRef.current) {
         viewerRef.current.destroy();
         viewerRef.current = null;
@@ -350,43 +347,70 @@ export function OpenSeadragonViewer({
     };
   }, [caseId, activeLayer, imageWidthPx, imageHeightPx, mppX, mppY, tileUrlTemplate]);
 
-  // Sync heatmap overlay without recreating viewer
+  // Sync heatmap overlay and opacity smoothly without re-downloading or stacking duplicate images
   useEffect(() => {
-    if (!viewerRef.current) return;
-    const world = viewerRef.current.world;
-    if (!world) return;
+    const viewer = viewerRef.current;
+    if (!viewer?.world) return;
+    const world = viewer.world;
 
-    const count = world.getItemCount();
-    if (count > 1) {
-      const overlayItem = world.getItemAt(1);
-      if (overlayImageUri && overlayItem && (overlayItem as any)._og_url !== overlayImageUri) {
-        world.removeItem(overlayItem);
-        viewerRef.current.addSimpleImage({
+    const targetOpacity = showOverlay ? overlayOpacity : 0.0;
+
+    // When overlay URI changes, remove old overlay and load the new one
+    if (overlayImageUri !== currentOverlayUriRef.current) {
+      if (overlayItemRef.current) {
+        try {
+          world.removeItem(overlayItemRef.current);
+        } catch (_) {}
+        overlayItemRef.current = null;
+      }
+      currentOverlayUriRef.current = overlayImageUri;
+
+      // Purge any orphan overlays, keeping only the primary slide at index 0
+      while (world.getItemCount() > 1) {
+        try {
+          world.removeItem(world.getItemAt(1));
+        } catch (_) {
+          break;
+        }
+      }
+
+      if (overlayImageUri) {
+        isAddingOverlayRef.current = true;
+        viewer.addSimpleImage({
           url: overlayImageUri,
-          opacity: showOverlay ? overlayOpacity : 0.0,
+          opacity: targetOpacity,
           x: 0,
           y: 0,
           width: 1.0,
-          success: (item: any) => {
-            if (item?.item) (item.item as any)._og_url = overlayImageUri;
+          success: (event: any) => {
+            overlayItemRef.current = event.item;
+            isAddingOverlayRef.current = false;
+            if (event.item && typeof event.item.setOpacity === "function") {
+              event.item.setOpacity(targetOpacity);
+            }
+            viewer.viewport?.requestRedraw();
+          },
+          error: () => {
+            isAddingOverlayRef.current = false;
           }
         });
-      } else if (overlayItem) {
-        overlayItem.setOpacity(showOverlay ? overlayOpacity : 0.0);
       }
-    } else if (overlayImageUri && count === 1) {
-      viewerRef.current.addSimpleImage({
-        url: overlayImageUri,
-        opacity: showOverlay ? overlayOpacity : 0.0,
-        x: 0,
-        y: 0,
-        width: 1.0,
-        success: (item: any) => {
-          if (item?.item) (item.item as any)._og_url = overlayImageUri;
+    } else {
+      // Same URI: smoothly update opacity on all overlay items and immediately redraw viewport
+      const count = world.getItemCount();
+      for (let i = 1; i < count; i++) {
+        const item = world.getItemAt(i);
+        if (item && typeof item.setOpacity === "function") {
+          item.setOpacity(targetOpacity);
         }
-      });
+      }
+      if (overlayItemRef.current && typeof overlayItemRef.current.setOpacity === "function") {
+        overlayItemRef.current.setOpacity(targetOpacity);
+      }
+      viewer.viewport?.requestRedraw();
     }
   }, [overlayOpacity, showOverlay, overlayImageUri]);
+
 
   // Update SVG polygon coordinates when hotspots change or are added
   useEffect(() => {
