@@ -37,11 +37,21 @@ def reset_database(x_admin_secret: str | None = Header(default=None)):
 
     try:
         with engine.begin() as conn:
-            for tbl in tables:
-                conn.execute(text(f"TRUNCATE TABLE {tbl} CASCADE;"))
+            # Disable FK checks for SQLite, use CASCADE-aware delete order for Postgres
+            dialect = conn.dialect.name
+            if dialect == "sqlite":
+                conn.execute(text("PRAGMA foreign_keys = OFF;"))
+                for tbl in tables:
+                    conn.execute(text(f"DELETE FROM {tbl};"))
+                conn.execute(text("PRAGMA foreign_keys = ON;"))
+            else:
+                # PostgreSQL — TRUNCATE with CASCADE and restart identity
+                conn.execute(text(
+                    f"TRUNCATE TABLE {', '.join(tables)} RESTART IDENTITY CASCADE;"
+                ))
         return {
             "status": "ok",
-            "message": f"Truncated {len(tables)} tables: {', '.join(tables)}",
+            "message": f"Cleared {len(tables)} tables: {', '.join(tables)}",
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
