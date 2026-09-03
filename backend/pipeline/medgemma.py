@@ -355,7 +355,7 @@ class MedGemmaClient:
         images = [b64_crop]
         if hpf_context_bytes:
             b64_context = base64.b64encode(hpf_context_bytes).decode("utf-8")
-            images.insert(0, b64_context)
+            images.append(b64_context)
 
         last_error = None
         for attempt in range(self.max_retries + 1):

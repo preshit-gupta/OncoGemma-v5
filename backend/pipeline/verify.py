@@ -238,14 +238,8 @@ def create_dual_magnification_composite(
         rgba_focus = slide_obj.read_region((x0, y0), 0, (crop_size, crop_size))
         rgb_focus = rgba_focus.convert("RGB")
 
-    # Draw subtle circular marker around candidate center (r=16 px)
-    focus_annotated = rgb_focus.copy()
-    draw = ImageDraw.Draw(focus_annotated)
-    cx, cy = crop_size // 2, crop_size // 2
-    draw.ellipse([cx - 16, cy - 16, cx + 16, cy + 16], outline="#E11D48", width=2)
-
     buf_focus = io.BytesIO()
-    focus_annotated.save(buf_focus, format="JPEG", quality=92)
+    rgb_focus.save(buf_focus, format="PNG")
     crop_bytes = buf_focus.getvalue()
 
     # 2. 10x Context Crop (512x512 px @ 1.0 um/px)
