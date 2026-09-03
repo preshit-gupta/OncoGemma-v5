@@ -245,7 +245,18 @@ def run_preprocess(stage_execution: StageExecution, session: Session) -> tuple[s
                 input_ref={"slide_id": str(slide_id), "preprocess_output_ref": output_ref}
             )
             session.add(next_qc_stage)
-        session.commit()
+            session.commit()
+            session.refresh(next_qc_stage)
+
+            from app.core.cloud_tasks import dispatch_stage_task
+            dispatch_stage_task(
+                case_id=str(case_id),
+                stage="qc",
+                stage_exec_id=str(next_qc_stage.id),
+                payload={"slide_id": str(slide_id), "preprocess_output_ref": output_ref}
+            )
+        else:
+            session.commit()
 
         return output_ref, {"tiatoolbox": "1.6.0"}
 

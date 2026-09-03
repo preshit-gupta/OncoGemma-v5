@@ -326,8 +326,19 @@ def run_ingest(stage_execution: StageExecution, session: Session) -> tuple[str, 
                 input_ref={"slide_id": str(slide_obj.id), "ingest_output_ref": output_ref}
             )
             session.add(next_prep_stage)
+            session.commit()
+            session.refresh(next_prep_stage)
 
-        session.commit()
+            from app.core.cloud_tasks import dispatch_stage_task
+            dispatch_stage_task(
+                case_id=str(stage_execution.case_id),
+                stage="preprocess",
+                stage_exec_id=str(next_prep_stage.id),
+                payload={"slide_id": str(slide_obj.id), "ingest_output_ref": output_ref}
+            )
+        else:
+            session.commit()
+
         model_versions = {"pillow": "10.2.0", "openslide": "1.3.1"}
 
         return output_ref, model_versions
