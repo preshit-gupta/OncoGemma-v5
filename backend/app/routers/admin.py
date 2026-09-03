@@ -27,8 +27,10 @@ def reset_database(x_admin_secret: str | None = Header(default=None)):
 
     tables = [
         "audit_events",
-        "report_amendments",
+        "stage_executions",
         "reports",
+        "gradings",
+        "hpf_sites",
         "detections",
         "hotspots",
         "slides",
