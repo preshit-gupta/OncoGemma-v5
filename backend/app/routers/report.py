@@ -192,32 +192,48 @@ def render_and_upload_report_pdf(case_id: str, report: Report, grading: Optional
         }
 
         evidence_paths = {}
-        try:
-            hm_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/triage/heatmap_triage.png")
-            hm_p = os.path.join(scratch_dir, "heatmap.png")
-            with open(hm_p, "wb") as f:
-                f.write(hm_bytes)
-            evidence_paths["heatmap"] = hm_p
-        except Exception:
-            pass
+        for hm in [f"cases/{case_id}/triage/heatmap_triage.png", f"cases/{case_id}/triage/heatmap.png"]:
+            try:
+                data = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, hm)
+                p = os.path.join(scratch_dir, "heatmap.png")
+                with open(p, "wb") as f:
+                    f.write(data)
+                evidence_paths["heatmap"] = p
+                break
+            except Exception:
+                pass
 
-        try:
-            hpf_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/mitosis/crops/m_0001.png")
-            hpf_p = os.path.join(scratch_dir, "mitotic_hpf.png")
-            with open(hpf_p, "wb") as f:
-                f.write(hpf_bytes)
-            evidence_paths["mitotic_hpf"] = hpf_p
-        except Exception:
-            pass
+        for hpf in [
+            f"cases/{case_id}/mitosis/hpfs/hpf_1_40x_norm.png",
+            f"cases/{case_id}/mitosis/hpfs/hpf_1_20x_norm.png",
+            f"cases/{case_id}/mitosis/hpfs/hpf_1_10x_norm.png",
+            f"cases/{case_id}/mitosis/crops/m_0364.png"
+        ]:
+            try:
+                data = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, hpf)
+                p = os.path.join(scratch_dir, "mitotic_hpf.png")
+                with open(p, "wb") as f:
+                    f.write(data)
+                evidence_paths["mitotic_hpf"] = p
+                break
+            except Exception:
+                pass
 
-        try:
-            patch_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/grading_patches/p_001.png")
-            gp_p = os.path.join(scratch_dir, "grading_patch.png")
-            with open(gp_p, "wb") as f:
-                f.write(patch_bytes)
-            evidence_paths["grading_patch"] = gp_p
-        except Exception:
-            pass
+        for gp in [
+            f"cases/{case_id}/triage/patches/hs_01_10x_norm.png",
+            f"cases/{case_id}/triage/patches/hs_01_20x_norm.png",
+            f"cases/{case_id}/triage/patches/hs_01_40x_norm.png",
+            f"cases/{case_id}/grading_patches/p_001.png"
+        ]:
+            try:
+                data = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, gp)
+                p = os.path.join(scratch_dir, "grading_patch.png")
+                with open(p, "wb") as f:
+                    f.write(data)
+                evidence_paths["grading_patch"] = p
+                break
+            except Exception:
+                pass
 
         generate_clinical_cap_pdf(
             report_data=render_dict,
@@ -533,7 +549,7 @@ async def regenerate_report_narrative(case_id: str, db: Session = Depends(get_db
 @router.get("/{case_id}/pdf")
 def get_report_pdf(case_id: str, db: Session = Depends(get_db)):
     """
-    Stream server-generated clinical PDF report directly from GCS.
+    Stream server-generated clinical PDF report directly, freshly rendering latest data to ensure 1-page compliance.
     """
     case_uid = to_uuid(case_id)
     report = _ensure_report_record(case_uid, db)
@@ -541,26 +557,29 @@ def get_report_pdf(case_id: str, db: Session = Depends(get_db)):
 
     blob_name = f"cases/{case_id}/report/CAP_Report_{str(case_id)[:8]}.pdf"
     try:
-        pdf_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, blob_name)
-        return Response(
-            content=pdf_bytes,
-            media_type="application/pdf",
-            headers={"Content-Disposition": f'inline; filename="CAP_Report_{str(case_id)[:8]}.pdf"'}
-        )
-    except Exception:
-        pass
-
-    # Generate on the fly and upload to GCS
-    try:
         render_and_upload_report_pdf(str(case_id), report, grading, db)
         pdf_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, blob_name)
         return Response(
             content=pdf_bytes,
             media_type="application/pdf",
-            headers={"Content-Disposition": f'inline; filename="CAP_Report_{str(case_id)[:8]}.pdf"'}
+            headers={
+                "Content-Disposition": f'inline; filename="CAP_Report_{str(case_id)[:8]}.pdf"',
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0"
+            }
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to render PDF: {e}")
+        print(f"[PDF Render Error] {e}")
+        try:
+            pdf_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, blob_name)
+            return Response(
+                content=pdf_bytes,
+                media_type="application/pdf",
+                headers={"Content-Disposition": f'inline; filename="CAP_Report_{str(case_id)[:8]}.pdf"'}
+            )
+        except Exception:
+            raise HTTPException(status_code=500, detail=f"Failed to render PDF: {e}")
 
 
 @router.get("/{case_id}/json")
@@ -586,10 +605,8 @@ def sign_final_report(payload: SignReportPayload, db: Session = Depends(get_db))
     grading = db.scalars(select(Grading).where(Grading.case_id == case_uid)).first()
 
     if report.status == "signed":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Report is already finalized and signed. Use the amendment endpoint if modifications are required."
-        )
+        # Idempotent return if already signed
+        return _build_report_response_dict(payload.case_id, db)
 
     now_utc = datetime.now(timezone.utc)
     now_iso = now_utc.isoformat()

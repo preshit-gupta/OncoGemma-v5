@@ -115,6 +115,9 @@ def get_mitosis_stage_data(case_id: str, db: Session = Depends(get_db)):
             "ver_conf": d.ver_conf,
             "label": d.label,
             "label_source": d.label_source,
+            "medgemma_verdict": getattr(d, "medgemma_verdict", None),
+            "medgemma_rationale": getattr(d, "medgemma_rationale", None),
+            "medgemma_confidence": getattr(d, "medgemma_confidence", None),
             "crop_uri": d.crop_uri,
             "crop_orig_uri": d.crop_orig_uri
         })
@@ -681,6 +684,16 @@ def confirm_mitosis_stage(payload: MitosisConfirmPayload, db: Session = Depends(
     )
     db.add(audit)
     db.commit()
+
+    try:
+        from app.core.cloud_tasks import dispatch_stage_task
+        dispatch_stage_task(
+            case_id=str(case_id),
+            stage="grading",
+            stage_exec_id=str(next_exec.id)
+        )
+    except Exception as e:
+        print(f"[CloudTasks Warning] Failed to dispatch next stage grading: {e}")
 
     return {
         "status": "success",

@@ -59,3 +59,12 @@ scratch/
 fake_gcs/
 data/
 oncogemma_local.db
+*key*.json
+sa-key.json
+infra/sa-key.json
+infra/bin/
+*.tfstate
+*.tfstate.*
+.terraform/
+tfplan
+

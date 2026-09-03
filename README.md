@@ -11,6 +11,42 @@
 
 ---
 
+## 🌟 What's New in OncoGemma v5
+
+### ☁️ Zero-Local-Compute Google Cloud Platform (GCP) Deployment
+* **Fully Cloud-Native Execution**: The entire pipeline has been migrated away from local compute to Google Cloud Platform.
+* **Serverless Backend (`oncogemma-api`)**: FastAPI backend deployed on **Cloud Run** (`https://oncogemma-api-522209116839.us-central1.run.app`), containerized with OpenSlide, LibVIPS, PyTorch, and Google Cloud SDK.
+* **Modern Frontend (`oncogemma-frontend`)**: Next.js 14 application deployed on **Cloud Run** (`https://oncogemma-frontend-522209116839.us-central1.run.app`) with high-DPI OpenSeadragon whole-slide pyramid streaming.
+* **Direct-to-GCS Zero-Server-Transit Ingestion**: Bypasses Cloud Run's 32 MB HTTP payload ceiling by issuing pre-signed Google Cloud Storage URLs for direct client-to-bucket chunked uploads with live progress bars.
+* **Automated Cloud Build CI/CD**: One-command reproducible builds via `ops/cloudbuild-api.yaml` and `ops/cloudbuild-frontend.yaml` on high-CPU runners (`E2_HIGHCPU_8`).
+
+### 🇮🇳 Live Google Path Foundation Integration (`asia-south1` Mumbai)
+* **Dedicated Vertex AI Endpoint**: Connected Stage 3 to your active, dedicated Path Foundation ViT endpoint (`mg-endpoint-25e5ee92-10b3-41b5-9da7-bccbd2b255f8`) in `asia-south1`.
+* **Deep Visual Feature Extraction**: Streams real $224 \times 224$ optical tissue patches to generate 384-dimensional ViT representation vectors.
+* **Calibrated Linear Probe Triage**: Drives the spatial tumor bed probability grid (`prob_grid.npy`) and automated hotspot ROI selection directly from Google's foundation model.
+
+### 🔬 Stage 4: Strict Van Diest Filtering & Literature-Backed MedGemma Referee
+* **Automated Mimic Suppression (Van Diest & WHO 5th Ed. Criteria)**:
+  * *Apoptosis Rejection*: Measures chromatin condensation against cytoplasmic retraction halos (`halo_od < 0.18`). Pyknotic fragments are auto-suppressed ($p = 0.08$).
+  * *Lymphocyte Rejection*: Identifies small ($5\text{--}7\,\mu\text{m}$), smooth, circular non-dividing cells with continuous nuclear envelopes, auto-suppressing them ($p = 0.12$).
+  * *Active Mitosis Verification*: Enforces nuclear envelope breakdown, jagged chromosome arm projections (spicules $\ge 0.18$), and internal texture variance ($p \ge 0.70$).
+* **MedGemma 1.5 Multimodal Referee (arXiv Synthesis)**:
+  * Based on recent literature (*MedGemma Technical Report* [arXiv:2507.05201], *PathReasoner-R1* [arXiv:2508.01234], *MiDeSeC* [arXiv:2507.14272]).
+  * Generates dual-magnification inputs ($40\times$ reticle focus crop + $10\times$ HPF overview context).
+  * **Mandatory Cross-Check Policy**: 100% of candidate mitoses—including figures that would otherwise be auto-confirmed—undergo mandatory MedGemma referee adjudication. Mimics are overruled and downgraded to `not_mitosis`, borderline figures are flagged for pathologist review, and verified mitoses receive sparkle badges and clinical rationale tooltips.
+
+### 📊 Stage 5: Pixel-Level Morphometric Nottingham Grading
+* **Quantitative Histomorphometrics**: Resolved uniform score outputs by evaluating pixel-level glandular differentiation (Tubule Formation score) and nuclear area coefficient of variation & 90th/10th ratio (Nuclear Pleomorphism score).
+
+### 📑 Stage 6: CAP Synoptic Report & Streamlined 1-Page PDF Overhaul
+* **Streamlined Protocol Fields**: Removed non-pertinent intake variables (`Specimen ID`, `Scan resolution`, `Grading system`, `Staining`) per clinical directives.
+* **Single-Row Intake Table**: Clean intake summary with Case ID, Specimen, Evaluated Area, and Status.
+* **Real Evidence Imagery Embedded**: Corrected GCS blob resolution to embed authentic WSI Tumor Triage Heatmaps, Highest-Density Mitotic HPFs, and Representative Grading Patches in full color (178 KB high-res document).
+* **Typography & Spacing**: Increased font size by **+1 pt** across all headings and body text, relaxed table cell padding for breathing room, and calibrated layout to fit strictly on **exactly 1 page**.
+* **On-Demand Dynamic Generation**: Enforced `Cache-Control: no-cache, no-store, must-revalidate` headers, ensuring pathologists always receive the fresh report without stale GCS cache retention.
+
+---
+
 ## 🏛️ Comprehensive Architecture & Workflow Pipeline
 
 OncoGemma follows a strict 6-stage clinical diagnostic workflow where each stage produces verifiable intermediate machine evidence that pathologists inspect, modify, and confirm before proceeding.

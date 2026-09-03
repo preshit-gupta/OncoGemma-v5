@@ -20,7 +20,8 @@ else:
             db_url,
             pool_pre_ping=True,
             pool_size=10,
-            max_overflow=20
+            max_overflow=20,
+            connect_args={"connect_timeout": 5}
         )
         with engine.connect() as conn:
             pass

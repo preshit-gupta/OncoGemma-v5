@@ -91,10 +91,10 @@ export function TriageViewer({
   const [noInvasiveTumor, setNoInvasiveTumor] = useState<boolean>(false);
   const [excludeReasonInput, setExcludeReasonInput] = useState<{ [id: string]: string }>({});
 
-  const fetchTriageData = async () => {
+  const fetchTriageData = async (silent: boolean = false) => {
     try {
-      setLoading(true);
-      const res = await fetch(`${API_BASE}/api/v1/stages/triage/${caseId}`, {
+      if (!silent) setLoading(true);
+      const res = await fetch(`${API_BASE}/api/v1/stages/triage/${caseId}?_t=${Date.now()}`, {
         headers: { "X-User-Role": "pathologist" }
       });
       if (!res.ok) {
@@ -104,9 +104,9 @@ export function TriageViewer({
       setData(json);
       setHotspotsList(json.effective_hotspots || []);
     } catch (err: any) {
-      setError(err.message || "Failed to load triage data");
+      if (!silent) setError(err.message || "Failed to load triage data");
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   };
 
@@ -127,6 +127,16 @@ export function TriageViewer({
   useEffect(() => {
     fetchTriageData();
   }, [caseId]);
+
+  // Auto-poll while triage is running or queued
+  useEffect(() => {
+    if (!data || data.status === "running" || data.status === "queued") {
+      const timer = setInterval(() => {
+        fetchTriageData(true);
+      }, 3000);
+      return () => clearInterval(timer);
+    }
+  }, [caseId, data?.status]);
 
   const handleExcludeHotspot = (id: string) => {
     const reason = excludeReasonInput[id] || "Pathologist excluded";
@@ -270,9 +280,7 @@ export function TriageViewer({
           imageWidthPx={imageWidthPx}
           imageHeightPx={imageHeightPx}
           overlayImageUri={
-            data?.heatmap_direct_url && !data.heatmap_direct_url.includes("storage.googleapis.com")
-              ? (data.heatmap_direct_url.startsWith("http") ? data.heatmap_direct_url : `${API_BASE}${data.heatmap_direct_url}`)
-              : `${API_BASE}/api/v1/stages/triage/${caseId}/heatmap`
+            `${API_BASE}/api/v1/stages/triage/${caseId}/heatmap?v=${data?.stage_execution_id || ''}`
           }
           overlayOpacity={heatmapOpacity}
           showOverlay={showHeatmap}
@@ -392,6 +400,14 @@ export function TriageViewer({
             <p className="text-[11px] text-slate-400 mt-0.5">Path Foundation 10× Tumor Front Screening</p>
           </div>
           <div className="flex items-center space-x-2">
+            <button
+              onClick={() => fetchTriageData()}
+              className="p-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 rounded-lg text-xs font-semibold flex items-center space-x-1 transition shadow-sm"
+              title="Refresh Triage Data"
+            >
+              <RotateCcw className={`w-3.5 h-3.5 ${loading ? "animate-spin" : ""}`} />
+              <span className="hidden sm:inline">Refresh</span>
+            </button>
             <button
               onClick={handleReprocessTriage}
               disabled={reprocessing}

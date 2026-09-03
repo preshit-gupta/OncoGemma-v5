@@ -14,15 +14,15 @@ class Settings(BaseSettings):
     # Vertex AI Endpoint Configuration - Path Foundation (Stage 3)
     VERTEX_PATH_FOUNDATION_ENDPOINT_ID: str = os.getenv(
         "VERTEX_PATH_FOUNDATION_ENDPOINT_ID",
-        "mg-endpoint-b556566c-9220-4e82-8d6b-96c28e8392aa"
+        "mg-endpoint-25e5ee92-10b3-41b5-9da7-bccbd2b255f8"
     )
     VERTEX_PATH_FOUNDATION_LOCATION: str = os.getenv(
         "VERTEX_PATH_FOUNDATION_LOCATION",
-        "asia-east1"
+        "asia-south1"
     )
     VERTEX_PATH_FOUNDATION_API_ENDPOINT: str = os.getenv(
         "VERTEX_PATH_FOUNDATION_API_ENDPOINT",
-        "mg-endpoint-b556566c-9220-4e82-8d6b-96c28e8392aa.asia-east1-250493189138.prediction.vertexai.goog"
+        "mg-endpoint-25e5ee92-10b3-41b5-9da7-bccbd2b255f8.asia-south1-962838713357.prediction.vertexai.goog"
     )
 
     # Vertex AI Endpoint Configuration - MedGemma 1.5 (Stage 5 Grading)
@@ -54,6 +54,13 @@ class Settings(BaseSettings):
     GCS_ARTIFACTS_BUCKET: str = os.getenv("GCS_ARTIFACTS_BUCKET", "oncogemma-dev-artifacts")
     CDN_BASE_URL: str | None = os.getenv("CDN_BASE_URL", None)
     STORAGE_EMULATOR_HOST: str | None = os.getenv("STORAGE_EMULATOR_HOST", None)
+
+    # Cloud Tasks & Asynchronous Cloud Workers
+    USE_CLOUD_TASKS: bool = os.getenv("USE_CLOUD_TASKS", "false").lower() in ("true", "1")
+    CLOUD_TASKS_LOCATION: str = os.getenv("CLOUD_TASKS_LOCATION", os.getenv("GCP_REGION", "us-central1"))
+    CLOUD_TASKS_QUEUE: str = os.getenv("CLOUD_TASKS_QUEUE", "oncogemma-stage-queue")
+    WORKER_SERVICE_URL: str = os.getenv("WORKER_SERVICE_URL", "http://localhost:8000")
+    CLOUD_TASKS_SERVICE_ACCOUNT: str = os.getenv("CLOUD_TASKS_SERVICE_ACCOUNT", "")
     
     # Auth
     MOCK_AUTH_ENABLED: bool = True

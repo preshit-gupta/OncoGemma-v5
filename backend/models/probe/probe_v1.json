@@ -1,0 +1,7 @@
+{
+  "model_name": "probe_v1",
+  "dataset": "PatchCamelyon (PCam)",
+  "train_auc": 0.965,
+  "pf_model_version": "path-foundation-v1",
+  "embedding_dim": 384
+}

@@ -21,7 +21,10 @@ class Detection(Base):
     det_conf = Column(Float, nullable=True) # YOLO detector confidence
     ver_conf = Column(Float, nullable=True) # HoVer-Net verifier confidence
     label = Column(String, nullable=False, default="unreviewed") # mitosis | not_mitosis | unreviewed
-    label_source = Column(String, nullable=False, default="model") # model | pathologist
+    label_source = Column(String, nullable=False, default="model") # model | pathologist | medgemma
+    medgemma_verdict = Column(String, nullable=True) # CONFIRMED | REJECTED_APOPTOSIS | REJECTED_LYMPHOCYTE | REJECTED_RESTING_NUCLEUS | EQUIVOCAL
+    medgemma_rationale = Column(Text, nullable=True) # Multimodal referee rationale
+    medgemma_confidence = Column(String, nullable=True) # low | medium | high
     crop_uri = Column(Text, nullable=True) # Normalized 128x128 crop URI
     crop_orig_uri = Column(Text, nullable=True) # Original 128x128 crop URI
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))

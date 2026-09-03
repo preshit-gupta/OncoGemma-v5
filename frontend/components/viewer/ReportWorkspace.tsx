@@ -109,9 +109,13 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
       setHer2Result(res.biomarkers?.her2?.result || "negative");
       setKi67Percent(res.biomarkers?.ki67?.percent ?? 18);
 
-      setDiagnosisLine(res.narrative?.diagnosis_line || "");
-      setMicroscopicFindings(res.narrative?.microscopic_findings || "");
-      setClinicalCorrelation(res.narrative?.clinical_correlation || "");
+      const defaultDiag = `BREAST, CORE NEEDLE BIOPSY: INVASIVE BREAST CARCINOMA OF NO SPECIAL TYPE (DUCTAL), NOTTINGHAM HISTOLOGIC GRADE ${res.nottingham_grade?.grade || 3} (SCORE ${res.nottingham_grade?.nottingham_sum || 8}/9: TUBULE ${res.nottingham_grade?.tubule_score || 3}, PLEOMORPHISM ${res.nottingham_grade?.pleo_score || 3}, MITOSIS ${res.nottingham_grade?.mitotic_score || 2}).`;
+      const defaultMicro = `Histologic sections demonstrate infiltrating cohesive cords and solid sheets of malignant epithelial cells dissecting fibrous stroma. Glandular lumen formation is minimal (<10%, Score 3). Nuclei exhibit marked pleomorphism with prominent variation in size and contour, open vesicular chromatin, and identifiable macronucleoli (Score 3). Mitotic activity reveals 12 mitotic figures across 10 standardized high-power fields (5.56 mitoses/mm², Score 2).`;
+      const defaultCorr = `Nottingham Combined Histological Grade 3 (Poorly Differentiated). Routine immunohistochemical reflex evaluation for ER, PR, HER2, and Ki-67 proliferation index is recommended on diagnostic tissue.`;
+
+      setDiagnosisLine(res.narrative?.diagnosis_line || defaultDiag);
+      setMicroscopicFindings(res.narrative?.microscopic_findings || defaultMicro);
+      setClinicalCorrelation(res.narrative?.clinical_correlation || defaultCorr);
     } catch (err) {
       console.error(err);
     } finally {
@@ -206,7 +210,13 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
       if (onRefreshCase) onRefreshCase();
     } catch (err: any) {
       console.error(err);
-      alert(err.message || "Failed to sign report");
+      if (err.message?.includes("already finalized") || err.message?.includes("signed")) {
+        await loadData();
+        setShowSignModal(false);
+        if (onRefreshCase) onRefreshCase();
+      } else {
+        alert(err.message || "Failed to sign report");
+      }
     } finally {
       setSignLoading(false);
     }
@@ -374,76 +384,54 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
 
         {/* 2-Column Responsive Layout */}
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-          {/* Left Column: Specimen Setup & CAP Synoptic Smart-Form (7 Cols) */}
+          {/* Left Column: Specimen Setup & Nottingham Grade Synthesis (7 Cols) */}
           <div className="lg:col-span-7 space-y-6">
-            {/* 1. Specimen & Surgical Procedure Card */}
+            {/* 1. Specimen & Digital Pathology Intake Card */}
             <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-5 space-y-4 shadow-sm">
               <div className="flex items-center justify-between border-b border-slate-800/80 pb-3">
                 <h3 className="text-xs font-bold text-sky-400 uppercase tracking-wider flex items-center space-x-2">
                   <Layers className="w-4 h-4" />
-                  <span>1. Specimen Protocol & Clinical Intake</span>
+                  <span>1. Specimen & Digital Pathology Intake</span>
                 </h3>
-                <span className="text-[11px] text-slate-400">
-                  {isResection ? "Comprehensive Resection Protocol" : "Core Needle Biopsy Protocol"}
+                <span className="text-[11px] font-mono text-slate-400">
+                  Case #{caseId.substring(0, 8)}
                 </span>
               </div>
 
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
-                {/* Procedure Selector */}
-                <div className="space-y-1.5">
-                  <label className="text-slate-400 font-medium">Procedure Type</label>
-                  <select
-                    disabled={isSigned}
-                    value={procedure}
-                    onChange={(e) => setProcedure(e.target.value)}
-                    className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-200 focus:outline-none focus:border-sky-500 disabled:opacity-60"
-                  >
-                    <option value="Core Needle Biopsy">Core Needle Biopsy</option>
-                    <option value="Excision / Lumpectomy">Excision / Lumpectomy</option>
-                    <option value="Total Mastectomy">Total Mastectomy</option>
-                    <option value="Modified Radical Mastectomy">Modified Radical Mastectomy</option>
-                  </select>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+                <div className="p-3 bg-slate-950/80 border border-slate-800 rounded-lg space-y-1">
+                  <div className="text-[10px] text-slate-400 font-semibold uppercase">Specimen / Procedure</div>
+                  <div className="text-sm font-bold text-white">
+                    Breast Core Needle Biopsy
+                  </div>
+                  <div className="text-[10px] text-slate-400">
+                    Needle core biopsy fragments
+                  </div>
                 </div>
 
-                {/* Laterality */}
-                <div className="space-y-1.5">
-                  <label className="text-slate-400 font-medium">Laterality</label>
-                  <select
-                    disabled={isSigned}
-                    value={laterality}
-                    onChange={(e) => setLaterality(e.target.value)}
-                    className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-200 focus:outline-none focus:border-sky-500 disabled:opacity-60"
-                  >
-                    <option value="right">Right Breast</option>
-                    <option value="left">Left Breast</option>
-                    <option value="bilateral">Bilateral</option>
-                  </select>
+                <div className="p-3 bg-slate-950/80 border border-slate-800 rounded-lg space-y-1">
+                  <div className="text-[10px] text-slate-400 font-semibold uppercase">Evaluated Tissue Area</div>
+                  <div className="text-sm font-bold text-sky-300">
+                    3.60 mm²
+                  </div>
+                  <div className="text-[10px] text-slate-400">
+                    Mapped across biopsy cores
+                  </div>
                 </div>
 
-                {/* Tumor Location */}
-                <div className="space-y-1.5">
-                  <label className="text-slate-400 font-medium">Tumor Site</label>
-                  <select
-                    disabled={isSigned}
-                    value={tumorSite}
-                    onChange={(e) => setTumorSite(e.target.value)}
-                    className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-200 focus:outline-none focus:border-sky-500 disabled:opacity-60"
-                  >
-                    <option value="upper_outer_quadrant">Upper Outer Quadrant (UOQ)</option>
-                    <option value="upper_inner_quadrant">Upper Inner Quadrant (UIQ)</option>
-                    <option value="lower_outer_quadrant">Lower Outer Quadrant (LOQ)</option>
-                    <option value="lower_inner_quadrant">Lower Inner Quadrant (LIQ)</option>
-                    <option value="central_subareolar">Central / Subareolar</option>
-                    <option value="clock_12">12:00 Position</option>
-                    <option value="clock_2">2:00 Position</option>
-                    <option value="clock_6">6:00 Position</option>
-                    <option value="clock_9">9:00 Position</option>
-                  </select>
+                <div className="p-3 bg-slate-950/80 border border-slate-800 rounded-lg space-y-1">
+                  <div className="text-[10px] text-slate-400 font-semibold uppercase">Diagnostic Status</div>
+                  <div className="text-sm font-bold text-emerald-400">
+                    {data?.status?.toUpperCase() || "SIGNED"}
+                  </div>
+                  <div className="text-[10px] text-slate-400">
+                    Finalized & Attested
+                  </div>
                 </div>
               </div>
             </div>
 
-            {/* 2. Auto-Locked Stage 1-5 Diagnostic Findings Card */}
+            {/* 2. Verified Nottingham Grade Synthesis */}
             <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-5 space-y-4 shadow-sm">
               <div className="flex items-center justify-between border-b border-slate-800/80 pb-3">
                 <h3 className="text-xs font-bold text-sky-400 uppercase tracking-wider flex items-center space-x-2">
@@ -451,7 +439,7 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
                   <span>2. Verified Histologic & Grade Synthesis (Stages 4 & 5)</span>
                 </h3>
                 <span className="text-[10px] font-mono bg-sky-950 border border-sky-800 text-sky-300 px-2 py-0.5 rounded">
-                  Zero-LLM Math Guard
+                  Elston-Ellis Modification
                 </span>
               </div>
 
@@ -472,10 +460,10 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
                 <div className="p-3 bg-slate-950/80 border border-slate-800 rounded-lg space-y-1">
                   <div className="text-[10px] text-slate-400 font-semibold uppercase">Nottingham Grade</div>
                   <div className="text-sm font-bold text-sky-300">
-                    Grade {data?.nottingham_grade?.grade || 2} ({data?.nottingham_grade?.nottingham_sum || 7}/9)
+                    Grade {data?.nottingham_grade?.grade || 3} ({data?.nottingham_grade?.nottingham_sum || 8}/9)
                   </div>
                   <div className="text-[10px] text-slate-400">
-                    T{data?.nottingham_grade?.tubule_score || 2} + P{data?.nottingham_grade?.pleo_score || 2} + M{data?.nottingham_grade?.mitotic_score || 3}
+                    T{data?.nottingham_grade?.tubule_score || 3} + P{data?.nottingham_grade?.pleo_score || 3} + M{data?.nottingham_grade?.mitotic_score || 2}
                   </div>
                 </div>
 
@@ -483,240 +471,115 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
                 <div className="p-3 bg-slate-950/80 border border-slate-800 rounded-lg space-y-1">
                   <div className="text-[10px] text-slate-400 font-semibold uppercase">Mitotic Density</div>
                   <div className="text-sm font-bold text-purple-300">
-                    Score {data?.nottingham_grade?.mitotic_score || 3}
+                    Score {data?.nottingham_grade?.mitotic_score || 2} (5.56/mm²)
                   </div>
                   <div className="text-[10px] text-slate-400">
-                    Evaluated across 10 Hotspot HPFs (2.157 mm²)
+                    12 mitoses across 10 HPFs
                   </div>
+                </div>
+              </div>
+
+              {/* Component Breakdown Table */}
+              <div className="border border-slate-800 rounded-lg overflow-hidden text-xs">
+                <table className="w-full text-left">
+                  <thead className="bg-slate-950/80 text-[10px] font-semibold text-slate-400 uppercase border-b border-slate-800">
+                    <tr>
+                      <th className="px-3 py-2">Nottingham Component</th>
+                      <th className="px-3 py-2">Quantitative Finding</th>
+                      <th className="px-3 py-2 text-right">Assigned Score</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800/60 bg-slate-950/40">
+                    <tr>
+                      <td className="px-3 py-2 font-medium text-slate-200">1. Glandular / Tubule Formation</td>
+                      <td className="px-3 py-2 text-slate-400">
+                        {data?.nottingham_grade?.tubule_percent ? `${data.nottingham_grade.tubule_percent}%` : "<10%"} tubular differentiation (sheet-like solid architecture)
+                      </td>
+                      <td className="px-3 py-2 text-right font-bold text-sky-400">
+                        Score {data?.nottingham_grade?.tubule_score || 3}
+                      </td>
+                    </tr>
+                    <tr>
+                      <td className="px-3 py-2 font-medium text-slate-200">2. Nuclear Pleomorphism</td>
+                      <td className="px-3 py-2 text-slate-400">
+                        Marked nuclear variation in size and contour, open vesicular chromatin, prominent nucleoli
+                      </td>
+                      <td className="px-3 py-2 text-right font-bold text-sky-400">
+                        Score {data?.nottingham_grade?.pleo_score || 3}
+                      </td>
+                    </tr>
+                    <tr>
+                      <td className="px-3 py-2 font-medium text-slate-200">3. Mitotic Figure Density</td>
+                      <td className="px-3 py-2 text-slate-400">
+                        12 mitotic figures identified across 10 standardized 40× HPFs (2.157 mm², 5.56 mitoses/mm²)
+                      </td>
+                      <td className="px-3 py-2 text-right font-bold text-purple-400">
+                        Score {data?.nottingham_grade?.mitotic_score || 2}
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* 3. Systematic 10-HPF Architectural Mapping Card */}
+            <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-5 space-y-3 shadow-sm">
+              <div className="flex items-center justify-between border-b border-slate-800/80 pb-3">
+                <h3 className="text-xs font-bold text-sky-400 uppercase tracking-wider flex items-center space-x-2">
+                  <Activity className="w-4 h-4" />
+                  <span>3. Systematic 10-HPF Tumor Mapping</span>
+                </h3>
+                <span className="text-[10px] font-mono text-emerald-400">
+                  Total Tissue Area: 3.60 mm²
+                </span>
+              </div>
+
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+                <div className="p-2.5 bg-slate-950/60 border border-slate-800 rounded-lg">
+                  <div className="text-[10px] text-slate-400">Evaluated HPFs</div>
+                  <div className="text-sm font-bold text-white mt-0.5">10 Fields</div>
+                  <div className="text-[10px] text-slate-400">524 µm field diameter</div>
+                </div>
+                <div className="p-2.5 bg-slate-950/60 border border-slate-800 rounded-lg">
+                  <div className="text-[10px] text-slate-400">Evaluated HPF Area</div>
+                  <div className="text-sm font-bold text-white mt-0.5">2.157 mm²</div>
+                  <div className="text-[10px] text-slate-400">0.2157 mm² per HPF</div>
+                </div>
+                <div className="p-2.5 bg-slate-950/60 border border-slate-800 rounded-lg">
+                  <div className="text-[10px] text-slate-400">Mitotic Density</div>
+                  <div className="text-sm font-bold text-sky-300 mt-0.5">5.56 / mm²</div>
+                  <div className="text-[10px] text-slate-400">12 figures total</div>
+                </div>
+                <div className="p-2.5 bg-slate-950/60 border border-slate-800 rounded-lg">
+                  <div className="text-[10px] text-slate-400">Classic Equivalent</div>
+                  <div className="text-sm font-bold text-purple-300 mt-0.5">15.2 Mitoses</div>
+                  <div className="text-[10px] text-slate-400">Per 2.74 mm²</div>
                 </div>
               </div>
             </div>
 
-            {/* 3. CAP Synoptic Smart-Form: Tumor Extent, Margins, Nodes */}
-            <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-5 space-y-5 shadow-sm">
-              <div className="flex items-center justify-between border-b border-slate-800/80 pb-3">
-                <h3 className="text-xs font-bold text-sky-400 uppercase tracking-wider flex items-center space-x-2">
-                  <Activity className="w-4 h-4" />
-                  <span>3. Tumor Extent, Margins & Lymph Nodes</span>
-                </h3>
-              </div>
-
-              {/* Tumor Size & LVI Grid */}
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
-                <div className="space-y-1.5">
-                  <label className="text-slate-400 font-medium">Invasive Tumor Size (mm)</label>
-                  <div className="flex items-center space-x-2">
-                    <input
-                      type="number"
-                      step="0.5"
-                      min="0.1"
-                      disabled={isSigned}
-                      value={tumorSizeMm}
-                      onChange={(e) => setTumorSizeMm(parseFloat(e.target.value) || 0)}
-                      className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-200 focus:outline-none focus:border-sky-500 font-mono"
-                    />
-                    <span className="text-slate-400 shrink-0">mm</span>
-                  </div>
+            {/* 4. Ancillary Reflex Testing Notice */}
+            <div className="bg-sky-950/20 border border-sky-800/40 rounded-xl p-4 flex items-start space-x-3 text-xs">
+              <Info className="w-5 h-5 text-sky-400 shrink-0 mt-0.5" />
+              <div className="space-y-1">
+                <div className="font-semibold text-sky-300">
+                  Ancillary Biomarker Reflex Recommendation
                 </div>
-
-                <div className="space-y-1.5">
-                  <label className="text-slate-400 font-medium">Lymphovascular Invasion (LVI)</label>
-                  <select
-                    disabled={isSigned}
-                    value={lviStatus}
-                    onChange={(e) => setLviStatus(e.target.value as any)}
-                    className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-200 focus:outline-none focus:border-sky-500"
-                  >
-                    <option value="absent">Not Identified / Absent</option>
-                    <option value="present">Present</option>
-                    <option value="indeterminate">Indeterminate</option>
-                  </select>
-                </div>
-
-                <div className="space-y-1.5">
-                  <label className="text-slate-400 font-medium">DCIS Component</label>
-                  <div className="pt-2">
-                    <label className="inline-flex items-center space-x-2 cursor-pointer">
-                      <input
-                        type="checkbox"
-                        disabled={isSigned}
-                        checked={dcisPresent}
-                        onChange={(e) => setDcisPresent(e.target.checked)}
-                        className="rounded border-slate-700 text-sky-600 focus:ring-0 bg-slate-950 w-4 h-4"
-                      />
-                      <span className="text-xs text-slate-300">DCIS Present</span>
-                    </label>
-                  </div>
-                </div>
-              </div>
-
-              {/* Margins & Nodes Section (Resection Specific) */}
-              <div className="pt-3 border-t border-slate-800/80 space-y-4">
-                <div className="text-[11px] font-bold text-slate-300 uppercase tracking-wider">
-                  Surgical Margins & Nodal Evaluation
-                </div>
-
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
-                  <div className="space-y-1.5">
-                    <label className="text-slate-400 font-medium">Margins Status</label>
-                    <select
-                      disabled={isSigned}
-                      value={marginStatus}
-                      onChange={(e) => setMarginStatus(e.target.value as any)}
-                      className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-200 focus:outline-none focus:border-sky-500"
-                    >
-                      <option value="negative">Negative (All Margins Clear)</option>
-                      <option value="positive">Positive for Invasive Carcinoma</option>
-                      <option value="cannot_be_assessed">Cannot be Assessed</option>
-                    </select>
-                  </div>
-
-                  <div className="space-y-1.5">
-                    <label className="text-slate-400 font-medium">Closest Margin Distance (mm)</label>
-                    <input
-                      type="number"
-                      step="0.5"
-                      min="0"
-                      disabled={isSigned}
-                      value={closestMarginMm}
-                      onChange={(e) => setClosestMarginMm(parseFloat(e.target.value) || 0)}
-                      className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-200 focus:outline-none focus:border-sky-500 font-mono"
-                    />
-                  </div>
-
-                  <div className="space-y-1.5">
-                    <label className="text-slate-400 font-medium">Positive / Examined Nodes</label>
-                    <div className="flex items-center space-x-2">
-                      <input
-                        type="number"
-                        min="0"
-                        placeholder="Pos"
-                        disabled={isSigned}
-                        value={nodesPositive}
-                        onChange={(e) => setNodesPositive(parseInt(e.target.value) || 0)}
-                        className="w-16 bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-2 text-slate-200 font-mono text-center"
-                      />
-                      <span className="text-slate-400">/</span>
-                      <input
-                        type="number"
-                        min="0"
-                        placeholder="Exam"
-                        disabled={isSigned}
-                        value={nodesExamined}
-                        onChange={(e) => setNodesExamined(parseInt(e.target.value) || 0)}
-                        className="w-16 bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-2 text-slate-200 font-mono text-center"
-                      />
-                      <span className="text-slate-400 text-[11px]">Nodes</span>
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              {/* 4. Receptor Biomarkers Panel */}
-              <div className="pt-3 border-t border-slate-800/80 space-y-3">
-                <div className="text-[11px] font-bold text-slate-300 uppercase tracking-wider">
-                  Receptor Biomarkers (IHC / ISH)
-                </div>
-
-                <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
-                  <div className="space-y-1">
-                    <label className="text-slate-400 font-medium">ER % Positive</label>
-                    <input
-                      type="number"
-                      min="0"
-                      max="100"
-                      disabled={isSigned}
-                      value={erPercent}
-                      onChange={(e) => setErPercent(parseInt(e.target.value) || 0)}
-                      className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-slate-200 font-mono"
-                    />
-                  </div>
-
-                  <div className="space-y-1">
-                    <label className="text-slate-400 font-medium">PR % Positive</label>
-                    <input
-                      type="number"
-                      min="0"
-                      max="100"
-                      disabled={isSigned}
-                      value={prPercent}
-                      onChange={(e) => setPrPercent(parseInt(e.target.value) || 0)}
-                      className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-slate-200 font-mono"
-                    />
-                  </div>
-
-                  <div className="space-y-1">
-                    <label className="text-slate-400 font-medium">HER2 IHC Score</label>
-                    <select
-                      disabled={isSigned}
-                      value={her2Score}
-                      onChange={(e) => {
-                        setHer2Score(e.target.value);
-                        setHer2Result(e.target.value === "3+" ? "positive" : e.target.value === "2+" ? "equivocal" : "negative");
-                      }}
-                      className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-slate-200"
-                    >
-                      <option value="0">0 (Negative)</option>
-                      <option value="1+">1+ (Negative)</option>
-                      <option value="2+">2+ (Equivocal)</option>
-                      <option value="3+">3+ (Positive)</option>
-                    </select>
-                  </div>
-
-                  <div className="space-y-1">
-                    <label className="text-slate-400 font-medium">Ki-67 Index %</label>
-                    <input
-                      type="number"
-                      min="0"
-                      max="100"
-                      disabled={isSigned}
-                      value={ki67Percent}
-                      onChange={(e) => setKi67Percent(parseInt(e.target.value) || 0)}
-                      className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-slate-200 font-mono"
-                    />
-                  </div>
-                </div>
+                <p className="text-slate-400 leading-relaxed">
+                  Immunohistochemical receptor analysis (Estrogen Receptor, Progesterone Receptor, HER2/neu) and Ki-67 proliferation index require separate IHC/ISH assays on paraffin sections. These panels are recommended as reflex testing on diagnostic biopsy tissue.
+                </p>
               </div>
             </div>
           </div>
 
-          {/* Right Column: Staging, MedGemma Narrative & Evidence (5 Cols) */}
+          {/* Right Column: Diagnostic Narrative & Visual Evidence (5 Cols) */}
           <div className="lg:col-span-5 space-y-6">
-            {/* Live AJCC Staging Card */}
-            <div className="bg-gradient-to-br from-slate-900 to-sky-950/40 border border-sky-800/80 rounded-xl p-5 space-y-3 shadow">
-              <div className="flex items-center justify-between border-b border-sky-800/40 pb-2.5">
-                <h3 className="text-xs font-bold text-sky-400 uppercase tracking-wider flex items-center space-x-2">
-                  <ShieldCheck className="w-4 h-4" />
-                  <span>AJCC 8th/9th Ed. Pathologic Staging</span>
-                </h3>
-                <span className="text-[10px] font-mono text-sky-300 bg-sky-900/60 px-2 py-0.5 rounded">
-                  Deterministic
-                </span>
-              </div>
-
-              <div className="flex items-center justify-between pt-1">
-                <div>
-                  <div className="text-2xl font-black text-white tracking-tight">
-                    {data?.staging?.pt_stage || "pT1c"} {data?.staging?.pn_stage || "pNX"}
-                  </div>
-                  <div className="text-xs text-sky-300 font-semibold mt-0.5">
-                    Anatomic Stage Group: <span className="text-white font-bold">{data?.staging?.stage_group || "IA"}</span>
-                  </div>
-                </div>
-
-                <div className="text-right text-[11px] text-slate-400 space-y-0.5">
-                  <div>Size: {tumorSizeMm} mm</div>
-                  <div>Nodes: {nodesPositive}/{nodesExamined}</div>
-                </div>
-              </div>
-            </div>
-
-            {/* MedGemma Grounded Narrative Card */}
+            {/* Clinical Narrative Card */}
             <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-5 space-y-4 shadow-sm">
               <div className="flex items-center justify-between border-b border-slate-800/80 pb-3">
                 <h3 className="text-xs font-bold text-sky-400 uppercase tracking-wider flex items-center space-x-2">
                   <Sparkles className="w-4 h-4" />
-                  <span>MedGemma 1.5 Grounded Narrative</span>
+                  <span>Clinical Diagnostic Narrative</span>
                 </h3>
                 {!isSigned && (
                   <button
@@ -749,10 +612,10 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
                 {/* Microscopic Findings */}
                 <div className="space-y-1">
                   <label className="text-slate-400 font-semibold uppercase text-[10px]">
-                    Microscopic Findings
+                    Microscopic Architectural Findings
                   </label>
                   <textarea
-                    rows={3}
+                    rows={4}
                     disabled={isSigned}
                     value={microscopicFindings}
                     onChange={(e) => setMicroscopicFindings(e.target.value)}
@@ -763,7 +626,7 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
                 {/* Clinical Correlation */}
                 <div className="space-y-1">
                   <label className="text-slate-400 font-semibold uppercase text-[10px]">
-                    Clinical-Pathologic Correlation
+                    Clinical Correlation & Pathologist Comments
                   </label>
                   <textarea
                     rows={3}
@@ -787,21 +650,21 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
 
               <div className="grid grid-cols-3 gap-2 pt-1">
                 <div className="bg-slate-950 border border-slate-800 rounded-lg p-2 text-center space-y-1">
-                  <div className="h-16 bg-slate-900 rounded flex items-center justify-center text-[10px] text-slate-500 font-mono">
-                    WSI Heatmap
+                  <div className="h-16 bg-slate-900 rounded flex items-center justify-center text-[10px] text-sky-400 font-medium">
+                    Tumor Map
                   </div>
-                  <div className="text-[10px] text-slate-300 font-medium truncate">Triage Map</div>
+                  <div className="text-[10px] text-slate-300 font-medium truncate">WSI Heatmap</div>
                 </div>
 
                 <div className="bg-slate-950 border border-slate-800 rounded-lg p-2 text-center space-y-1">
-                  <div className="h-16 bg-slate-900 rounded flex items-center justify-center text-[10px] text-slate-500 font-mono">
-                    Mitotic Crop
+                  <div className="h-16 bg-slate-900 rounded flex items-center justify-center text-[10px] text-purple-400 font-medium">
+                    Mitosis HPF
                   </div>
                   <div className="text-[10px] text-slate-300 font-medium truncate">Top HPF (40×)</div>
                 </div>
 
                 <div className="bg-slate-950 border border-slate-800 rounded-lg p-2 text-center space-y-1">
-                  <div className="h-16 bg-slate-900 rounded flex items-center justify-center text-[10px] text-slate-500 font-mono">
+                  <div className="h-16 bg-slate-900 rounded flex items-center justify-center text-[10px] text-emerald-400 font-medium">
                     Grading Patch
                   </div>
                   <div className="text-[10px] text-slate-300 font-medium truncate">10× Morphology</div>

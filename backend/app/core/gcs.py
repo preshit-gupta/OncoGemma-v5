@@ -95,17 +95,43 @@ def generate_signed_upload_url(bucket_name: str, blob_name: str, expiration_minu
     """Generates a signed upload URL for direct browser-to-bucket upload."""
     bucket = get_bucket(bucket_name)
     blob = bucket.blob(blob_name)
+    client = get_gcs_client()
+    creds = client._credentials
+
+    if hasattr(creds, "valid") and not creds.valid:
+        try:
+            from google.auth.transport.requests import Request
+            creds.refresh(Request())
+        except Exception:
+            pass
+
+    sa_email = getattr(creds, "service_account_email", None) or "oncogemma-cloudrun-sa@oncogemma.iam.gserviceaccount.com"
+    token = getattr(creds, "token", None)
+
     try:
-        url = blob.generate_signed_url(
-            version="v4",
-            expiration=timedelta(minutes=expiration_minutes),
-            method="PUT",
-            content_type="application/octet-stream"
-        )
-        return url
+        kwargs = {
+            "version": "v4",
+            "expiration": timedelta(minutes=expiration_minutes),
+            "method": "PUT",
+            "content_type": "application/octet-stream",
+        }
+        if sa_email:
+            kwargs["service_account_email"] = sa_email
+        if token:
+            kwargs["access_token"] = token
+
+        return blob.generate_signed_url(**kwargs)
     except Exception as e:
-        # Fallback to direct GCS endpoint if signed URL generation credentials lack private key (e.g. ADC user token)
-        return f"https://storage.googleapis.com/{bucket_name}/{blob_name}"
+        print(f"[Signed URL Warning] Primary sign failed ({e}), attempting standard signed URL...")
+        try:
+            return blob.generate_signed_url(
+                version="v4",
+                expiration=timedelta(minutes=expiration_minutes),
+                method="PUT",
+                content_type="application/octet-stream",
+            )
+        except Exception as err2:
+            raise RuntimeError(f"Could not generate signed upload URL: {e} / {err2}")
 
 def upload_directory_to_gcs_and_purge(local_dir: str, bucket_name: str, dest_prefix: str, max_workers: int = 16):
     """

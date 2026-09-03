@@ -815,6 +815,16 @@ def confirm_grading_stage(payload: ConfirmGradingPayload, db: Session = Depends(
 
     db.commit()
 
+    try:
+        from app.core.cloud_tasks import dispatch_stage_task
+        dispatch_stage_task(
+            case_id=str(case_id),
+            stage="report",
+            stage_exec_id=str(next_exec.id)
+        )
+    except Exception as e:
+        print(f"[CloudTasks Warning] Failed to dispatch next stage report: {e}")
+
     return {
         "status": "success",
         "case_id": case_id,

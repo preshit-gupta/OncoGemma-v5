@@ -14,7 +14,7 @@ from app.core.config import settings
 from app.core.gcs import ensure_buckets_exist
 from app.core.db import Base, engine
 from app.routers import (
-    cases_router, tiles_router, audit_router, triage_router, mitosis_router, grading_router, report_router
+    cases_router, tiles_router, audit_router, triage_router, mitosis_router, grading_router, report_router, worker_webhook_router
 )
 
 @asynccontextmanager
@@ -47,6 +47,7 @@ app.include_router(triage_router)
 app.include_router(mitosis_router)
 app.include_router(grading_router)
 app.include_router(report_router)
+app.include_router(worker_webhook_router)
 
 @app.get("/healthz")
 def health_check():

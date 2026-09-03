@@ -130,6 +130,26 @@ export function MitosisViewer({
     loadStageData();
   }, [caseId]);
 
+  // Auto-poll while mitosis stage is queued or running
+  useEffect(() => {
+    if (!data || data.status === "running" || data.status === "queued") {
+      const timer = setInterval(() => {
+        fetchMitosisStageData(caseId).then((stageData) => {
+          if (stageData && stageData.status !== "queued") {
+            setData(stageData);
+            setCandidates(stageData.candidates || []);
+            setHpfs(stageData.hpfs || []);
+            if (stageData.summary) setSummary(stageData.summary);
+            if (stageData.candidates && stageData.candidates.length > 0 && !selectedCandidateId) {
+              setSelectedCandidateId(stageData.candidates[0].id);
+            }
+          }
+        }).catch(() => {});
+      }, 3000);
+      return () => clearInterval(timer);
+    }
+  }, [caseId, data?.status, selectedCandidateId]);
+
   // Client-side optimistic Nottingham Score recalculation
   const computeClientScore = useCallback((currentCandidates: MitosisCandidate[], currentHpfs: VirtualHpfSite[]) => {
     const mitoses = currentCandidates.filter(c => c.label === "mitosis");
@@ -461,7 +481,7 @@ export function MitosisViewer({
     );
   }
 
-  const opticalPatchUrl = `${API_BASE}/api/v1/stages/mitosis/${caseId}/hpfs/${activeHpf?.seq || 1}/thumbnail?mag=40x&stain=${stainMode}&v=1.2`;
+  const opticalPatchUrl = `${API_BASE}/api/v1/stages/mitosis/${caseId}/hpfs/${activeHpf?.seq || 1}/thumbnail?mag=40x&stain=${stainMode}&v=${data?.stage_execution_id || 'v3'}`;
   const wholeSlideThumbnailUrl = `${API_BASE}/api/v1/cases/${caseId}/thumbnail`;
 
   return (
@@ -524,6 +544,16 @@ export function MitosisViewer({
               <Activity className="w-3.5 h-3.5" />
               Nottingham Mitotic Score: {summary.mitotic_score} ({summary.mitotic_score === 3 ? "High ≥20" : summary.mitotic_score === 2 ? "Mod 10-19" : "Low 0-9"})
             </div>
+
+            {/* Refresh Data Button */}
+            <button
+              onClick={loadStageData}
+              disabled={loading}
+              className="p-1 rounded-lg bg-slate-800 text-slate-400 hover:text-slate-200 border border-slate-700 transition"
+              title="Refresh Mitosis Stage Data"
+            >
+              <RotateCcw className={`w-4 h-4 ${loading ? "animate-spin" : ""}`} />
+            </button>
 
             {/* Calculation Details Popover Button */}
             <button

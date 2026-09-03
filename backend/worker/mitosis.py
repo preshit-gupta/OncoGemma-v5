@@ -30,7 +30,8 @@ from app.models.detection import Detection
 from app.models.hpf_site import HpfSite
 from app.models.audit import AuditEvent
 from pipeline.detect import YoloMitosisDetector, apply_global_nms, enumerate_hotspot_tiles
-from pipeline.verify import HoVerNetMitosisVerifier
+from pipeline.verify import HoVerNetMitosisVerifier, create_dual_magnification_composite
+from pipeline.medgemma import MedGemmaClient
 from pipeline.hpf import generate_mitosis_density_map, greedy_place_hpfs
 from pipeline.scoring import calculate_hpf_mitosis_counts, compute_nottingham_mitotic_score
 from pipeline.stain import MacenkoNormalizer
@@ -227,6 +228,7 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
         print(f"[Worker:Mitosis] Detected {len(raw_candidates)} candidates -> {len(candidates)} after {nms_radius_um}um NMS.")
 
         # Second-Pass Verification & Crop Extraction (128x128 @ 0.25 um/px)
+        medgemma_client = MedGemmaClient()
         half_crop_px = crop_size_px // 2
         for cand in candidates:
             cx_um, cy_um = cand["centroid_um"]
@@ -272,6 +274,42 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
             cand["_crop_bytes"] = crop_bytes
             cand["crop_uri"] = f"gs://{settings.GCS_ARTIFACTS_BUCKET}/cases/{case_id}/mitosis/crops/{crop_id}.png"
             cand["crop_orig_uri"] = f"gs://{settings.GCS_ARTIFACTS_BUCKET}/cases/{case_id}/mitosis/crops/{crop_id}_orig.png"
+
+            # MedGemma Multimodal Referee Cross-Check (Mandatory for ALL auto-confirmed & unreviewed candidates)
+            cand["medgemma_verdict"] = None
+            cand["medgemma_rationale"] = None
+            cand["medgemma_confidence"] = None
+
+            if cand["label"] in ("unreviewed", "mitosis"):
+                try:
+                    f_crop_b = None
+                    ctx_b = None
+                    if openslide_slide is not None:
+                        try:
+                            f_crop_b, ctx_b = create_dual_magnification_composite(openslide_slide, cx_px, cy_px, mpp_x)
+                        except Exception:
+                            f_crop_b = crop_bytes
+                    else:
+                        f_crop_b = crop_bytes
+
+                    mg_resp = asyncio.run(medgemma_client.evaluate_mitosis_confirmation(f_crop_b, ctx_b))
+                    cand["medgemma_verdict"] = mg_resp.verdict
+                    cand["medgemma_rationale"] = mg_resp.rationale
+                    cand["medgemma_confidence"] = mg_resp.confidence
+
+                    if mg_resp.verdict == "CONFIRMED":
+                        cand["label"] = "mitosis"
+                        cand["label_source"] = "medgemma_confirmed"
+                        cand["ver_conf"] = max(cand["ver_conf"], 0.88)
+                    elif mg_resp.verdict in ("REJECTED_APOPTOSIS", "REJECTED_LYMPHOCYTE", "REJECTED_RESTING_NUCLEUS"):
+                        cand["label"] = "not_mitosis"
+                        cand["label_source"] = f"medgemma_{mg_resp.verdict.lower()}"
+                        cand["ver_conf"] = min(cand["ver_conf"], 0.12)
+                    else: # EQUIVOCAL
+                        cand["label"] = "unreviewed"
+                        cand["label_source"] = "medgemma_equivocal"
+                except Exception as mge:
+                    print(f"[Worker:Mitosis] MedGemma referee note for {cand['id']}: {mge}")
 
         # Concurrently upload all crop PNGs to GCS
         from concurrent.futures import ThreadPoolExecutor
@@ -325,14 +363,14 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
         stain_normalizer = None
         try:
             from pipeline.stain import PureNumpyMacenkoNormalizer
-            sp_text = download_blob_as_text(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/preprocess/stain_params.json")
-            sp_data = json.loads(sp_text)
+            sp_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/preprocess/stain_params.json")
+            sp_data = json.loads(sp_bytes.decode("utf-8"))
             if "stain_matrix" in sp_data and "max_concentrations" in sp_data:
                 stain_normalizer = PureNumpyMacenkoNormalizer()
                 stain_normalizer.stain_matrix_target = np.array(sp_data["stain_matrix"], dtype=float)
                 stain_normalizer.max_conc_target = np.array(sp_data["max_concentrations"], dtype=float)
-        except Exception:
-            pass
+        except Exception as se:
+            print(f"[Worker:Mitosis Note] Failed to load stain normalizer: {se}")
 
         hpf_uploads = []
         dim_w, dim_h = getattr(openslide_slide, "dimensions", (width_px, height_px)) if openslide_slide else (width_px, height_px)
@@ -422,6 +460,9 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
                 ver_conf=cand.get("ver_conf"),
                 label=cand.get("label", "unreviewed"),
                 label_source=cand.get("label_source", "model"),
+                medgemma_verdict=cand.get("medgemma_verdict"),
+                medgemma_rationale=cand.get("medgemma_rationale"),
+                medgemma_confidence=cand.get("medgemma_confidence"),
                 crop_uri=cand.get("crop_uri"),
                 crop_orig_uri=cand.get("crop_orig_uri")
             )

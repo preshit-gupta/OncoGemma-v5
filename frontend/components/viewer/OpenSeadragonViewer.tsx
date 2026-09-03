@@ -353,10 +353,25 @@ export function OpenSeadragonViewer({
   // Sync heatmap overlay without recreating viewer
   useEffect(() => {
     if (!viewerRef.current) return;
-    const count = viewerRef.current.world.getItemCount();
+    const world = viewerRef.current.world;
+    if (!world) return;
+
+    const count = world.getItemCount();
     if (count > 1) {
-      const overlayItem = viewerRef.current.world.getItemAt(1);
-      if (overlayItem) {
+      const overlayItem = world.getItemAt(1);
+      if (overlayImageUri && overlayItem && (overlayItem as any)._og_url !== overlayImageUri) {
+        world.removeItem(overlayItem);
+        viewerRef.current.addSimpleImage({
+          url: overlayImageUri,
+          opacity: showOverlay ? overlayOpacity : 0.0,
+          x: 0,
+          y: 0,
+          width: 1.0,
+          success: (item: any) => {
+            if (item?.item) (item.item as any)._og_url = overlayImageUri;
+          }
+        });
+      } else if (overlayItem) {
         overlayItem.setOpacity(showOverlay ? overlayOpacity : 0.0);
       }
     } else if (overlayImageUri && count === 1) {
@@ -365,7 +380,10 @@ export function OpenSeadragonViewer({
         opacity: showOverlay ? overlayOpacity : 0.0,
         x: 0,
         y: 0,
-        width: 1.0
+        width: 1.0,
+        success: (item: any) => {
+          if (item?.item) (item.item as any)._og_url = overlayImageUri;
+        }
       });
     }
   }, [overlayOpacity, showOverlay, overlayImageUri]);

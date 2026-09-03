@@ -19,8 +19,7 @@ verifier:
   model_name: "hovernet_mitosis_v1"
   weights_path: "models/verifier/hovernet_mitosis.pt"
   crop_size_px: 128
-  crop_size_um: 32.0 # 128 * 0.25
-  ver_threshold: 0.65 # Confirmed mitosis verification threshold (>=0.65 is definite mitosis)
+  ver_threshold: 0.70 # Confirmed mitosis verification threshold (>=0.70 is definite mitosis)
 
 hpf:
   radius_um: 262.0 # 250-270 um field radius (area ≈ 0.2157 mm²)

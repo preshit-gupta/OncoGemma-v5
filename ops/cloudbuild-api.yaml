@@ -1,0 +1,37 @@
+steps:
+  # 1. Build Backend API Container Image
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - '$_REGION-docker.pkg.dev/$PROJECT_ID/oncogemma-repo/api:latest'
+      - '-f'
+      - 'ops/docker/Dockerfile.api'
+      - '.'
+    id: 'build-api'
+
+  # 2. Push Container Image to Artifact Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', '$_REGION-docker.pkg.dev/$PROJECT_ID/oncogemma-repo/api:latest']
+    id: 'push-api'
+
+  # 3. Deploy FastAPI Control Plane to Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'gcloud'
+    args:
+      - 'run'
+      - 'deploy'
+      - 'oncogemma-api'
+      - '--image=$_REGION-docker.pkg.dev/$PROJECT_ID/oncogemma-repo/api:latest'
+      - '--region=$_REGION'
+      - '--platform=managed'
+      - '--allow-unauthenticated'
+      - '--add-cloudsql-instances=$PROJECT_ID:$_REGION:oncogemma-dev-psql'
+    id: 'deploy-api'
+
+substitutions:
+  _REGION: 'us-central1'
+
+options:
+  machineType: 'E2_HIGHCPU_8'
+  logging: CLOUD_LOGGING_ONLY

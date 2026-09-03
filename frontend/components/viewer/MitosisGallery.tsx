@@ -147,7 +147,7 @@ export function MitosisGallery({
             const isRejected = cand.label === "not_mitosis";
             const isUnreviewed = cand.label === "unreviewed";
 
-            const cropUrl = `${API_BASE}/api/v1/stages/mitosis/${caseId}/candidates/${cand.id}/crop?stain=${stainMode}&v=1.2`;
+            const cropUrl = `${API_BASE}/api/v1/stages/mitosis/${caseId}/candidates/${cand.id}/crop?stain=${stainMode}&v=v3`;
 
             return (
               <div
@@ -208,12 +208,39 @@ export function MitosisGallery({
                       {cand.ver_conf !== null && cand.ver_conf !== undefined && (
                         <span>Ver: <strong className="text-slate-300">{((cand.ver_conf || 0) * 100).toFixed(0)}%</strong></span>
                       )}
-                      {cand.label_source && cand.label_source !== "model" && (
+                      {cand.medgemma_verdict && (
+                        <span 
+                          title={cand.medgemma_rationale || cand.medgemma_verdict}
+                          className={`text-[9px] px-1 py-0.5 rounded flex items-center gap-0.5 font-sans font-medium ${
+                            cand.medgemma_verdict === "CONFIRMED"
+                              ? "bg-indigo-950 text-indigo-300 border border-indigo-700/50"
+                              : cand.medgemma_verdict.startsWith("REJECTED")
+                              ? "bg-rose-950 text-rose-300 border border-rose-800/40"
+                              : "bg-amber-950 text-amber-300 border border-amber-800/40"
+                          }`}
+                        >
+                          <Sparkles className="w-2.5 h-2.5 text-indigo-400" />
+                          {cand.medgemma_verdict === "CONFIRMED"
+                            ? "MedGemma"
+                            : cand.medgemma_verdict === "REJECTED_APOPTOSIS"
+                            ? "Apoptosis"
+                            : cand.medgemma_verdict === "REJECTED_LYMPHOCYTE"
+                            ? "Lymphocyte"
+                            : "MedGemma"}
+                        </span>
+                      )}
+                      {cand.label_source && cand.label_source !== "model" && !cand.label_source.startsWith("medgemma") && (
                         <span className="text-[9px] px-1 bg-sky-950 text-sky-300 rounded border border-sky-800/40">
                           Manual
                         </span>
                       )}
                     </div>
+
+                    {cand.medgemma_rationale && (
+                      <p className="mt-1 text-[10px] text-indigo-200/80 line-clamp-1 italic font-sans" title={cand.medgemma_rationale}>
+                        &ldquo;{cand.medgemma_rationale}&rdquo;
+                      </p>
+                    )}
 
                     {/* Quick Action Toggle Buttons */}
                     <div className="mt-2 flex items-center gap-1.5">

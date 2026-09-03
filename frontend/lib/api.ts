@@ -1,6 +1,4 @@
-export const API_BASE = typeof window !== "undefined"
-  ? (process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000")
-  : "http://localhost:8000";
+export const API_BASE = "";
 
 export interface Case {
   id: string;
@@ -54,11 +52,93 @@ export async function createCase(): Promise<Case> {
   return res.json();
 }
 
+export async function uploadSlideDirectToGCS(
+  caseId: string,
+  file: File,
+  onProgress?: (percent: number) => void
+): Promise<any> {
+  // 1. Request Signed Upload URL from FastAPI control plane
+  const urlRes = await fetch(`${API_BASE}/api/v1/cases/${caseId}/slide/upload-url`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-User-Role": "pathologist"
+    },
+    body: JSON.stringify({
+      filename: file.name,
+      size_bytes: file.size,
+      content_type: file.type || "application/octet-stream"
+    })
+  });
+
+  if (!urlRes.ok) {
+    throw new Error(`Failed to acquire direct upload URL: ${urlRes.statusText}`);
+  }
+
+  const { upload_url, gcs_uri } = await urlRes.json();
+
+  // 2. Upload file directly from browser to GCS bucket via Signed URL
+  await new Promise<void>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+
+    if (xhr.upload && onProgress) {
+      xhr.upload.addEventListener("progress", (e) => {
+        if (e.lengthComputable) {
+          const percent = Math.round((e.loaded / e.total) * 100);
+          onProgress(percent);
+        }
+      });
+    }
+
+    xhr.addEventListener("load", () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve();
+      } else {
+        reject(new Error(`Direct GCS upload failed with status ${xhr.status}`));
+      }
+    });
+
+    xhr.addEventListener("error", () => reject(new Error("Network connection error during direct GCS upload")));
+    xhr.addEventListener("abort", () => reject(new Error("Direct GCS upload aborted")));
+
+    xhr.open("PUT", upload_url);
+    xhr.setRequestHeader("Content-Type", "application/octet-stream");
+    xhr.send(file);
+  });
+
+  // 3. Finalize upload with API to record slide metadata and trigger cloud pipeline stage
+  const finalizeRes = await fetch(`${API_BASE}/api/v1/cases/${caseId}/slide/finalize`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-User-Role": "pathologist"
+    },
+    body: JSON.stringify({ gcs_uri })
+  });
+
+  if (!finalizeRes.ok) {
+    throw new Error("Failed to finalize slide registration in cloud");
+  }
+
+  return finalizeRes.json();
+}
+
 export async function uploadSlideFile(
   caseId: string,
   file: File,
   onProgress?: (percent: number) => void
 ): Promise<any> {
+  // First attempt zero-server-transit direct GCS upload
+  try {
+    return await uploadSlideDirectToGCS(caseId, file, onProgress);
+  } catch (directErr) {
+    if (file.size > 25 * 1024 * 1024) {
+      // Cloud Run HTTP body limit is 32MB; large WSI files cannot be proxied through the API
+      throw directErr;
+    }
+    console.warn("Direct GCS upload attempt failed, falling back to API proxy upload:", directErr);
+  }
+
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     const formData = new FormData();
@@ -150,7 +230,10 @@ export interface MitosisCandidate {
   det_conf?: number | null;
   ver_conf?: number | null;
   label: "mitosis" | "not_mitosis" | "unreviewed";
-  label_source: "model" | "pathologist" | "pathologist_bulk";
+  label_source: string;
+  medgemma_verdict?: string | null;
+  medgemma_rationale?: string | null;
+  medgemma_confidence?: "low" | "medium" | "high" | null;
   crop_uri?: string | null;
   crop_orig_uri?: string | null;
 }

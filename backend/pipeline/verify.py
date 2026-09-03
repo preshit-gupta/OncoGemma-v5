@@ -151,43 +151,56 @@ class HoVerNetMitosisVerifier:
                 py_crop = int(pt[0][1] + (cy - r_px))
                 contour_pts.append([px_crop, py_crop])
 
-            # 1. Reject Apoptotic Fragments / Small Pyknotic Debris:
-            # Mitotic figures in breast carcinoma are 10-18 um (40-72 px diameter).
-            # Anything with diam < 20 px (< 5 um) or area < 300 px2 is an apoptotic body, pyknotic fragment, or debris.
-            if equiv_diam < 20.0 or area < 300.0:
-                return 0.15, contour_pts
+            # Measure halo contrast ratio to detect apoptotic retraction space
+            mask_cnt_inner = np.zeros_like(center_h_od, dtype=np.uint8)
+            cv2.drawContours(mask_cnt_inner, [central_cnt], -1, 255, -1)
+            kernel = np.ones((5, 5), np.uint8)
+            mask_cnt_outer = cv2.dilate(mask_cnt_inner, kernel, iterations=2)
+            halo_mask = (mask_cnt_outer > 0) & (mask_cnt_inner == 0)
+            halo_od = float(np.mean(center_h_od[halo_mask])) if np.any(halo_mask) else 0.5
+            core_od = float(np.mean(center_h_od[mask_cnt_inner > 0])) if np.any(mask_cnt_inner > 0) else 0.5
+
+            # 1. Reject Apoptotic Bodies (Van Diest Criteria):
+            # Apoptotic bodies feature small, smooth, compact globular pyknotic fragments
+            # (equiv_diam < 24 px, circ > 0.58, spiculation < 0.20) surrounded by a clear retraction halo.
+            if equiv_diam < 24.0 and circ > 0.58 and spiculation < 0.20 and halo_od < 0.18:
+                return 0.08, contour_pts
 
             # 2. Reject Lymphocyte / Inflammatory Cell:
-            # Smooth continuous circular membrane (circ > 0.65, solidity > 0.88, spiculation < 0.20, low texture std < 0.28)
-            if 20 <= equiv_diam <= 32 and circ > 0.65 and solidity > 0.88 and spiculation < 0.20 and std_od < 0.28:
-                return 0.20, contour_pts
+            # Small (diam 16-30 px ~ 4-7.5 um), high circularity (>0.64), high solidity (>0.86), low spiculation (<0.18)
+            if 16.0 <= equiv_diam <= 30.0 and circ > 0.64 and solidity > 0.86 and spiculation < 0.18:
+                return 0.12, contour_pts
 
-            # 3. Reject Normal / Resting Tumor Nucleus (Solitary or Crowded Sheet):
-            # Smooth membrane, lower chromatin condensation (p95_od < 0.95 and std_od < 0.30, spiculation < 0.22, solidity > 0.85)
-            if spiculation < 0.22 and solidity > 0.85 and p95_od < 0.95 and std_od < 0.30:
-                return 0.28, contour_pts
+            # 3. Reject Resting Interphase Nuclei:
+            # True mitoses REQUIRE dissolved nuclear envelope. An intact, continuous oval/circular membrane
+            # with smooth contour (spiculation < 0.18, circ > 0.55, solidity > 0.84) represents interphase.
+            if spiculation < 0.18 and solidity > 0.84 and (circ > 0.55 or p95_od < 0.90):
+                return 0.15, contour_pts
 
-            # 4. Reject Massive Tissue Fold / Stain Clump:
-            if area > 3500 or equiv_diam > 65.0:
-                return 0.20, contour_pts
+            # 4. Reject Tiny Debris / Giant Tissue Folds:
+            if area < 300.0 or equiv_diam < 20.0 or area > 3200.0 or equiv_diam > 62.0:
+                return 0.12, contour_pts
 
-            # 5. Mitotic Figure Scoring (True dividing cell with dissolved envelope and hairy spicules):
-            # - Size score: centered around 24-55 px (6-14 um)
+            # 5. Mitotic Figure Scoring (Van Diest Classic Metaphase / Anaphase / Telophase Criteria):
+            # True dividing cell requires:
+            # - High spiculation / chromosome arms protruding into cytoplasm (spiculation >= 0.18)
+            # - Intensely condensed basophilic chromatin (p95_od >= 0.75)
+            # - High texture variance from individual chromosomes (std_od >= 0.20)
+            # - Irregular, jagged contour from envelope dissolution (solidity < 0.82)
             size_score = float(np.clip((equiv_diam - 20.0) / 22.0, 0.0, 1.0))
-            # - Spiculation / lack of intact membrane (spiculation >= 0.15)
-            spic_score = float(np.clip((spiculation - 0.15) / 0.45, 0.0, 1.0))
-            # - Chromatin condensation (p95_od >= 0.75)
+            spic_score = float(np.clip((spiculation - 0.18) / 0.40, 0.0, 1.0))
             od_score = float(np.clip((p95_od - 0.75) / 0.75, 0.0, 1.0))
-            # - Texture variance from chromosome clumps (std_od >= 0.20)
             texture_score = float(np.clip((std_od - 0.20) / 0.35, 0.0, 1.0))
-            # - Irregularity (lower solidity from jagged boundary)
-            irregularity_score = float(np.clip((1.0 - solidity) / 0.30, 0.0, 1.0))
+            irregularity_score = float(np.clip((0.85 - solidity) / 0.25, 0.0, 1.0))
+
+            if spic_score < 0.10 or od_score < 0.20 or texture_score < 0.15:
+                return 0.22, contour_pts
 
             p_mitosis = 0.15 + (
-                0.25 * spic_score +
+                0.30 * spic_score +
                 0.25 * od_score +
                 0.25 * texture_score +
-                0.15 * size_score +
+                0.10 * size_score +
                 0.10 * irregularity_score
             )
 
@@ -199,3 +212,55 @@ class HoVerNetMitosisVerifier:
                 return 0.12, None
             score = 0.20 + min(0.70, (dense_pixels / 600.0) * 0.35 + (p95_od / 2.0) * 0.35)
             return float(np.clip(score, 0.05, 0.95)), None
+
+
+def create_dual_magnification_composite(
+    slide_obj,
+    center_x: int,
+    center_y: int,
+    mpp_x: float = 0.25
+) -> tuple[bytes, bytes]:
+    """
+    Extract dual-magnification views for MedGemma multimodal refereeing:
+    1. Focus Crop (40x, 128x128 px): Target cell with subtle circular reticle.
+    2. Context Patch (10x, 512x512 px): Surrounding tumor bed architecture.
+    """
+    from PIL import Image, ImageDraw
+    import io
+    from app.core.openslide_lock import OPENSLIDE_GLOBAL_LOCK
+
+    # 1. 40x Focus Crop (128x128 px @ level 0)
+    crop_size = 128
+    x0 = max(0, int(center_x - crop_size // 2))
+    y0 = max(0, int(center_y - crop_size // 2))
+
+    with OPENSLIDE_GLOBAL_LOCK:
+        rgba_focus = slide_obj.read_region((x0, y0), 0, (crop_size, crop_size))
+        rgb_focus = rgba_focus.convert("RGB")
+
+    # Draw subtle circular marker around candidate center (r=16 px)
+    focus_annotated = rgb_focus.copy()
+    draw = ImageDraw.Draw(focus_annotated)
+    cx, cy = crop_size // 2, crop_size // 2
+    draw.ellipse([cx - 16, cy - 16, cx + 16, cy + 16], outline="#E11D48", width=2)
+
+    buf_focus = io.BytesIO()
+    focus_annotated.save(buf_focus, format="JPEG", quality=92)
+    crop_bytes = buf_focus.getvalue()
+
+    # 2. 10x Context Crop (512x512 px @ 1.0 um/px)
+    downsample = 1.0 / max(mpp_x, 0.1) # e.g. 4.0
+    l0_w = int(512 * downsample)
+    l0_h = int(512 * downsample)
+    cx0 = max(0, int(center_x - l0_w // 2))
+    cy0 = max(0, int(center_y - l0_h // 2))
+
+    with OPENSLIDE_GLOBAL_LOCK:
+        rgba_ctx = slide_obj.read_region((cx0, cy0), 0, (l0_w, l0_h))
+        rgb_ctx = rgba_ctx.convert("RGB").resize((512, 512), Image.Resampling.LANCZOS)
+
+    buf_ctx = io.BytesIO()
+    rgb_ctx.save(buf_ctx, format="JPEG", quality=85)
+    context_bytes = buf_ctx.getvalue()
+
+    return crop_bytes, context_bytes

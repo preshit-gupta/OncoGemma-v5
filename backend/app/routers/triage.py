@@ -587,6 +587,16 @@ def confirm_triage(payload: TriageConfirmPayload, db: Session = Depends(get_db))
     db.add(audit)
     db.commit()
 
+    try:
+        from app.core.cloud_tasks import dispatch_stage_task
+        dispatch_stage_task(
+            case_id=str(payload.case_id),
+            stage=next_stage_name,
+            stage_exec_id=str(next_exec.id)
+        )
+    except Exception as e:
+        print(f"[CloudTasks Warning] Failed to dispatch next stage {next_stage_name}: {e}")
+
     return {
         "status": "confirmed",
         "case_id": payload.case_id,

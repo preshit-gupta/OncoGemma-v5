@@ -19,6 +19,7 @@ from app.core.gcs import (
     parse_gcs_uri
 )
 from app.core.openslide_lock import OPENSLIDE_GLOBAL_LOCK
+from app.core.cloud_tasks import dispatch_stage_task
 from app.models.case import Case
 from app.models.slide import Slide
 from app.models.stage_execution import StageExecution
@@ -157,6 +158,13 @@ async def upload_slide_file(
     
     db.commit()
 
+    dispatch_stage_task(
+        case_id=str(case_id),
+        stage="ingest",
+        stage_exec_id=str(stage_exec.id),
+        payload={"gcs_uri": gcs_uri, "slide_id": str(slide_obj.id)}
+    )
+
     return {
         "status": "queued",
         "slide_id": str(slide_obj.id),
@@ -207,6 +215,13 @@ def retry_case_stage(
     db.add(audit)
     db.commit()
     db.refresh(new_stage)
+
+    dispatch_stage_task(
+        case_id=str(case_id),
+        stage=stage_name,
+        stage_exec_id=str(new_stage.id),
+        payload={"slide_id": str(slide_obj.id)}
+    )
 
     return {
         "status": "queued",
@@ -292,6 +307,14 @@ def approve_case_stage(
     db.add(audit)
     db.commit()
 
+    if new_stage:
+        dispatch_stage_task(
+            case_id=str(case_id),
+            stage=next_stage_name,
+            stage_exec_id=str(new_stage.id),
+            payload={"slide_id": str(slide_obj.id), "gcs_uri_original": slide_obj.gcs_uri_original}
+        )
+
     return {
         "status": "approved",
         "approved_stage": stage_name,
@@ -362,6 +385,13 @@ def finalize_slide_upload(
     db.commit()
     db.refresh(slide_obj)
     db.refresh(stage_exec)
+
+    dispatch_stage_task(
+        case_id=str(case_id),
+        stage="ingest",
+        stage_exec_id=str(stage_exec.id),
+        payload={"gcs_uri_original": req.gcs_uri, "slide_id": str(slide_obj.id)}
+    )
 
     return {
         "status": "queued",

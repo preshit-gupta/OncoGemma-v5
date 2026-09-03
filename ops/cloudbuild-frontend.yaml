@@ -1,0 +1,36 @@
+steps:
+  # 1. Build Next.js Frontend Container Image
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - '$_REGION-docker.pkg.dev/$PROJECT_ID/oncogemma-repo/frontend:latest'
+      - '-f'
+      - 'ops/docker/Dockerfile.frontend'
+      - '.'
+    id: 'build-frontend'
+
+  # 2. Push Container Image to Artifact Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', '$_REGION-docker.pkg.dev/$PROJECT_ID/oncogemma-repo/frontend:latest']
+    id: 'push-frontend'
+
+  # 3. Deploy Next.js Frontend to Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'gcloud'
+    args:
+      - 'run'
+      - 'deploy'
+      - 'oncogemma-frontend'
+      - '--image=$_REGION-docker.pkg.dev/$PROJECT_ID/oncogemma-repo/frontend:latest'
+      - '--region=$_REGION'
+      - '--platform=managed'
+      - '--allow-unauthenticated'
+    id: 'deploy-frontend'
+
+substitutions:
+  _REGION: 'us-central1'
+
+options:
+  machineType: 'E2_HIGHCPU_8'
+  logging: CLOUD_LOGGING_ONLY
