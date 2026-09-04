@@ -35,7 +35,26 @@
   * Generates dual-magnification inputs ($40\times$ reticle focus crop + $10\times$ HPF overview context).
   * **Mandatory Cross-Check Policy**: 100% of candidate mitoses—including figures that would otherwise be auto-confirmed—undergo mandatory MedGemma referee adjudication. Mimics are overruled and downgraded to `not_mitosis`, borderline figures are flagged for pathologist review, and verified mitoses receive sparkle badges and clinical rationale tooltips.
 
-### 🎯 MIDOG-Standard NMS & Optical Reticle Calibration (Latest)
+### 🗺️ Stage 3 Triage Viewer: Viridis Tumor Heatmap & OpenSeadragon Stacking Overhaul (Latest)
+* **Z-Index Layering & Race Condition Elimination**: Fixed an asynchronous race condition in OpenSeadragon where simple image overlays were attached before the base slide pyramid fired its `open` event, inadvertently placing the heatmap underneath opaque slide tiles. Overlays are now strictly sequenced and indexed at the top level of the viewer world (`index: world.getItemCount()`), ensuring the Viridis colormap renders reliably over the tissue bed.
+* **Aspect Ratio & Coordinate Registration**: Aligned the $80 \times 215$ RGBA probability grid directly with the gigapixel WSI slide coordinates ($52,842 \times 142,079$ px) without dimension conflicts, yielding sharp, pixel-perfect spatial registration across the invasive tumor front.
+* **Fluid Intensity Toggle & Non-Destructive Slider**: Re-engineered opacity updates in `OpenSeadragonViewer.tsx` to directly manipulate `item.setOpacity(targetOpacity)` and trigger `viewer.forceRedraw()`. Pathologists can toggle heatmap visibility and slide the intensity between 10% and 100% with instantaneous visual feedback and zero platform freezing or canvas thrashing.
+* **Self-Healing Overlay Loading**: Protected against premature 404 caching during in-flight triage execution, with automatic retries and cache-busting upon stage completion.
+
+### 🧬 Stage 3 → Stage 4: Tissue Density–Conscious HPF Selection (No Empty Lumina) (Latest)
+* **Parenchymal Tissue Ratio Gating (`min_tissue_ratio >= 0.70`)**:
+  * Root cause: Moving from Stage 3 hotspots to Stage 4 mitotic activity previously placed HPFs using greedy convolution strictly on candidate mitotic density, which could center HPF circles over empty background glass, ductal lumina, or acellular necrosis if solitary artifacts or mimics appeared there.
+  * Solution in `backend/pipeline/hpf.py`: Evaluates the local Otsu tissue segmentation mask for every candidate $(x, y)$ coordinate across the WSI. Any coordinate whose $524\,\mu\text{m}$ circular field contains $< 70\%$ tissue area is filtered out prior to greedy peak selection.
+  * Guarantees that all 10 standard Virtual HPFs ($2.157\text{ mm}^2$ total area) reside strictly within cellular, solid invasive carcinoma tumor parenchyma, fully adhering to Nottingham and WHO diagnostic guidelines.
+
+### 🔄 Cloud-Native State Rehydration & Resilient Backend Recovery (Latest)
+* **Autonomous GCS-Backed Relational Recovery (`rehydrate.py`)**:
+  * Cloud Run containers are ephemeral and can scale to zero or restart across deployment cycles. 
+  * Implemented transparent on-demand rehydration: if a queried Case, Slide, StageExecution, Hotspot, Detection, or HPF is missing from the active database, the API dynamically inspects persistent GCS artifacts (`gs://oncogemma-dev-artifacts/cases/{case_id}/`) and reconstructs the full relational state.
+  * Restores active cases, triage review states, and verified mitotic figure candidates seamlessly without requiring repetitive slide uploads or re-running expensive ML pipelines.
+* **Protected Database Admin Utilities**: Added `/api/v1/admin/reset-database` with dialect-aware table clearing (SQLite `DELETE FROM` / PostgreSQL `TRUNCATE RESTART IDENTITY CASCADE`) for controlled end-to-end regression testing.
+
+### 🎯 MIDOG-Standard NMS & Optical Reticle Calibration
 These fixes resolve coinciding / overlapping / duplicate mitotic figure counts — the most critical accuracy improvement to date.
 
 * **MIDOG 2022 Challenge–Standard 20 µm NMS** ([arXiv:2204.03742](https://arxiv.org/abs/2204.03742)):
