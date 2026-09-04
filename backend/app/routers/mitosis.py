@@ -184,6 +184,16 @@ def get_mitosis_stage_data(case_id: str, db: Session = Depends(get_db)):
     }
 
 
+def get_cached_slide_path(raw_bucket_name: str, blob_name: str) -> str:
+    cache_dir = os.path.join(tempfile.gettempdir(), "oncogemma_slides")
+    os.makedirs(cache_dir, exist_ok=True)
+    safe_name = blob_name.replace("/", "_")
+    target_path = os.path.join(cache_dir, safe_name)
+    if not os.path.exists(target_path) or os.path.getsize(target_path) == 0:
+        download_blob_to_filename(raw_bucket_name, blob_name, target_path)
+    return target_path
+
+
 @router.get("/{case_id}/candidates/{candidate_id}/crop")
 def get_candidate_crop(
     case_id: str,
@@ -244,14 +254,11 @@ def get_candidate_crop(
             pass
 
     if cx_um is not None and cy_um is not None:
-        scratch_dir = tempfile.mkdtemp(prefix="og_cand_crop_")
         try:
             gcs_uri_original = resolve_slide_raw_uri(case_id, slide_obj) or getattr(slide_obj, "gcs_uri_original", None) or f"gs://{settings.GCS_RAW_BUCKET}/cases/{case_id}/slide.svs"
             raw_bucket_name, r_blob_name = parse_gcs_uri(gcs_uri_original)
-            ext = os.path.splitext(r_blob_name)[1] or ".svs"
-            local_slide_path = os.path.join(scratch_dir, f"slide{ext}")
+            local_slide_path = get_cached_slide_path(raw_bucket_name, r_blob_name)
 
-            download_blob_to_filename(raw_bucket_name, r_blob_name, local_slide_path)
             if os.path.exists(local_slide_path):
                 with OPENSLIDE_GLOBAL_LOCK:
                     import openslide
@@ -302,8 +309,6 @@ def get_candidate_crop(
                 return Response(content=extracted_crop_bytes, media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
         except Exception as e:
             print(f"[Candidate Crop Extraction Error] {e}")
-        finally:
-            shutil.rmtree(scratch_dir, ignore_errors=True)
 
     raise HTTPException(status_code=404, detail=f"Candidate crop {candidate_id} could not be extracted from authentic slide")
 
@@ -375,18 +380,11 @@ def get_hpf_thumbnail(
 
     extracted_bytes = None
 
-    # Fallback: OpenSlide raw WSI extraction directly from resolved raw slide URI
-    scratch_dir = tempfile.mkdtemp(prefix="og_hpf_thumb_")
+    # OpenSlide raw WSI extraction directly from cached raw slide
     try:
         gcs_uri_original = resolve_slide_raw_uri(case_id, slide_obj) or getattr(slide_obj, "gcs_uri_original", None) or f"gs://{settings.GCS_RAW_BUCKET}/cases/{case_id}/slide.svs"
         raw_bucket_name, blob_name = parse_gcs_uri(gcs_uri_original)
-        ext = os.path.splitext(blob_name)[1] or ".svs"
-        local_slide_path = os.path.join(scratch_dir, f"slide{ext}")
-
-        try:
-            download_blob_to_filename(raw_bucket_name, blob_name, local_slide_path)
-        except Exception as dl_e:
-            print(f"[HPF Slide Download Note] {dl_e}")
+        local_slide_path = get_cached_slide_path(raw_bucket_name, blob_name)
 
         if os.path.exists(local_slide_path):
             with OPENSLIDE_GLOBAL_LOCK:
@@ -404,7 +402,13 @@ def get_hpf_thumbnail(
                     x0 = max(0, min(dim_w - crop_w_px, cx_px - crop_w_px // 2))
                     y0 = max(0, min(dim_h - crop_h_px, cy_px - crop_h_px // 2))
 
-                    patch_raw = os_slide.read_region((x0, y0), 0, (crop_w_px, crop_h_px)).convert("RGB")
+                    downsample = 1.0 if mag == "40x" else (2.0 if mag == "20x" else 4.0)
+                    target_level = os_slide.get_best_level_for_downsample(downsample)
+                    lvl_downsample = float(os_slide.level_downsamples[target_level])
+                    lvl_w = max(1, int(round(crop_w_px / lvl_downsample)))
+                    lvl_h = max(1, int(round(crop_h_px / lvl_downsample)))
+
+                    patch_raw = os_slide.read_region((x0, y0), target_level, (lvl_w, lvl_h)).convert("RGB")
                 finally:
                     if os_slide and hasattr(os_slide, "close"):
                         os_slide.close()
