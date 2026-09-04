@@ -207,11 +207,19 @@ async def upload_slide_file(
     db.add(slide_obj)
     db.flush()
     
-    # Queue 'ingest' stage_execution
+    # Queue 'ingest' stage_execution (monotonic attempt tracking - Issue #69)
+    stmt_ingest = (
+        select(StageExecution)
+        .where(StageExecution.case_id == case_id, StageExecution.stage == "ingest")
+        .order_by(StageExecution.attempt.desc())
+    )
+    existing_ingest = db.scalars(stmt_ingest).first()
+    next_attempt = (existing_ingest.attempt + 1) if existing_ingest else 1
+
     stage_exec = StageExecution(
         case_id=case_id,
         stage="ingest",
-        attempt=1,
+        attempt=next_attempt,
         status="queued",
         input_ref={
             "gcs_uri_original": gcs_uri,
@@ -220,6 +228,7 @@ async def upload_slide_file(
         }
     )
     db.add(stage_exec)
+    case_obj.status = "open"
     
     # Audit event
     audit = AuditEvent(
@@ -227,7 +236,7 @@ async def upload_slide_file(
         actor=user.id,
         event_type="slide_uploaded",
         stage="ingest",
-        payload={"gcs_uri": gcs_uri, "slide_id": str(slide_obj.id), "filename": file.filename}
+        payload={"gcs_uri": gcs_uri, "slide_id": str(slide_obj.id), "filename": file.filename, "attempt": next_attempt}
     )
     db.add(audit)
     
@@ -244,8 +253,11 @@ async def upload_slide_file(
         "status": "queued",
         "slide_id": str(slide_obj.id),
         "stage_execution_id": str(stage_exec.id),
-        "gcs_uri": gcs_uri
+        "gcs_uri": gcs_uri,
+        "attempt": next_attempt
     }
+
+KNOWN_STAGES = ("ingest", "preprocess", "qc", "triage", "mitosis", "grading", "report")
 
 @router.post("/{case_id}/stages/{stage_name}/retry", status_code=status.HTTP_202_ACCEPTED)
 def retry_case_stage(
@@ -255,6 +267,12 @@ def retry_case_stage(
     user: CurrentUser = Depends(get_current_user)
 ):
     """Re-queue execution attempt for a specific pipeline stage."""
+    if stage_name not in KNOWN_STAGES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid stage_name '{stage_name}'. Known stages: {', '.join(KNOWN_STAGES)}"
+        )
+
     case_obj = db.get(Case, case_id)
     if not case_obj:
         raise HTTPException(status_code=404, detail="Case not found")
@@ -269,7 +287,24 @@ def retry_case_stage(
         .order_by(StageExecution.attempt.desc())
     )
     existing_stage = db.scalars(stmt).first()
-    next_attempt = (existing_stage.attempt + 1) if existing_stage else 1
+    if not existing_stage:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Stage '{stage_name}' has no previous execution attempt to retry."
+        )
+
+    if existing_stage.status not in ("failed", "rejected", "running"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Stage '{stage_name}' cannot be retried because its status is '{existing_stage.status}'. Only stages in ('failed', 'rejected') can be retried."
+        )
+
+    if existing_stage.status == "running":
+        existing_stage.status = "failed"
+        existing_stage.error = "Interrupted and retried by user while running."
+        existing_stage.completed_at = datetime.now(timezone.utc)
+
+    next_attempt = existing_stage.attempt + 1
 
     new_stage = StageExecution(
         case_id=case_id,
@@ -329,8 +364,22 @@ def approve_case_stage(
         .order_by(StageExecution.attempt.desc())
     )
     current_stage = db.scalars(stmt).first()
-    if current_stage:
-        current_stage.status = "confirmed"
+    if not current_stage:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Stage '{stage_name}' execution not found for case {case_id}."
+        )
+
+    if current_stage.status != "awaiting_review":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Stage '{stage_name}' cannot be approved because its status is '{current_stage.status}', expected 'awaiting_review'."
+        )
+
+    now_utc = datetime.now(timezone.utc)
+    current_stage.status = "confirmed"
+    current_stage.reviewed_by = user.id
+    current_stage.reviewed_at = now_utc
 
     # If approving preprocess, also mark associated QC stage as confirmed
     if stage_name == "preprocess":
@@ -341,6 +390,8 @@ def approve_case_stage(
         ).first()
         if qc_stage and qc_stage.status in ("awaiting_review", "done"):
             qc_stage.status = "confirmed"
+            qc_stage.reviewed_by = user.id
+            qc_stage.reviewed_at = now_utc
 
     # Determine next stage name
     next_stage_map = {
@@ -439,21 +490,31 @@ def finalize_slide_upload(
     db.add(slide_obj)
     db.flush()
     
+    # Queue 'ingest' stage_execution (monotonic attempt tracking - Issue #69)
+    stmt_ingest = (
+        select(StageExecution)
+        .where(StageExecution.case_id == case_id, StageExecution.stage == "ingest")
+        .order_by(StageExecution.attempt.desc())
+    )
+    existing_ingest = db.scalars(stmt_ingest).first()
+    next_attempt = (existing_ingest.attempt + 1) if existing_ingest else 1
+
     stage_exec = StageExecution(
         case_id=case_id,
         stage="ingest",
-        attempt=1,
+        attempt=next_attempt,
         status="queued",
         input_ref={"gcs_uri_original": req.gcs_uri, "slide_id": str(slide_obj.id)}
     )
     db.add(stage_exec)
+    case_obj.status = "open"
     
     audit = AuditEvent(
         case_id=str(case_id),
         actor=user.id,
         event_type="slide_uploaded",
         stage="ingest",
-        payload={"gcs_uri": req.gcs_uri, "slide_id": str(slide_obj.id)}
+        payload={"gcs_uri": req.gcs_uri, "slide_id": str(slide_obj.id), "attempt": next_attempt}
     )
     db.add(audit)
     
@@ -471,7 +532,8 @@ def finalize_slide_upload(
     return {
         "status": "queued",
         "slide_id": str(slide_obj.id),
-        "stage_execution_id": str(stage_exec.id)
+        "stage_execution_id": str(stage_exec.id),
+        "attempt": next_attempt
     }
 
 @router.get("/{case_id}/thumbnail")
@@ -542,7 +604,11 @@ def get_case_detail(
         raise HTTPException(status_code=404, detail="Case not found")
 
     slides = db.scalars(select(Slide).where(Slide.case_id == case_id)).all()
-    stages = db.scalars(select(StageExecution).where(StageExecution.case_id == case_id).order_by(StageExecution.started_at.asc())).all()
+    stages = db.scalars(
+        select(StageExecution)
+        .where(StageExecution.case_id == case_id)
+        .order_by(StageExecution.attempt.desc(), StageExecution.started_at.desc())
+    ).all()
 
     slides_data = [
         {

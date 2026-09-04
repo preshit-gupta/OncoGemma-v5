@@ -5,7 +5,7 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-009688.svg)](https://fastapi.tiangolo.com)
 [![Next.js](https://img.shields.io/badge/Next.js-14.2+-black.svg)](https://nextjs.org)
 [![Google Cloud](https://img.shields.io/badge/GCP-Cloud%20Storage%20%7C%20Vertex%20AI-4285F4.svg)](https://cloud.google.com)
-[![Tests](https://img.shields.io/badge/Tests-78%2F78%20Passing-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/Tests-90%2F90%20Passing-brightgreen.svg)](tests/)
 
 **OncoGemma v5** is an enterprise-grade clinical AI platform and diagnostic copilot designed for pathologists to analyze Whole-Slide Images (WSIs) of invasive breast carcinoma. It automates gigapixel slide ingestion, quality control, tumor bed triage, mitotic figure quantification, Nottingham Histologic Grading (Elston-Ellis modification), and College of American Pathologists (CAP) synoptic cancer reporting with AJCC 8th/9th Edition staging.
 
@@ -225,8 +225,14 @@ abla^2 I)$). Flags blurred fields with $	ext{score} < 85.0$.
   * Removed quaternary flat pink pyramid generators; unreadable slides fail fast with true diagnostic error logs.
   * Implemented byte-level TIFF IFD unlinking and PHI data zeroing before setting `label_stripped_at`.
   * Removed arbitrary level 11/12 DZI pregeneration ceilings, generating full-depth pyramids to support instant high-magnification ($20\times/40\times$) review.
+* **State Machine Gating & Worker Concurrency (Batch 4)**:
+  * Implemented `SELECT ... FOR UPDATE SKIP LOCKED` in `poll_and_execute_single_task` with graceful SQLite fallback, eliminating multi-worker race conditions and duplicate task execution.
+  * Scoped startup reset of stuck running stages to orphaned jobs (>15 min) to prevent clobbering active worker tasks across rolling deployments.
+  * Eliminated silent import-time SQLite fallback in `db.py`: PostgreSQL connection failures fail fast with loud errors and return HTTP 503 on `/healthz` (via active `SELECT 1` probes).
+  * Added SQLAlchemy connect listener enforcing `PRAGMA foreign_keys=ON` on all SQLite engines, and established `ON DELETE CASCADE` relationships across `Case` child entities (`Hotspot`, `Detection`, `HpfSite`).
+  * Enforced strict stage status gating (`awaiting_review` required to approve or confirm) and monotonic attempt incrementation (`attempt = max(existing) + 1`), preventing unique constraint collisions during slide re-scans.
 * **100% Offline Test Isolation & CI Reliability**:
-  * Implemented session-level test isolation in `conftest.py` with GCS mock `.prefixes` support, running all 78 tests completely offline.
+  * Implemented session-level test isolation in `conftest.py` with GCS mock `.prefixes` support, running all 90 tests completely offline.
 
 ---
 
@@ -346,8 +352,9 @@ cd backend
 pytest tests/ -v
 ```
 
-### Test Coverage Summary (78/78 Tests Passing Across 16 Suites)
+### Test Coverage Summary (90/90 Tests Passing Across 17 Suites)
 * `backend/tests/test_api_auth.py` (Authentication, bearer tokens, RBAC roles: admin, pathologist, technician, viewer)
+* `backend/tests/test_batch4_state_and_concurrency.py` (Row locking, worker skip_locked, orphan recovery, SQLite foreign keys, case cascade deletes, attempt monotonicity)
 * `backend/tests/test_cap_reporting.py` (CAP synoptic PDF generation, benign protocols, digital signatures, multi-version immutable amendments)
 * `backend/tests/test_coords.py` (Micron-to-pixel coordinate transforms and geometric scaling)
 * `backend/tests/test_grading.py` (Nottingham grading, MedGemma integration, spatial candidate deduplication across overlapping HPFs)

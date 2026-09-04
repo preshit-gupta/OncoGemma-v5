@@ -44,7 +44,19 @@ def generate_norm_dzi_pyramid(slide_obj, normalizer, local_slide_path: str, scra
         slide = openslide.OpenSlide(local_slide_path)
         dz = DeepZoomGenerator(slide, tile_size=256, overlap=0, limit_bounds=False)
         
+        # Pregenerate levels up to dz.level_count bounded by max_pregen_tiles (Issue #635)
+        max_pregen_tiles = 1500
+        cumulative_tiles = 0
+        max_level_to_generate = dz.level_count
         for level in range(0, dz.level_count):
+            cols, rows = dz.level_tiles[level]
+            lvl_tiles = cols * rows
+            if cumulative_tiles + lvl_tiles > max_pregen_tiles and level > 0:
+                max_level_to_generate = level
+                break
+            cumulative_tiles += lvl_tiles
+
+        for level in range(0, max_level_to_generate):
             norm_level_dir = os.path.join(norm_pyramid_dir, str(level))
             os.makedirs(norm_level_dir, exist_ok=True)
             cols, rows = dz.level_tiles[level]

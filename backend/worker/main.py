@@ -3,7 +3,7 @@ import sys
 import time
 import uuid
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -30,23 +30,35 @@ HANDLERS = {
     "report": run_report
 }
 
-def reset_stuck_running_stages():
-    """Reset any orphan stages left in 'running' state by previous worker restarts."""
+def reset_stuck_running_stages(timeout_seconds: int = 300):
+    """
+    Reset orphan stages left in 'running' state exceeding timeout_seconds (default: 5 minutes / Cloud Run timeout).
+    Prevents resetting actively executing sibling worker tasks on worker startup.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=timeout_seconds)
     db = SessionLocal()
     try:
-        stmt = update(StageExecution).where(StageExecution.status == "running").values(status="queued")
+        stmt = (
+            update(StageExecution)
+            .where(
+                StageExecution.status == "running",
+                (StageExecution.started_at <= cutoff) | (StageExecution.started_at.is_(None))
+            )
+            .values(status="queued", started_at=None)
+        )
         res = db.execute(stmt)
         db.commit()
         if res.rowcount > 0:
-            print(f"[Worker Startup] Reset {res.rowcount} stuck 'running' stages back to 'queued'...")
+            print(f"[Worker Reset] Reset {res.rowcount} stuck 'running' stages (> {timeout_seconds}s) back to 'queued'...")
     except Exception as e:
-        print(f"[Worker Startup Reset Note] {e}")
+        print(f"[Worker Reset Note] {e}")
     finally:
         db.close()
 
 def poll_and_execute_single_task():
     """
-    Executes a single queued task using SQLAlchemy ORM queue fetch.
+    Executes a single queued task using SQLAlchemy ORM queue fetch with row locking.
+    Uses .with_for_update(skip_locked=True) on PostgreSQL and cleanly falls back on SQLite.
     """
     db: Session = SessionLocal()
     try:
@@ -61,7 +73,34 @@ def poll_and_execute_single_task():
             .limit(1)
         )
 
-        stage_exec = db.scalars(stmt).first()
+        is_postgres = False
+        try:
+            bind = db.get_bind()
+            if bind and bind.dialect.name == "postgresql":
+                is_postgres = True
+        except Exception:
+            pass
+
+        if is_postgres:
+            stmt = stmt.with_for_update(skip_locked=True)
+
+        try:
+            stage_exec = db.scalars(stmt).first()
+        except Exception as exc:
+            if is_postgres and ("for update" in str(exc).lower() or "skip locked" in str(exc).lower()):
+                stmt_fallback = (
+                    select(StageExecution)
+                    .where(
+                        StageExecution.status == "queued",
+                        StageExecution.stage.in_(stages_list)
+                    )
+                    .order_by(StageExecution.started_at.asc().nulls_first(), StageExecution.id.asc())
+                    .limit(1)
+                )
+                stage_exec = db.scalars(stmt_fallback).first()
+            else:
+                raise
+
         if not stage_exec:
             return False
 
@@ -105,9 +144,14 @@ def poll_and_execute_single_task():
 
 def run_worker_loop():
     print(f"[Worker] Starting OncoGemma stage worker poll loop. Engine: {engine.dialect.name}. Handlers: {list(HANDLERS.keys())}")
-    reset_stuck_running_stages()
+    reset_stuck_running_stages(timeout_seconds=300)
+    last_reset_check = time.time()
     while True:
         try:
+            if time.time() - last_reset_check > 60.0:
+                reset_stuck_running_stages(timeout_seconds=300)
+                last_reset_check = time.time()
+
             executed = poll_and_execute_single_task()
             if not executed:
                 time.sleep(1.0)

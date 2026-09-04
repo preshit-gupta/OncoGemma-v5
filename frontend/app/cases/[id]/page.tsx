@@ -368,39 +368,6 @@ export default function CaseWorkspacePage({ params }: { params: { id: string } }
             <div className="flex items-center justify-center h-full text-slate-400 text-sm">
               Loading slide workspace...
             </div>
-          ) : isIngestRunning ? (
-            <div className="flex flex-col items-center justify-center h-full text-slate-300 space-y-4 bg-slate-950 p-8">
-              <div className="relative w-16 h-16 flex items-center justify-center">
-                <div className="absolute inset-0 rounded-full border-4 border-sky-500/20 border-t-sky-500 animate-spin" />
-                <Microscope className="w-8 h-8 text-sky-400" />
-              </div>
-              <div className="text-center max-w-md">
-                <h3 className="text-base font-bold text-white tracking-tight">Processing Whole-Slide Image</h3>
-                <p className="text-xs text-slate-400 mt-1.5 leading-relaxed">
-                  Extracting WSI metadata, streaming raw slide to Cloud Storage (<span className="font-mono text-sky-400">gs://oncogemma-dev-raw</span>), and generating multi-resolution pyramid tiles...
-                </p>
-                <div className="mt-4 inline-flex items-center space-x-2 text-[11px] font-mono text-sky-400 bg-sky-950/60 border border-sky-800/80 px-3 py-1.5 rounded-full">
-                  <span className="w-2 h-2 rounded-full bg-sky-400 animate-ping" />
-                  <span>Pipeline Worker Active</span>
-                </div>
-              </div>
-            </div>
-          ) : isIngestFailed ? (
-            <div className="flex flex-col items-center justify-center h-full text-slate-300 space-y-4 bg-slate-950 p-8">
-              <AlertTriangle className="w-12 h-12 text-rose-500" />
-              <div className="text-center max-w-md">
-                <h3 className="text-base font-bold text-white">Slide Ingest Failed</h3>
-                <p className="text-xs text-slate-400 mt-1">
-                  {ingestStage?.error || "Failed to process slide file during pyramid tile generation."}
-                </p>
-                <button
-                  onClick={handleRetryIngest}
-                  className="mt-4 bg-rose-600 hover:bg-rose-700 text-white text-xs font-semibold px-4 py-2 rounded-lg transition shadow"
-                >
-                  Retry Ingest Stage
-                </button>
-              </div>
-            </div>
           ) : isNeedsMpp ? (
             <div className="flex flex-col items-center justify-center h-full text-slate-300 space-y-4 bg-slate-950 p-8">
               <div className="relative w-16 h-16 flex items-center justify-center bg-amber-500/10 rounded-full border border-amber-500/30">
@@ -458,6 +425,39 @@ export default function CaseWorkspacePage({ params }: { params: { id: string } }
                     )}
                   </button>
                 </form>
+              </div>
+            </div>
+          ) : isIngestRunning ? (
+            <div className="flex flex-col items-center justify-center h-full text-slate-300 space-y-4 bg-slate-950 p-8">
+              <div className="relative w-16 h-16 flex items-center justify-center">
+                <div className="absolute inset-0 rounded-full border-4 border-sky-500/20 border-t-sky-500 animate-spin" />
+                <Microscope className="w-8 h-8 text-sky-400" />
+              </div>
+              <div className="text-center max-w-md">
+                <h3 className="text-base font-bold text-white tracking-tight">Processing Whole-Slide Image</h3>
+                <p className="text-xs text-slate-400 mt-1.5 leading-relaxed">
+                  Extracting WSI metadata, streaming raw slide to Cloud Storage (<span className="font-mono text-sky-400">gs://oncogemma-dev-raw</span>), and generating multi-resolution pyramid tiles...
+                </p>
+                <div className="mt-4 inline-flex items-center space-x-2 text-[11px] font-mono text-sky-400 bg-sky-950/60 border border-sky-800/80 px-3 py-1.5 rounded-full">
+                  <span className="w-2 h-2 rounded-full bg-sky-400 animate-ping" />
+                  <span>Pipeline Worker Active</span>
+                </div>
+              </div>
+            </div>
+          ) : isIngestFailed ? (
+            <div className="flex flex-col items-center justify-center h-full text-slate-300 space-y-4 bg-slate-950 p-8">
+              <AlertTriangle className="w-12 h-12 text-rose-500" />
+              <div className="text-center max-w-md">
+                <h3 className="text-base font-bold text-white">Slide Ingest Failed</h3>
+                <p className="text-xs text-slate-400 mt-1">
+                  {ingestStage?.error || "Failed to process slide file during pyramid tile generation."}
+                </p>
+                <button
+                  onClick={handleRetryIngest}
+                  className="mt-4 bg-rose-600 hover:bg-rose-700 text-white text-xs font-semibold px-4 py-2 rounded-lg transition shadow"
+                >
+                  Retry Ingest Stage
+                </button>
               </div>
             </div>
           ) : activeStage === "report" ? (

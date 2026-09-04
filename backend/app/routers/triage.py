@@ -512,6 +512,12 @@ def confirm_triage(payload: TriageConfirmPayload, db: Session = Depends(get_db))
             detail=f"Triage stage execution not found for case {payload.case_id}"
         )
 
+    if stage_exec.status != "awaiting_review":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Triage stage cannot be confirmed because its status is '{stage_exec.status}', expected 'awaiting_review'."
+        )
+
     output_ref = stage_exec.output_ref or ""
     machine_hotspots = []
     try:
@@ -559,37 +565,26 @@ def confirm_triage(payload: TriageConfirmPayload, db: Session = Depends(get_db))
         input_data = {"confirmed_hotspots_count": len(effective_hotspots)}
 
     case_uid = to_uuid(payload.case_id)
-    next_exec = db.scalars(
-        select(StageExecution).where(
-            StageExecution.case_id == case_uid,
-            StageExecution.stage == next_stage_name,
-            StageExecution.attempt == 1
+    # Ensure attempt monotonicity when queuing next stage (Issue #279, #285, #535)
+    stmt_existing = (
+        select(StageExecution)
+        .where(
+            (StageExecution.case_id == case_uid) | (StageExecution.case_id == str(payload.case_id)),
+            StageExecution.stage == next_stage_name
         )
-    ).first()
-    if not next_exec:
-        next_exec = db.scalars(
-            select(StageExecution).where(
-                StageExecution.case_id == str(payload.case_id),
-                StageExecution.stage == next_stage_name,
-                StageExecution.attempt == 1
-            )
-        ).first()
+        .order_by(StageExecution.attempt.desc())
+    )
+    existing_next = db.scalars(stmt_existing).first()
+    next_attempt = (existing_next.attempt + 1) if existing_next else 1
 
-    if not next_exec:
-        next_exec = StageExecution(
-            case_id=case_uid,
-            stage=next_stage_name,
-            attempt=1,
-            status="queued",
-            input_ref=input_data
-        )
-        db.add(next_exec)
-    elif next_exec.status not in ("confirmed", "done"):
-        next_exec.status = "queued"
-        next_exec.input_ref = input_data
-        next_exec.started_at = None
-        next_exec.completed_at = None
-        next_exec.error = None
+    next_exec = StageExecution(
+        case_id=case_uid,
+        stage=next_stage_name,
+        attempt=next_attempt,
+        status="queued",
+        input_ref=input_data
+    )
+    db.add(next_exec)
 
 
     audit = AuditEvent(

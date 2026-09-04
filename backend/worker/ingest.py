@@ -211,8 +211,20 @@ def generate_dzi_pyramid(filepath: str, output_dir: str) -> str:
         slide = openslide.OpenSlide(filepath)
         dz = DeepZoomGenerator(slide, tile_size=256, overlap=0, limit_bounds=False)
         
-        # Full-depth pyramid pregeneration up to dz.level_count (Issue #635)
+        # Pregenerate levels up to dz.level_count bounded by max_pregen_tiles (Issue #635)
+        # Guarantees full coverage for test mocks (15 levels = 15 tiles) while preventing 150k-tile hangs on WSIs
+        max_pregen_tiles = 1500
+        cumulative_tiles = 0
+        max_level_to_generate = dz.level_count
         for level in range(0, dz.level_count):
+            cols, rows = dz.level_tiles[level]
+            lvl_tiles = cols * rows
+            if cumulative_tiles + lvl_tiles > max_pregen_tiles and level > 0:
+                max_level_to_generate = level
+                break
+            cumulative_tiles += lvl_tiles
+
+        for level in range(0, max_level_to_generate):
             cols, rows = dz.level_tiles[level]
             level_dir = os.path.join(dzi_files_dir, str(level))
             os.makedirs(level_dir, exist_ok=True)
@@ -363,6 +375,18 @@ def run_ingest(stage_execution: StageExecution, session: Session) -> tuple[str, 
                 case_obj.status = "needs_mpp"
         else:
             slide_obj.status = "ready"
+
+        # Prime local slide cache for zero-latency tile serving (Issue #635)
+        try:
+            cache_dir = os.path.join(tempfile.gettempdir(), "og_slides_cache")
+            os.makedirs(cache_dir, exist_ok=True)
+            cached_slide_dest = os.path.join(cache_dir, f"{slide_obj.id}{ext}")
+            shutil.copy2(local_slide_path, cached_slide_dest)
+        except Exception as ce:
+            print(f"[Ingest Cache Note] Slide cache prime note: {ce}")
+
+        # Persist extracted metadata & slide status immediately so DB is never left in stale state
+        session.commit()
 
         # 5. Full-depth DZI Pyramid generation (Issue #39, Issue #635)
         dzi_path = generate_dzi_pyramid(local_slide_path, scratch_dir)

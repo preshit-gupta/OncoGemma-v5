@@ -151,8 +151,7 @@ def stream_slide_tile(slide: Slide, layer: str, z: int, filename: str, case_id: 
     except Exception as gcs_err:
         print(f"[Tile Router Warning] Real GCS fetch note: {gcs_err}")
 
-    # 2. Dynamic On-The-Fly Tile Generation Fallback from GCS raw bucket
-    scratch_dir = tempfile.mkdtemp(prefix="og_tile_dyn_")
+    # 2. Dynamic On-The-Fly Tile Generation with Persistent Local Slide Cache (Issue #635)
     try:
         parts = stem.split("_")
         if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
@@ -161,9 +160,15 @@ def stream_slide_tile(slide: Slide, layer: str, z: int, filename: str, case_id: 
             gcs_uri_original = resolve_slide_raw_uri(cid, slide) or slide.gcs_uri_original or f"gs://{settings.GCS_RAW_BUCKET}/cases/{cid}/{slide.id}.svs"
             raw_bucket_name, blob_name = parse_gcs_uri(gcs_uri_original)
             slide_ext = os.path.splitext(blob_name)[1] or ".svs"
-            local_slide_path = os.path.join(scratch_dir, f"slide{slide_ext}")
+            
+            cache_dir = os.path.join(tempfile.gettempdir(), "og_slides_cache")
+            os.makedirs(cache_dir, exist_ok=True)
+            local_slide_path = os.path.join(cache_dir, f"{slide.id}{slide_ext}")
 
-            download_blob_to_filename(raw_bucket_name, blob_name, local_slide_path)
+            # Cache slide locally once per container; zero network re-downloads for all subsequent tiles
+            if not os.path.exists(local_slide_path) or os.path.getsize(local_slide_path) == 0:
+                download_blob_to_filename(raw_bucket_name, blob_name, local_slide_path)
+
             if os.path.exists(local_slide_path):
                 tile_bytes = generate_tile_on_the_fly(
                     slide_file_path=local_slide_path,
@@ -177,8 +182,6 @@ def stream_slide_tile(slide: Slide, layer: str, z: int, filename: str, case_id: 
                     return Response(content=tile_bytes, media_type="image/png", headers=no_cache_headers)
     except Exception as dynamic_err:
         print(f"[Tile Router Warning] Dynamic tile extraction fallback error: {dynamic_err}")
-    finally:
-        shutil.rmtree(scratch_dir, ignore_errors=True)
 
     # 3. Fallback for 'norm' to 'orig' in GCS
     if target_layer == "norm":

@@ -1,8 +1,9 @@
 import sys
 import asyncio
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 
 if sys.platform == "win32":
     try:
@@ -147,6 +148,14 @@ app.include_router(admin_router)
 
 @app.get("/healthz")
 def health_check():
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Database connection failed: {e}"
+        )
     return {
         "status": "healthy",
         "version": app.version,
