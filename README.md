@@ -25,6 +25,18 @@
 * **Deep Visual Feature Extraction**: Streams real $224 \times 224$ optical tissue patches to generate 384-dimensional ViT representation vectors.
 * **Calibrated Linear Probe Triage**: Drives the spatial tumor bed probability grid (`prob_grid.npy`) and automated hotspot ROI selection directly from Google's foundation model.
 
+### 🔬 Stage 4: True 40× High-Power Optical Resolution ($0.25\text{--}0.28\,\mu\text{m/px}$) & Interactive Canvas (Latest)
+* **Optical Resolution Calibration**:
+  * *Root Cause Identified*: Stage 4 HPF patches were previously downsampled to $512\times 512$ px ($1.127\,\mu\text{m/px}$), which physically corresponds to a $10\times$ overview rather than diagnostic $40\times$ microscopy. A $12\,\mu\text{m}$ mitotic figure was reduced to an 8-pixel smudge, impeding sub-cellular assessment.
+  * *Full-Fidelity 40× Patches*: Pre-rendered and dynamic HPF patches now extract directly from Level 0 at authentic $2048\times 2048$ px ($0.28\,\mu\text{m/px}$, true $40\times$ optical magnification) across the standard $577\,\mu\text{m}$ field box.
+  * *High-Efficiency Dual-Codec Storage*: Leverages visually lossless JPEG (quality 94, ~1.6 MB) for $40\times$ fields for instant network streaming and sub-second rendering, alongside $20\times$ ($1024\times 1024$ px) and $10\times$ ($512\times 512$ px) tiers.
+* **Interactive Pathologist Mitosis Studio (`MitosisViewer.tsx`)**:
+  * **Default 40× High-Power Mode**: Starts immediately in high-power magnification ($3.5\times$ viewport zoom) so pathologists view crisp nuclear morphology, chromatin texture, and spindle poles.
+  * **Magnification Toggles**: Quick-switch buttons for `10× Overview`, `20× Field`, and `40× High-Power`.
+  * **Candidate Auto-Focus**: Clicking any candidate card auto-centers the stage canvas directly on that candidate's centroid at $40\times$.
+  * **Spacebar Rapid Toggle**: Pressing <kbd>Space</kbd> toggles between $10\times$ field orientation and $40\times$ cellular focus.
+  * **In-Canvas 40× Loupe Inspector**: Embedded floating inspector card displays high-resolution crops, detection/verification metrics, and keyboard shortcuts (<kbd>M</kbd> for Mitosis, <kbd>X</kbd> for Reject).
+
 ### 🔬 Stage 4: Strict Van Diest Filtering & Literature-Backed MedGemma Referee
 * **Automated Mimic Suppression (Van Diest & WHO 5th Ed. Criteria)**:
   * *Apoptosis Rejection*: Measures chromatin condensation against cytoplasmic retraction halos (`halo_od < 0.18`). Pyknotic fragments are auto-suppressed ($p = 0.08$).

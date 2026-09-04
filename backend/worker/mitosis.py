@@ -427,7 +427,7 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
             h_cy_px = int(h_cy_um / mpp_y)
 
             for mag_name in ("10x", "20x", "40x"):
-                field_um = 577.29 if mag_name == "40x" else (1154.58 if mag_name == "20x" else 2309.15)
+                field_um = 577.29 # Standard HPF review field (r=262 um -> width=577.29 um)
                 crop_w_px = max(1, int(round(field_um / mpp_x)))
                 crop_h_px = max(1, int(round(field_um / mpp_y)))
 
@@ -444,21 +444,33 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
                 if patch_orig is None:
                     raise RuntimeError(f"Failed to extract authentic optical patch for HPF #{hpf_seq} at {mag_name} from slide")
 
-                patch_orig_512 = patch_orig.resize((512, 512), Image.Resampling.BILINEAR)
+                # Multi-resolution hierarchy calibrated to HPF reticle:
+                # 40x: 2048x2048 (0.28 um/px - authentic high-power cellular resolution)
+                # 20x: 1024x1024 (0.56 um/px - medium power)
+                # 10x: 512x512   (1.13 um/px - low power overview)
+                target_dim = 2048 if mag_name == "40x" else (1024 if mag_name == "20x" else 512)
+                patch_orig_scaled = patch_orig.resize((target_dim, target_dim), Image.Resampling.BILINEAR) if patch_orig.size != (target_dim, target_dim) else patch_orig
+
                 buf_o = io.BytesIO()
-                patch_orig_512.save(buf_o, "PNG")
+                if mag_name == "40x":
+                    patch_orig_scaled.save(buf_o, "JPEG", quality=94)
+                else:
+                    patch_orig_scaled.save(buf_o, "PNG")
                 orig_bytes = buf_o.getvalue()
 
-                patch_norm_512 = patch_orig_512
+                patch_norm_scaled = patch_orig_scaled
                 if stain_normalizer:
                     try:
-                        norm_arr = stain_normalizer.transform(np.array(patch_orig_512))
-                        patch_norm_512 = Image.fromarray(norm_arr)
+                        norm_arr = stain_normalizer.transform(np.array(patch_orig_scaled))
+                        patch_norm_scaled = Image.fromarray(norm_arr)
                     except Exception:
-                        patch_norm_512 = patch_orig_512
+                        patch_norm_scaled = patch_orig_scaled
 
                 buf_n = io.BytesIO()
-                patch_norm_512.save(buf_n, "PNG")
+                if mag_name == "40x":
+                    patch_norm_scaled.save(buf_n, "JPEG", quality=94)
+                else:
+                    patch_norm_scaled.save(buf_n, "PNG")
                 norm_bytes = buf_n.getvalue()
 
                 hpf_uploads.append((f"cases/{case_id}/mitosis/hpfs/hpf_{hpf_seq}_{mag_name}_orig.png", orig_bytes))

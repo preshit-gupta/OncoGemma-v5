@@ -329,7 +329,8 @@ def get_hpf_thumbnail(
     try:
         hpf_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, hpf_blob)
         if len(hpf_bytes) > 25000:
-            return Response(content=hpf_bytes, media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
+            media_type = "image/jpeg" if hpf_bytes.startswith(b"\xff\xd8") else "image/png"
+            return Response(content=hpf_bytes, media_type=media_type, headers={"Cache-Control": "public, max-age=86400"})
     except Exception:
         pass
 
@@ -375,10 +376,11 @@ def get_hpf_thumbnail(
     mpp_x = float(getattr(slide_obj, "mpp_x", 0.265018) or 0.265018)
     mpp_y = float(getattr(slide_obj, "mpp_y", 0.265018) or mpp_x)
 
-    # Resolution mapping calibrated to frontend 520x520 canvas (r=236 px -> radius_um=262.0)
-    field_size_um = 577.29 if mag == "40x" else (1154.58 if mag == "20x" else 2309.15)
+    # Resolution mapping calibrated to frontend HPF reticle canvas (r=236 px -> radius_um=262.0)
+    field_size_um = 577.29
 
     extracted_bytes = None
+    media_type = "image/png"
 
     # OpenSlide raw WSI extraction directly from cached raw slide
     try:
@@ -413,7 +415,8 @@ def get_hpf_thumbnail(
                     if os_slide and hasattr(os_slide, "close"):
                         os_slide.close()
 
-            patch_final = patch_raw.resize((512, 512), Image.Resampling.BILINEAR)
+            target_dim = 2048 if mag == "40x" else (1024 if mag == "20x" else 512)
+            patch_final = patch_raw.resize((target_dim, target_dim), Image.Resampling.BILINEAR) if patch_raw.size != (target_dim, target_dim) else patch_raw
 
             if stain == "norm":
                 try:
@@ -430,7 +433,12 @@ def get_hpf_thumbnail(
                     print(f"[HPF Normalization Note] {se}")
 
             buf = io.BytesIO()
-            patch_final.save(buf, format="PNG")
+            if mag == "40x":
+                patch_final.save(buf, format="JPEG", quality=94)
+                media_type = "image/jpeg"
+            else:
+                patch_final.save(buf, format="PNG")
+                media_type = "image/png"
             extracted_bytes = buf.getvalue()
     except Exception as e:
         print(f"[HPF Extraction Error] {e}")
@@ -444,12 +452,12 @@ def get_hpf_thumbnail(
             settings.GCS_ARTIFACTS_BUCKET,
             hpf_blob,
             extracted_bytes,
-            "image/png"
+            media_type
         )
     except Exception as up_e:
         print(f"[HPF GCS Cache Note] {up_e}")
 
-    return Response(content=extracted_bytes, media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
+    return Response(content=extracted_bytes, media_type=media_type, headers={"Cache-Control": "public, max-age=86400"})
 
 
 @router.post("/recompute")
