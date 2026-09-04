@@ -185,10 +185,14 @@ def enumerate_hotspot_tiles(
     hotspot_polygon_um: List[List[float]],
     tile_size_px: int = 1024,
     mpp: float = 0.25,
-    stride_px: int = 960
+    stride_px: int = 960,
+    tissue_mask: Optional[np.ndarray] = None,
+    slide_dimensions_um: Optional[Tuple[float, float]] = None,
+    min_tissue_ratio: float = 0.20
 ) -> List[Dict[str, Any]]:
     """
     Generates 40x tile coordinates covering a hotspot polygon.
+    Filters out tiles with less than min_tissue_ratio tissue coverage when tissue_mask is provided.
     Returns list of dicts with tile bounding box in pixels and base micrometers.
     """
     if not hotspot_polygon_um:
@@ -202,18 +206,36 @@ def enumerate_hotspot_tiles(
     tile_size_um = tile_size_px * mpp
     stride_um = stride_px * mpp
 
+    mh, mw = (tissue_mask.shape if tissue_mask is not None else (0, 0))
+    slide_w_um, slide_h_um = (slide_dimensions_um if slide_dimensions_um is not None else (1.0, 1.0))
+
     tiles = []
     curr_y = min_y_um
     while curr_y <= max_y_um:
         curr_x = min_x_um
         while curr_x <= max_x_um:
-            tiles.append({
-                "origin_um": [float(curr_x), float(curr_y)],
-                "size_um": [float(tile_size_um), float(tile_size_um)],
-                "origin_px": [int(curr_x / mpp), int(curr_y / mpp)],
-                "size_px": [tile_size_px, tile_size_px],
-            })
+            # Check tissue coverage if tissue_mask is available
+            include_tile = True
+            if tissue_mask is not None and mh > 0 and mw > 0:
+                mx0 = max(0, min(mw - 1, int(round(curr_x / max(slide_w_um, 1.0) * (mw - 1)))))
+                mx1 = max(0, min(mw - 1, int(round((curr_x + tile_size_um) / max(slide_w_um, 1.0) * (mw - 1)))))
+                my0 = max(0, min(mh - 1, int(round(curr_y / max(slide_h_um, 1.0) * (mh - 1)))))
+                my1 = max(0, min(mh - 1, int(round((curr_y + tile_size_um) / max(slide_h_um, 1.0) * (mh - 1)))))
+                sub = tissue_mask[min(my0, my1):max(my0, my1) + 1, min(mx0, mx1):max(mx0, mx1) + 1]
+                if sub.size > 0:
+                    cov = (sub > 0).sum() / sub.size
+                    if cov < min_tissue_ratio:
+                        include_tile = False
+
+            if include_tile:
+                tiles.append({
+                    "origin_um": [float(curr_x), float(curr_y)],
+                    "size_um": [float(tile_size_um), float(tile_size_um)],
+                    "origin_px": [int(curr_x / mpp), int(curr_y / mpp)],
+                    "size_px": [tile_size_px, tile_size_px],
+                })
             curr_x += stride_um
         curr_y += stride_um
 
     return tiles
+

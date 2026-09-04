@@ -580,16 +580,42 @@ def re_place_hpfs(payload: BulkActionPayload, db: Session = Depends(get_db)):
     Re-runs the greedy 10-HPF placement algorithm based on currently confirmed mitosis coordinates.
     """
     case_id = payload.case_id
+    case_uid = to_uuid(case_id)
+
+    # Fetch slide dimensions and MPP for accurate physical metric
+    slide_row = db.scalars(select(Slide).where((Slide.case_id == case_uid) | (Slide.case_id == str(case_id)))).first()
+    mpp_x = float(getattr(slide_row, "mpp_x", 0.25) or 0.25) if slide_row else 0.25
+    mpp_y = float(getattr(slide_row, "mpp_y", 0.25) or 0.25) if slide_row else 0.25
+    w_px = float(getattr(slide_row, "width_px", 20000) or 20000) if slide_row else 20000.0
+    h_px = float(getattr(slide_row, "height_px", 20000) or 20000) if slide_row else 20000.0
+    slide_dims_um = (w_px * mpp_x, h_px * mpp_y)
+
+    # Fetch preprocess tissue mask from GCS
+    tissue_mask = None
+    try:
+        mask_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/preprocess/tissue_mask.png")
+        mask_img = Image.open(io.BytesIO(mask_bytes)).convert("L")
+        tissue_mask = np.array(mask_img) > 10
+    except Exception as me:
+        print(f"[re_place_hpfs Note] Could not load tissue_mask: {me}")
 
     # Fetch confirmed mitoses
     confirmed_dets = db.scalars(
-        select(Detection).where(Detection.case_id == case_id, Detection.label == "mitosis")
+        select(Detection).where(
+            (Detection.case_id == case_uid) | (Detection.case_id == str(case_id)),
+            Detection.label == "mitosis"
+        )
     ).all()
 
     hotspot_rows = db.scalars(
-        select(Hotspot).where(Hotspot.case_id == case_id, Hotspot.excluded == False)
+        select(Hotspot).where(
+            (Hotspot.case_id == case_uid) | (Hotspot.case_id == str(case_id)),
+            Hotspot.excluded == False
+        )
     ).all()
-    hotspot_polys = [h.polygon_um for h in hotspot_rows]
+    hotspot_rows_sorted = sorted(hotspot_rows, key=lambda h: (h.prob_mean or 0.0), reverse=True)
+    hotspot_polys = [h.polygon_um for h in hotspot_rows_sorted]
+    hotspot_prios = [float(h.prob_mean or 0.0) for h in hotspot_rows_sorted]
 
     cands = [{"id": d.id, "centroid_um": d.centroid_um, "label": "mitosis"} for d in confirmed_dets]
     
@@ -598,13 +624,22 @@ def re_place_hpfs(payload: BulkActionPayload, db: Session = Depends(get_db)):
     bbox = (min(xs), min(ys), max(xs), max(ys))
 
     density_map, grid_meta = generate_mitosis_density_map(cands, bounding_box_um=bbox)
-    new_hpfs = greedy_place_hpfs(density_map, grid_meta, hotspot_polygons_um=hotspot_polys, count=10)
+    new_hpfs = greedy_place_hpfs(
+        density_map,
+        grid_meta,
+        hotspot_polygons_um=hotspot_polys,
+        count=10,
+        tissue_mask=tissue_mask,
+        slide_dimensions_um=slide_dims_um,
+        min_tissue_coverage=0.70,
+        hotspot_priorities=hotspot_prios
+    )
 
     # Persist new HPFs
-    db.execute(delete(HpfSite).where(HpfSite.case_id == case_id))
+    db.execute(delete(HpfSite).where((HpfSite.case_id == case_uid) | (HpfSite.case_id == str(case_id))))
     for h in new_hpfs:
         hpf_row = HpfSite(
-            case_id=case_id,
+            case_id=case_uid,
             seq=h["seq"],
             center_um=h["center_um"],
             radius_um=h["radius_um"],

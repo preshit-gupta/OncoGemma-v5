@@ -110,3 +110,86 @@ def test_greedy_place_hpfs_overlap_relaxation_fallback():
 
     # Must return 10 HPFs via relaxation fallback
     assert len(hpfs) == 10
+
+
+def test_greedy_place_hpfs_rejects_empty_glass():
+    # Grid where left half (x < 1000 um) is dense tissue and right half (x >= 1000 um) is empty glass
+    ny, nx = 100, 100
+    stride = 16.0
+    slide_w_um = nx * stride # 1600 um
+    slide_h_um = ny * stride # 1600 um
+
+    # Tissue mask: 1 for left half, 0 for right half
+    tissue_mask = np.zeros((100, 100), dtype=np.uint8)
+    tissue_mask[:, :50] = 255 # Left half is tissue
+
+    # Put high density candidates on the right half (glass) and lower on the left half (tissue)
+    density_map = np.zeros((ny, nx), dtype=np.float32)
+    density_map[30, 20] = 5.0  # Tissue
+    density_map[70, 20] = 5.0  # Tissue
+    density_map[30, 80] = 100.0 # Glass (should be strictly rejected!)
+    density_map[70, 80] = 100.0 # Glass (should be strictly rejected!)
+
+    grid_meta = {
+        "origin_um": [0.0, 0.0],
+        "stride_um": stride,
+        "nx": nx,
+        "ny": ny
+    }
+
+    hpfs = greedy_place_hpfs(
+        density_map,
+        grid_meta,
+        count=2,
+        radius_um=262.0,
+        min_separation_um=524.0,
+        tissue_mask=tissue_mask,
+        slide_dimensions_um=(slide_w_um, slide_h_um),
+        min_tissue_coverage=0.70
+    )
+
+    assert len(hpfs) == 2
+    for h in hpfs:
+        cx, cy = h["center_um"]
+        # Must be on left half (tissue)
+        assert cx < 800.0, f"HPF placed in glass area: center_x = {cx}"
+        assert h["tissue_coverage"] >= 0.70, f"Insufficient tissue coverage: {h['tissue_coverage']}"
+
+
+def test_greedy_place_hpfs_prioritizes_dense_hotspots():
+    ny, nx = 100, 100
+    stride = 16.0
+    slide_w_um = nx * stride
+    slide_h_um = ny * stride
+
+    tissue_mask = np.ones((100, 100), dtype=np.uint8) * 255
+    density_map = np.ones((ny, nx), dtype=np.float32)
+
+    grid_meta = {
+        "origin_um": [0.0, 0.0],
+        "stride_um": stride,
+        "nx": nx,
+        "ny": ny
+    }
+
+    # Hotspot A (lower priority 0.50): centered at (300, 300)
+    hs_a = [[100.0, 100.0], [500.0, 100.0], [500.0, 500.0], [100.0, 500.0]]
+    # Hotspot B (higher priority 0.95): centered at (1200, 1200)
+    hs_b = [[1000.0, 1000.0], [1400.0, 1000.0], [1400.0, 1400.0], [1000.0, 1400.0]]
+
+    hpfs = greedy_place_hpfs(
+        density_map,
+        grid_meta,
+        hotspot_polygons_um=[hs_a, hs_b],
+        hotspot_priorities=[0.50, 0.95],
+        count=2,
+        radius_um=262.0,
+        min_separation_um=524.0,
+        tissue_mask=tissue_mask,
+        slide_dimensions_um=(slide_w_um, slide_h_um)
+    )
+
+    assert len(hpfs) == 2
+    # HPF 1 must be from the higher priority hotspot (Hotspot B, cx >= 1000)
+    assert hpfs[0]["center_um"][0] >= 1000.0, f"Expected HPF 1 in Hotspot B (>= 1000 um), got {hpfs[0]['center_um']}"
+

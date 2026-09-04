@@ -161,15 +161,19 @@ def get_triage_heatmap_image(case_id: str, db: Session = Depends(get_db)):
     """Returns the Viridis heatmap PNG overlay directly from GCS."""
     try:
         hm_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/triage/heatmap_triage.png")
-        return Response(content=hm_bytes, media_type="image/png")
+        return Response(content=hm_bytes, media_type="image/png", headers={"Cache-Control": "public, max-age=3600"})
     except Exception:
         pass
 
     try:
         hm_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/triage/heatmap.png")
-        return Response(content=hm_bytes, media_type="image/png")
+        return Response(content=hm_bytes, media_type="image/png", headers={"Cache-Control": "public, max-age=3600"})
     except Exception:
-        raise HTTPException(status_code=404, detail="Heatmap image artifact not found in GCS")
+        raise HTTPException(
+            status_code=404,
+            detail="Heatmap image artifact not found in GCS",
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate"}
+        )
 
 
 def generate_synthetic_microscopic_patch(mag: str, stain: str, seed_str: str) -> bytes:

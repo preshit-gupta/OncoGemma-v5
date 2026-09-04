@@ -124,6 +124,7 @@ export function OpenSeadragonViewer({
   const overlayItemRef = useRef<any>(null);
   const currentOverlayUriRef = useRef<string | null>(null);
   const isAddingOverlayRef = useRef<boolean>(false);
+  const isBaseSlideOpenRef = useRef<boolean>(false);
 
   // Programmatic smooth camera fly-to when focusPointUm changes
   useEffect(() => {
@@ -305,6 +306,7 @@ export function OpenSeadragonViewer({
     };
 
     viewer.addHandler("open", () => {
+      isBaseSlideOpenRef.current = true;
       onViewportChange();
       if (viewer.viewport) {
         if (prevBounds) {
@@ -314,6 +316,7 @@ export function OpenSeadragonViewer({
         }
         viewer.viewport.applyConstraints();
       }
+      syncOverlay();
     });
 
     viewer.addHandler("animation", onViewportChange);
@@ -337,6 +340,7 @@ export function OpenSeadragonViewer({
     });
 
     return () => {
+      isBaseSlideOpenRef.current = false;
       overlayItemRef.current = null;
       currentOverlayUriRef.current = null;
       isAddingOverlayRef.current = false;
@@ -348,23 +352,46 @@ export function OpenSeadragonViewer({
   }, [caseId, activeLayer, imageWidthPx, imageHeightPx, mppX, mppY, tileUrlTemplate]);
 
   // Sync heatmap overlay and opacity smoothly without re-downloading or stacking duplicate images
-  useEffect(() => {
+  const syncOverlay = () => {
     try {
       const viewer = viewerRef.current;
       if (!viewer?.world) return;
       const world = viewer.world;
 
+      // Base slide MUST be open and present in world before attaching overlays
+      if (world.getItemCount() === 0 || !isBaseSlideOpenRef.current) {
+        return;
+      }
+
       const targetOpacity = showOverlay ? overlayOpacity : 0.0;
 
-      // When overlay URI changes, remove old overlay and load the new one
-      if (overlayImageUri !== currentOverlayUriRef.current) {
+      // If overlay URI is cleared / null, remove existing overlay item
+      if (!overlayImageUri) {
         if (overlayItemRef.current) {
           try {
             world.removeItem(overlayItemRef.current);
           } catch (_) {}
           overlayItemRef.current = null;
         }
-        currentOverlayUriRef.current = overlayImageUri;
+        currentOverlayUriRef.current = null;
+        if (typeof viewer.forceRedraw === "function") {
+          viewer.forceRedraw();
+        }
+        return;
+      }
+
+      // Check if we need to load or reload the overlay
+      const needsLoad =
+        overlayImageUri !== currentOverlayUriRef.current ||
+        (!overlayItemRef.current && !isAddingOverlayRef.current);
+
+      if (needsLoad) {
+        if (overlayItemRef.current) {
+          try {
+            world.removeItem(overlayItemRef.current);
+          } catch (_) {}
+          overlayItemRef.current = null;
+        }
 
         // Purge any orphan overlays, keeping only the primary slide at index 0
         try {
@@ -373,59 +400,74 @@ export function OpenSeadragonViewer({
           }
         } catch (_) {}
 
-        if (overlayImageUri) {
-          isAddingOverlayRef.current = true;
-          viewer.addSimpleImage({
-            url: overlayImageUri,
-            opacity: targetOpacity,
-            x: 0,
-            y: 0,
-            width: 1.0,
-            success: (event: any) => {
-              try {
-                overlayItemRef.current = event.item;
-                isAddingOverlayRef.current = false;
-                if (event.item && typeof event.item.setOpacity === "function") {
-                  event.item.setOpacity(targetOpacity);
-                }
-                if (viewer && typeof viewer.requestRedraw === "function") {
-                  viewer.requestRedraw();
-                } else if (viewer && typeof viewer.forceRedraw === "function") {
-                  viewer.forceRedraw();
-                }
-              } catch (_) {}
-            },
-            error: () => {
-              isAddingOverlayRef.current = false;
-            }
-          });
-        }
-      } else {
-        // Same URI: smoothly update opacity on all overlay items and trigger redraw
-        const count = world.getItemCount();
-        for (let i = 1; i < count; i++) {
-          const item = world.getItemAt(i);
-          if (item && typeof item.setOpacity === "function") {
+        isAddingOverlayRef.current = true;
+        const uriToLoad = overlayImageUri;
+        const heightRatio = (imageWidthPx && imageHeightPx) ? imageHeightPx / imageWidthPx : undefined;
+
+        viewer.addSimpleImage({
+          url: uriToLoad,
+          opacity: targetOpacity,
+          x: 0,
+          y: 0,
+          width: 1.0,
+          height: heightRatio,
+          success: (event: any) => {
             try {
-              item.setOpacity(targetOpacity);
-            } catch (_) {}
+              isAddingOverlayRef.current = false;
+              overlayItemRef.current = event.item;
+              currentOverlayUriRef.current = uriToLoad;
+
+              // Ensure the overlay is placed strictly ON TOP of the base slide
+              const count = world.getItemCount();
+              if (count > 1 && typeof world.setItemIndex === "function") {
+                world.setItemIndex(event.item, count - 1);
+              }
+
+              if (event.item && typeof event.item.setOpacity === "function") {
+                event.item.setOpacity(targetOpacity);
+              }
+              if (typeof viewer.forceRedraw === "function") {
+                viewer.forceRedraw();
+              }
+            } catch (e) {
+              console.warn("[OpenSeadragonViewer Overlay Success Handler]", e);
+            }
+          },
+          error: (err: any) => {
+            isAddingOverlayRef.current = false;
+            overlayItemRef.current = null;
+            currentOverlayUriRef.current = null; // Clear so subsequent renders or retries can reload
+            console.warn("[OpenSeadragonViewer Overlay Load Error]", err);
           }
-        }
+        });
+      } else {
+        // Overlay already loaded: smoothly update opacity on all overlay items and trigger redraw
         if (overlayItemRef.current && typeof overlayItemRef.current.setOpacity === "function") {
           try {
             overlayItemRef.current.setOpacity(targetOpacity);
           } catch (_) {}
         }
-        if (viewer && typeof viewer.requestRedraw === "function") {
-          viewer.requestRedraw();
-        } else if (viewer && typeof viewer.forceRedraw === "function") {
+        const count = world.getItemCount();
+        for (let i = 1; i < count; i++) {
+          const item = world.getItemAt(i);
+          if (item && item !== world.getItemAt(0) && typeof item.setOpacity === "function") {
+            try {
+              item.setOpacity(targetOpacity);
+            } catch (_) {}
+          }
+        }
+        if (typeof viewer.forceRedraw === "function") {
           viewer.forceRedraw();
         }
       }
     } catch (err) {
       console.warn("[OpenSeadragonViewer Overlay Sync Note]", err);
     }
-  }, [overlayOpacity, showOverlay, overlayImageUri]);
+  };
+
+  useEffect(() => {
+    syncOverlay();
+  }, [overlayOpacity, showOverlay, overlayImageUri, imageWidthPx, imageHeightPx]);
 
 
 

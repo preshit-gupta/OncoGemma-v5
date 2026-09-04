@@ -154,6 +154,21 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
                 "source": "model"
             })
 
+        # Download preprocess tissue mask from GCS
+        slide_dimensions_um = (float(width_px * mpp_x), float(height_px * mpp_y))
+        tissue_mask = None
+        try:
+            mask_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/preprocess/tissue_mask.png")
+            mask_img = Image.open(io.BytesIO(mask_bytes)).convert("L")
+            tissue_mask = np.array(mask_img) > 10
+            print(f"[Worker:Mitosis] Successfully loaded preprocess tissue mask ({tissue_mask.shape[1]}x{tissue_mask.shape[0]}, {tissue_mask.sum()} tissue px)")
+        except Exception as tme:
+            print(f"[Worker:Mitosis Note] Could not load preprocess tissue_mask from GCS: {tme}")
+
+        # Prioritize confirmed hotspots by tumor cellularity & tissue density (prob_mean descending)
+        hotspots.sort(key=lambda h: (h.get("prob_mean") or 0.0), reverse=True)
+        print(f"[Worker:Mitosis] Prioritized {len(hotspots)} confirmed hotspots by cellular density: {[h['id'] for h in hotspots]}")
+
         # Initialize detectors & verifiers
         detector = YoloMitosisDetector(conf_threshold=det_thresh)
         verifier = HoVerNetMitosisVerifier(threshold=ver_thresh)
@@ -175,13 +190,33 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
         except Exception as e:
             print(f"[Worker:Mitosis Warning] Could not open slide with OpenSlide: {e}")
 
+        # Fallback to OpenSlide thumbnail tissue mask if GCS mask was not found
+        if tissue_mask is None and openslide_slide is not None:
+            try:
+                with OPENSLIDE_GLOBAL_LOCK:
+                    thumb = openslide_slide.get_thumbnail((512, 512)).convert("RGB")
+                arr = np.array(thumb).astype(float)
+                r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+                tissue_mask = ~((r > 215) & (g > 215) & (b > 215))
+                print(f"[Worker:Mitosis] Generated fallback tissue mask from OpenSlide thumbnail ({tissue_mask.sum()} tissue px)")
+            except Exception as te:
+                print(f"[Worker:Mitosis Note] Thumbnail fallback note: {te}")
+
         raw_candidates = []
         cand_seq = 1
 
-        # Sweep each confirmed hotspot
+        # Sweep each confirmed hotspot, skipping empty glass tiles
         for hs in hotspots:
             poly_um = hs["polygon_um"]
-            tiles = enumerate_hotspot_tiles(poly_um, tile_size_px=tile_size_px, mpp=mpp_x, stride_px=stride_px)
+            tiles = enumerate_hotspot_tiles(
+                poly_um,
+                tile_size_px=tile_size_px,
+                mpp=mpp_x,
+                stride_px=stride_px,
+                tissue_mask=tissue_mask,
+                slide_dimensions_um=slide_dimensions_um,
+                min_tissue_ratio=0.20
+            )
 
             for tile in tiles:
                 tx_um, ty_um = tile["origin_um"]
@@ -352,8 +387,9 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
             radius_um=radius_um
         )
 
-        # Greedy 10-HPF Placement with Overlap Relaxation Fallback
+        # Greedy 10-HPF Placement with Overlap Relaxation Fallback & Strict Tissue Density Gating
         hotspot_polys = [h["polygon_um"] for h in hotspots]
+        hotspot_prios = [float(h.get("prob_mean") or 0.0) for h in hotspots]
         hpfs = greedy_place_hpfs(
             density_map,
             grid_meta,
@@ -361,7 +397,11 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
             count=hpf_count,
             radius_um=radius_um,
             min_separation_um=float(hpf_cfg.get("min_separation_um", 524.0)),
-            relaxed_min_separation_um=float(hpf_cfg.get("relaxed_min_separation_um", 393.0))
+            relaxed_min_separation_um=float(hpf_cfg.get("relaxed_min_separation_um", 393.0)),
+            tissue_mask=tissue_mask,
+            slide_dimensions_um=slide_dimensions_um,
+            min_tissue_coverage=float(hpf_cfg.get("min_tissue_coverage", 0.70)),
+            hotspot_priorities=hotspot_prios
         )
 
         # Pre-render and upload all 10 HPF patch variants (10x, 20x, 40x @ norm/orig) to GCS

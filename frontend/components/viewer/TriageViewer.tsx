@@ -257,6 +257,16 @@ export function TriageViewer({
     .filter((h) => !h.excluded)
     .reduce((sum, h) => sum + (h.area_mm2 || 0), 0);
 
+  const isHeatmapAvailable = Boolean(
+    data?.heatmap_png_uri ||
+    data?.status === "awaiting_review" ||
+    data?.status === "done" ||
+    data?.status === "confirmed"
+  );
+  const heatmapOverlayUri = isHeatmapAvailable
+    ? `${API_BASE}/api/v1/stages/triage/${caseId}/heatmap?v=${data?.stage_execution_id || ''}`
+    : null;
+
   if (loading) {
     return (
       <div className="w-full h-full bg-slate-950 flex flex-col items-center justify-center text-slate-400">
@@ -285,9 +295,7 @@ export function TriageViewer({
           mppY={mppY || mppX}
           imageWidthPx={imageWidthPx}
           imageHeightPx={imageHeightPx}
-          overlayImageUri={
-            `${API_BASE}/api/v1/stages/triage/${caseId}/heatmap?v=${data?.stage_execution_id || ''}`
-          }
+          overlayImageUri={heatmapOverlayUri}
           overlayOpacity={heatmapOpacity}
           showOverlay={showHeatmap}
           showHotspotMask={showHotspotMask}
