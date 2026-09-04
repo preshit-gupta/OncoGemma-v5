@@ -413,6 +413,8 @@ def get_hpf_thumbnail(
                     if os_slide and hasattr(os_slide, "close"):
                         os_slide.close()
 
+            patch_final = patch_raw.resize((512, 512), Image.Resampling.BILINEAR)
+
             if stain == "norm":
                 try:
                     from pipeline.stain import PureNumpyMacenkoNormalizer
@@ -422,19 +424,16 @@ def get_hpf_thumbnail(
                         norm_obj = PureNumpyMacenkoNormalizer()
                         norm_obj.stain_matrix_target = np.array(sp_data["stain_matrix"], dtype=float)
                         norm_obj.max_conc_target = np.array(sp_data["max_concentrations"], dtype=float)
-                        norm_arr = norm_obj.transform(np.array(patch_raw))
-                        patch_raw = Image.fromarray(norm_arr)
+                        norm_arr = norm_obj.transform(np.array(patch_final))
+                        patch_final = Image.fromarray(norm_arr)
                 except Exception as se:
                     print(f"[HPF Normalization Note] {se}")
 
-            patch_final = patch_raw.resize((512, 512), Image.Resampling.BILINEAR)
             buf = io.BytesIO()
             patch_final.save(buf, format="PNG")
             extracted_bytes = buf.getvalue()
     except Exception as e:
         print(f"[HPF Extraction Error] {e}")
-    finally:
-        shutil.rmtree(scratch_dir, ignore_errors=True)
 
     if extracted_bytes is None:
         raise HTTPException(status_code=404, detail=f"HPF #{seq} microscopic patch ({mag}, {stain}) could not be extracted from authentic slide")

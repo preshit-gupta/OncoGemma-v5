@@ -24,7 +24,8 @@ if os.path.exists("/cloudsql"):
 
 for sock in cloudsql_instances:
     if os.path.exists(sock) and ("localhost" in db_url or "127.0.0.1" in db_url):
-        db_url = f"postgresql+psycopg2://oncogemma:oncogemma_dev_password@/oncogemma_db?host={sock}"
+        cloud_pw = os.getenv("DB_PASSWORD", "oncogemma_secure_cloud_password")
+        db_url = f"postgresql+psycopg2://oncogemma:{cloud_pw}@/oncogemma_db?host={sock}"
         print(f"[DB Core] Connected to Cloud SQL via unix socket at {sock}")
         break
 
