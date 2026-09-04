@@ -18,7 +18,8 @@ from app.core.gcs import (
     parse_gcs_uri,
     upload_blob_from_bytes,
     upload_blob_from_filename,
-    download_blob_to_filename
+    download_blob_to_filename,
+    resolve_slide_raw_uri
 )
 from app.models.slide import Slide
 from app.models.stage_execution import StageExecution
@@ -126,7 +127,7 @@ def run_preprocess(stage_execution: StageExecution, session: Session) -> tuple[s
     scratch_dir = tempfile.mkdtemp(prefix="og_preprocess_")
 
     try:
-        gcs_uri_original = slide_obj.gcs_uri_original or f"gs://{settings.GCS_RAW_BUCKET}/cases/{case_id}/{slide_id}.svs"
+        gcs_uri_original = resolve_slide_raw_uri(case_id, slide_obj) or slide_obj.gcs_uri_original or f"gs://{settings.GCS_RAW_BUCKET}/cases/{case_id}/{slide_id}.svs"
         raw_bucket_name, blob_name = parse_gcs_uri(gcs_uri_original)
         
         ext = os.path.splitext(blob_name)[1] or ".svs"

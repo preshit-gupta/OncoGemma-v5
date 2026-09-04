@@ -22,7 +22,8 @@ from app.core.gcs import (
     download_blob_as_text,
     download_blob_to_filename,
     upload_blob_from_bytes,
-    blob_exists
+    blob_exists,
+    resolve_slide_raw_uri
 )
 from app.core.db import get_db
 from app.core.openslide_lock import OPENSLIDE_GLOBAL_LOCK
@@ -389,7 +390,7 @@ def get_hotspot_thumbnail(
     if extracted_bytes is None and slide_obj:
         scratch_dir = tempfile.mkdtemp(prefix="og_hs_thumb_")
         try:
-            gcs_uri_original = getattr(slide_obj, "gcs_uri_original", None) or f"gs://{settings.GCS_RAW_BUCKET}/cases/{case_id}/{getattr(slide_obj, 'id', 'slide')}.svs"
+            gcs_uri_original = resolve_slide_raw_uri(case_id, slide_obj) or getattr(slide_obj, "gcs_uri_original", None) or f"gs://{settings.GCS_RAW_BUCKET}/cases/{case_id}/{getattr(slide_obj, 'id', 'slide')}.svs"
             raw_bucket_name, blob_name = parse_gcs_uri(gcs_uri_original)
             ext = os.path.splitext(blob_name)[1] or ".svs"
             local_slide_path = os.path.join(scratch_dir, f"slide{ext}")

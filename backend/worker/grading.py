@@ -28,7 +28,8 @@ from app.core.gcs import (
     parse_gcs_uri,
     upload_blob_from_bytes,
     download_blob_to_filename,
-    get_gcs_artifact_direct_url
+    get_gcs_artifact_direct_url,
+    resolve_slide_raw_uri
 )
 from app.core.openslide_lock import OPENSLIDE_GLOBAL_LOCK
 from app.models.case import Case
@@ -141,7 +142,7 @@ def run_grading(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str,
     scratch_dir = tempfile.mkdtemp(prefix="og_grading_")
 
     try:
-        gcs_uri_original = slide.gcs_uri_original or f"gs://{settings.GCS_RAW_BUCKET}/cases/{case_id}/{slide_id}.svs"
+        gcs_uri_original = resolve_slide_raw_uri(case_id, slide) or slide.gcs_uri_original or f"gs://{settings.GCS_RAW_BUCKET}/cases/{case_id}/{slide_id}.svs"
         raw_bucket_name, blob_name = parse_gcs_uri(gcs_uri_original)
         ext = os.path.splitext(blob_name)[1] or ".svs"
         local_slide_path = os.path.join(scratch_dir, f"slide{ext}")

@@ -12,7 +12,8 @@ from app.core.gcs import (
     get_gcs_client,
     parse_gcs_uri,
     upload_blob_from_bytes,
-    download_blob_to_filename
+    download_blob_to_filename,
+    resolve_slide_raw_uri
 )
 from app.models.case import Case
 from app.models.slide import Slide
@@ -46,7 +47,7 @@ def run_qc(stage_execution: StageExecution, session: Session) -> tuple[str, dict
     scratch_dir = tempfile.mkdtemp(prefix="og_qc_")
 
     try:
-        gcs_uri_original = slide_obj.gcs_uri_original or f"gs://{settings.GCS_RAW_BUCKET}/cases/{case_id}/{slide_id}.svs"
+        gcs_uri_original = resolve_slide_raw_uri(case_id, slide_obj) or slide_obj.gcs_uri_original or f"gs://{settings.GCS_RAW_BUCKET}/cases/{case_id}/{slide_id}.svs"
         raw_bucket_name, blob_name = parse_gcs_uri(gcs_uri_original)
         
         ext = os.path.splitext(blob_name)[1] or ".svs"

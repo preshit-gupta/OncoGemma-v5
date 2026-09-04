@@ -7,7 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.core.gcs import download_blob_as_bytes, blob_exists, get_gcs_client
+from app.core.gcs import download_blob_as_bytes, blob_exists, get_gcs_client, resolve_slide_raw_uri
 from app.models.case import Case
 from app.models.slide import Slide
 from app.models.stage_execution import StageExecution
@@ -50,7 +50,12 @@ def rehydrate_case_from_gcs(case_id_val: Any, db: Session) -> Case | None:
         db.flush()
 
     existing_slide = db.scalars(select(Slide).where(Slide.case_id == case_uuid)).first()
-    if not existing_slide:
+    if existing_slide:
+        real_raw_uri = resolve_slide_raw_uri(case_str, existing_slide)
+        if real_raw_uri and getattr(existing_slide, "gcs_uri_original", None) != real_raw_uri:
+            existing_slide.gcs_uri_original = real_raw_uri
+            db.flush()
+    else:
         ingest_data = {}
         if blob_exists(bucket, f"cases/{case_str}/ingest_output.json"):
             try:
@@ -62,11 +67,12 @@ def rehydrate_case_from_gcs(case_id_val: Any, db: Session) -> Case | None:
         slide_uuid = to_uuid(ingest_data.get("slide_id", uuid.uuid4()))
         dims = ingest_data.get("dimensions", [52842, 142079])
         mpp = ingest_data.get("mpp_x", 0.265018)
+        resolved_raw = resolve_slide_raw_uri(case_str) or f"gs://{settings.GCS_RAW_BUCKET}/cases/{case_str}/slide.svs"
 
         slide_obj = Slide(
             id=slide_uuid,
             case_id=case_uuid,
-            gcs_uri_original=f"gs://{settings.GCS_RAW_BUCKET}/cases/{case_str}/slide.svs",
+            gcs_uri_original=resolved_raw,
             gcs_uri_pyramid=ingest_data.get("gcs_uri_pyramid", f"gs://{settings.GCS_PYRAMIDS_BUCKET}/{slide_uuid}/orig/"),
             checksum_sha256=ingest_data.get("checksum", ""),
             mpp_x=mpp,

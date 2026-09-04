@@ -26,7 +26,8 @@ from app.core.gcs import (
     get_gcs_client,
     parse_gcs_uri,
     download_blob_as_bytes,
-    download_blob_to_filename
+    download_blob_to_filename,
+    resolve_slide_raw_uri
 )
 from app.core.db import get_db
 from app.models.case import Case
@@ -538,7 +539,7 @@ def get_patch_image(case_id: str, patch_id: str, db: Session = Depends(get_db)):
         case_uid = to_uuid(case_id)
         slide = db.scalars(select(Slide).where(Slide.case_id == case_uid)).first()
         slide_id = str(slide.id) if slide else "slide"
-        gcs_uri_original = getattr(slide, "gcs_uri_original", None) or f"gs://{settings.GCS_RAW_BUCKET}/cases/{case_id}/{slide_id}.svs"
+        gcs_uri_original = resolve_slide_raw_uri(case_id, slide) or getattr(slide, "gcs_uri_original", None) or f"gs://{settings.GCS_RAW_BUCKET}/cases/{case_id}/{slide_id}.svs"
         raw_bucket_name, slide_blob = parse_gcs_uri(gcs_uri_original)
         ext = os.path.splitext(slide_blob)[1] or ".svs"
         local_slide_path = os.path.join(scratch_dir, f"slide{ext}")

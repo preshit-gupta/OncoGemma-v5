@@ -93,6 +93,38 @@ def delete_blob(bucket_name: str, blob_name: str):
     if blob.exists():
         blob.delete()
 
+def resolve_slide_raw_uri(case_id: str, slide_obj=None) -> str | None:
+    """
+    Authoritative resolution of the raw Whole-Slide Image (SVS/NDPI/TIFF) URI in GCS.
+    Resolves dynamically even when the uploaded file has a UUID or arbitrary filename.
+    """
+    if slide_obj:
+        uri = getattr(slide_obj, "gcs_uri_original", None)
+        if uri and uri.startswith("gs://"):
+            b_name, o_name = parse_gcs_uri(uri)
+            try:
+                if blob_exists(b_name, o_name):
+                    return uri
+            except Exception:
+                pass
+
+    try:
+        client = get_gcs_client()
+        bucket = client.bucket(settings.GCS_RAW_BUCKET)
+        blobs = list(bucket.list_blobs(prefix=f"cases/{case_id}/"))
+        
+        for b in blobs:
+            if b.name.lower().endswith((".svs", ".ndpi", ".tiff", ".tif", ".mrxs", ".bif", ".vms")):
+                return f"gs://{settings.GCS_RAW_BUCKET}/{b.name}"
+                
+        if blobs:
+            blobs.sort(key=lambda x: getattr(x, "size", 0) or 0, reverse=True)
+            return f"gs://{settings.GCS_RAW_BUCKET}/{blobs[0].name}"
+    except Exception as e:
+        print(f"[Resolve Raw Slide URI Error] {e}")
+
+    return None
+
 def get_service_account_email() -> str:
     """
     Resolves the canonical service account email for signing.

@@ -21,7 +21,8 @@ from app.core.gcs import (
     parse_gcs_uri,
     download_blob_as_bytes,
     download_blob_as_text,
-    download_blob_to_filename
+    download_blob_to_filename,
+    resolve_slide_raw_uri
 )
 from app.core.openslide_lock import OPENSLIDE_GLOBAL_LOCK
 from app.models.case import Case
@@ -155,7 +156,7 @@ def stream_slide_tile(slide: Slide, layer: str, z: int, filename: str, case_id: 
         if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
             c, r = int(parts[0]), int(parts[1])
             cid = str(case_id or slide.case_id)
-            gcs_uri_original = slide.gcs_uri_original or f"gs://{settings.GCS_RAW_BUCKET}/cases/{cid}/{slide.id}.svs"
+            gcs_uri_original = resolve_slide_raw_uri(cid, slide) or slide.gcs_uri_original or f"gs://{settings.GCS_RAW_BUCKET}/cases/{cid}/{slide.id}.svs"
             raw_bucket_name, blob_name = parse_gcs_uri(gcs_uri_original)
             slide_ext = os.path.splitext(blob_name)[1] or ".svs"
             local_slide_path = os.path.join(scratch_dir, f"slide{slide_ext}")

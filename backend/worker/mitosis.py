@@ -20,7 +20,8 @@ from app.core.gcs import (
     upload_blob_from_bytes,
     download_blob_as_bytes,
     download_blob_to_filename,
-    get_gcs_artifact_direct_url
+    get_gcs_artifact_direct_url,
+    resolve_slide_raw_uri
 )
 from app.core.openslide_lock import OPENSLIDE_GLOBAL_LOCK
 from app.models.case import Case
@@ -174,7 +175,7 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
         verifier = HoVerNetMitosisVerifier(threshold=ver_thresh)
 
         # Download raw slide from GCS to transient scratch file for tile & crop sampling
-        gcs_uri_original = slide_obj.gcs_uri_original or f"gs://{settings.GCS_RAW_BUCKET}/cases/{case_id}/{slide_id}.svs"
+        gcs_uri_original = resolve_slide_raw_uri(case_id, slide_obj) or slide_obj.gcs_uri_original or f"gs://{settings.GCS_RAW_BUCKET}/cases/{case_id}/{slide_id}.svs"
         raw_bucket_name, blob_name = parse_gcs_uri(gcs_uri_original)
         ext = os.path.splitext(blob_name)[1] or ".svs"
         local_slide_path = os.path.join(scratch_dir, f"slide{ext}")
@@ -189,6 +190,9 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
                     print(f"[Worker:Mitosis] Successfully opened SVS slide with OpenSlide from GCS {blob_name}")
         except Exception as e:
             print(f"[Worker:Mitosis Warning] Could not open slide with OpenSlide: {e}")
+
+        if openslide_slide is None:
+            raise RuntimeError(f"Could not open authentic gigapixel slide for case {case_id} ({raw_bucket_name}/{blob_name}). Aborting Stage 4 to prevent synthetic mock generation.")
 
         # Fallback to OpenSlide thumbnail tissue mask if GCS mask was not found
         if tissue_mask is None and openslide_slide is not None:
@@ -233,13 +237,8 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
                         print(f"[Worker:Mitosis] OpenSlide read_region error at ({tx_px}, {ty_px}): {e}")
 
                 if tile_rgb is None:
-                    # Generate realistic synthetic high-power H&E tile for dev/mock environments
-                    np.random.seed(int(abs(tx_um * 17 + ty_um * 31)) % 10000)
-                    tile_rgb = np.full((tile_size_px, tile_size_px, 3), (235, 215, 230), dtype=np.uint8)
-                    for _ in range(15):
-                        nx_p = np.random.randint(32, tile_size_px - 32)
-                        ny_p = np.random.randint(32, tile_size_px - 32)
-                        tile_rgb[ny_p-8:ny_p+8, nx_p-8:nx_p+8] = (60, 20, 90)
+                    print(f"[Worker:Mitosis Warning] Could not read tile at ({tx_px}, {ty_px}) from slide")
+                    continue
 
                 # Detect mitotic candidates on tile
                 tile_preds = detector.detect(tile_rgb)
@@ -283,11 +282,8 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
                     print(f"[Worker:Mitosis] Crop extraction error for {cand['id']}: {e}")
 
             if crop_rgb is None:
-                # Synthetic 128x128 crop
-                crop_rgb = np.full((crop_size_px, crop_size_px, 3), (230, 210, 225), dtype=np.uint8)
-                cy, cx = crop_size_px // 2, crop_size_px // 2
-                crop_rgb[cy-10:cy+10, cx-6:cx+6] = (45, 10, 80)
-                crop_rgb[cy-6:cy+6, cx-12:cx+12] = (50, 15, 85)
+                print(f"[Worker:Mitosis Warning] Skipping candidate {cand['id']} - could not extract optical crop from slide")
+                continue
 
             # Run HoVer-Net nuclear instance verification
             ver_conf, contour = verifier.verify(crop_rgb)
@@ -446,26 +442,24 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
                         patch_orig = None
 
                 if patch_orig is None:
-                    from pipeline.stain import generate_synthetic_microscopic_patch
-                    orig_bytes = generate_synthetic_microscopic_patch(mag_name, "orig", f"hpf_{case_id}_{hpf_seq}_{mag_name}_orig")
-                    norm_bytes = generate_synthetic_microscopic_patch(mag_name, "norm", f"hpf_{case_id}_{hpf_seq}_{mag_name}_norm")
-                else:
-                    patch_orig_512 = patch_orig.resize((512, 512), Image.Resampling.BILINEAR)
-                    buf_o = io.BytesIO()
-                    patch_orig_512.save(buf_o, "PNG")
-                    orig_bytes = buf_o.getvalue()
+                    raise RuntimeError(f"Failed to extract authentic optical patch for HPF #{hpf_seq} at {mag_name} from slide")
 
-                    patch_norm_512 = patch_orig_512
-                    if stain_normalizer:
-                        try:
-                            norm_arr = stain_normalizer.transform(np.array(patch_orig_512))
-                            patch_norm_512 = Image.fromarray(norm_arr)
-                        except Exception:
-                            patch_norm_512 = patch_orig_512
+                patch_orig_512 = patch_orig.resize((512, 512), Image.Resampling.BILINEAR)
+                buf_o = io.BytesIO()
+                patch_orig_512.save(buf_o, "PNG")
+                orig_bytes = buf_o.getvalue()
 
-                    buf_n = io.BytesIO()
-                    patch_norm_512.save(buf_n, "PNG")
-                    norm_bytes = buf_n.getvalue()
+                patch_norm_512 = patch_orig_512
+                if stain_normalizer:
+                    try:
+                        norm_arr = stain_normalizer.transform(np.array(patch_orig_512))
+                        patch_norm_512 = Image.fromarray(norm_arr)
+                    except Exception:
+                        patch_norm_512 = patch_orig_512
+
+                buf_n = io.BytesIO()
+                patch_norm_512.save(buf_n, "PNG")
+                norm_bytes = buf_n.getvalue()
 
                 hpf_uploads.append((f"cases/{case_id}/mitosis/hpfs/hpf_{hpf_seq}_{mag_name}_orig.png", orig_bytes))
                 hpf_uploads.append((f"cases/{case_id}/mitosis/hpfs/hpf_{hpf_seq}_{mag_name}_norm.png", norm_bytes))
