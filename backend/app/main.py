@@ -52,7 +52,7 @@ async def background_pipeline_worker():
 
 
 def ensure_schema_up_to_date():
-    """Ensure newly added columns exist in Postgres production tables."""
+    """Ensure newly added columns and cascade foreign keys exist in production tables."""
     from sqlalchemy import text
     try:
         with engine.begin() as conn:
@@ -61,6 +61,37 @@ def ensure_schema_up_to_date():
             conn.execute(text("ALTER TABLE detections ADD COLUMN IF NOT EXISTS medgemma_confidence VARCHAR;"))
             conn.execute(text("ALTER TABLE detections ALTER COLUMN medgemma_confidence TYPE VARCHAR USING medgemma_confidence::VARCHAR;"))
             logger.info("[Database Schema] Verified all columns exist on 'detections' table.")
+
+            # On PostgreSQL: ensure foreign key constraints on child tables have ON DELETE CASCADE
+            if conn.dialect.name == "postgresql":
+                fk_updates = [
+                    ("hotspots", "hotspots_stage_execution_id_fkey", "stage_execution_id", "stage_executions(id)"),
+                    ("hotspots", "hotspots_case_id_fkey", "case_id", "cases(id)"),
+                    ("detections", "detections_case_id_fkey", "case_id", "cases(id)"),
+                    ("hpf_sites", "hpf_sites_case_id_fkey", "case_id", "cases(id)"),
+                    ("slides", "slides_case_id_fkey", "case_id", "cases(id)"),
+                    ("stage_executions", "stage_executions_case_id_fkey", "case_id", "cases(id)"),
+                    ("gradings", "gradings_case_id_fkey", "case_id", "cases(id)"),
+                    ("reports", "reports_case_id_fkey", "case_id", "cases(id)"),
+                ]
+                for tbl, cname, col, target in fk_updates:
+                    try:
+                        conn.execute(text(f"""
+                            DO $$
+                            BEGIN
+                                IF EXISTS (
+                                    SELECT 1 FROM information_schema.table_constraints 
+                                    WHERE constraint_name = '{cname}' AND table_name = '{tbl}'
+                                ) THEN
+                                    ALTER TABLE {tbl} DROP CONSTRAINT {cname};
+                                END IF;
+                                ALTER TABLE {tbl} ADD CONSTRAINT {cname} 
+                                    FOREIGN KEY ({col}) REFERENCES {target} ON DELETE CASCADE;
+                            END $$;
+                        """))
+                    except Exception as fk_e:
+                        logger.warning(f"[Schema FK Migration Note] Could not update FK {cname} on {tbl}: {fk_e}")
+                logger.info("[Database Schema] Ensured ON DELETE CASCADE on all case and stage_execution foreign keys.")
     except Exception as e:
         logger.warning(f"[Database Schema Migration Note] {e}")
 

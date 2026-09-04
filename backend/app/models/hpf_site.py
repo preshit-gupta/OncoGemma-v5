@@ -14,7 +14,7 @@ JSONType = JSON().with_variant(JSONB, "postgresql")
 class HpfSite(Base):
     __tablename__ = "hpf_sites"
 
-    case_id = Column(GUID, ForeignKey("cases.id"), primary_key=True, index=True)
+    case_id = Column(GUID, ForeignKey("cases.id", ondelete="CASCADE"), primary_key=True, index=True)
     seq = Column(Integer, primary_key=True) # 1 to 10
     center_um = Column(JSONType, nullable=False) # [x, y] in base micrometers
     radius_um = Column(Float, nullable=False, default=262.0)

@@ -67,9 +67,9 @@ export default function CasesPage() {
     try {
       await deleteCase(caseId);
       await loadCases();
-    } catch (err) {
+    } catch (err: any) {
       console.error(err);
-      alert("Failed to delete case");
+      alert(err.message || "Failed to delete case");
     }
   };
 
@@ -78,9 +78,9 @@ export default function CasesPage() {
     try {
       await clearAllCases();
       await loadCases();
-    } catch (err) {
+    } catch (err: any) {
       console.error(err);
-      alert("Failed to clear cases");
+      alert(err.message || "Failed to clear cases");
     }
   };
 

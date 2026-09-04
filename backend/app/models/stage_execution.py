@@ -13,7 +13,7 @@ class StageExecution(Base):
     __tablename__ = "stage_executions"
 
     id: Mapped[uuid.UUID] = mapped_column(GUID, primary_key=True, default=uuid.uuid4)
-    case_id: Mapped[uuid.UUID] = mapped_column(GUID, ForeignKey("cases.id"), nullable=False)
+    case_id: Mapped[uuid.UUID] = mapped_column(GUID, ForeignKey("cases.id", ondelete="CASCADE"), nullable=False)
     
     stage: Mapped[str] = mapped_column(String, nullable=False) # ingest|preprocess|qc|triage|mitosis|grading|report
     attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
@@ -34,6 +34,7 @@ class StageExecution(Base):
     review_edits: Mapped[dict | None] = mapped_column(JSONType, nullable=True) # RFC-6902 JSON diff
 
     case = relationship("Case", back_populates="stage_executions")
+    hotspots = relationship("Hotspot", cascade="all, delete-orphan", passive_deletes=True)
 
     __table_args__ = (
         UniqueConstraint("case_id", "stage", "attempt", name="uq_stage_execution_attempt"),

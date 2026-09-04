@@ -207,7 +207,10 @@ export async function deleteCase(caseId: string) {
     method: "DELETE",
     headers: { "X-User-Role": "pathologist" }
   });
-  if (!res.ok) throw new Error("Failed to delete case");
+  if (!res.ok) {
+    const errData = await res.json().catch(() => null);
+    throw new Error(errData?.detail || `Failed to delete case (${res.status})`);
+  }
 }
 
 export async function clearAllCases() {
@@ -215,7 +218,10 @@ export async function clearAllCases() {
     method: "DELETE",
     headers: { "X-User-Role": "pathologist" }
   });
-  if (!res.ok) throw new Error("Failed to clear cases");
+  if (!res.ok) {
+    const errData = await res.json().catch(() => null);
+    throw new Error(errData?.detail || `Failed to clear cases (${res.status})`);
+  }
   return res.json();
 }
 

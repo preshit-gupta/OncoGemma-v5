@@ -23,6 +23,11 @@ from app.core.cloud_tasks import dispatch_stage_task
 from app.models.case import Case
 from app.models.slide import Slide
 from app.models.stage_execution import StageExecution
+from app.models.hotspot import Hotspot
+from app.models.detection import Detection
+from app.models.hpf_site import HpfSite
+from app.models.grading import Grading
+from app.models.report import Report
 from app.models.audit import AuditEvent
 from app.core.rehydrate import rehydrate_case_from_gcs
 from app.schemas.case import (
@@ -81,19 +86,67 @@ def list_cases(
         cases = db.scalars(stmt).all()
     return cases
 
+def delete_single_case_data(case_id: uuid.UUID, db: Session):
+    """
+    Safely delete a case and all associated child entities in strict dependency order,
+    preventing any foreign key constraint violations, and cleans up associated GCS storage artifacts.
+    """
+    case_str = str(case_id)
+
+    # 1. Delete leaf entities (mitosis detections and virtual HPF sites)
+    db.query(Detection).filter(Detection.case_id == case_id).delete(synchronize_session=False)
+    db.query(HpfSite).filter(HpfSite.case_id == case_id).delete(synchronize_session=False)
+
+    # 2. Delete Hotspots (which reference stage_executions and cases)
+    db.query(Hotspot).filter(Hotspot.case_id == case_id).delete(synchronize_session=False)
+
+    # 3. Delete StageExecutions
+    db.query(StageExecution).filter(StageExecution.case_id == case_id).delete(synchronize_session=False)
+
+    # 4. Delete Grading and Report
+    db.query(Grading).filter(Grading.case_id == case_id).delete(synchronize_session=False)
+    db.query(Report).filter(Report.case_id == case_id).delete(synchronize_session=False)
+
+    # 5. Delete Slide records
+    db.query(Slide).filter(Slide.case_id == case_id).delete(synchronize_session=False)
+
+    # 6. Delete AuditEvents
+    db.query(AuditEvent).filter(AuditEvent.case_id == case_str).delete(synchronize_session=False)
+
+    # 7. Delete Case record
+    db.query(Case).filter(Case.id == case_id).delete(synchronize_session=False)
+    db.commit()
+
+    # 8. Clean up GCS artifacts and raw slide blobs
+    try:
+        from app.core.gcs import get_gcs_client
+        client = get_gcs_client()
+        for bname in [settings.GCS_ARTIFACTS_BUCKET, settings.GCS_RAW_BUCKET, settings.GCS_PYRAMIDS_BUCKET]:
+            try:
+                bucket = client.bucket(bname)
+                blobs = list(bucket.list_blobs(prefix=f"cases/{case_str}/"))
+                if blobs:
+                    bucket.delete_blobs(blobs)
+                    print(f"[Delete Case GCS] Deleted {len(blobs)} blobs from {bname} for case {case_str}")
+            except Exception as b_err:
+                print(f"[Delete Case GCS Note] Could not delete blobs from {bname}: {b_err}")
+    except Exception as gcs_err:
+        print(f"[Delete Case GCS Exception] {gcs_err}")
+
+
 @router.delete("", status_code=status.HTTP_200_OK)
 def clear_all_cases(
     db: Session = Depends(get_db),
     user: CurrentUser = Depends(get_current_user)
 ):
-    """Clear all diagnostic cases and audit logs."""
+    """Clear all diagnostic cases, associated relational child data, and storage artifacts."""
     cases = db.scalars(select(Case)).all()
     count = len(cases)
     for c in cases:
-        db.delete(c)
-    db.commit()
+        delete_single_case_data(c.id, db)
 
     return {"status": "cleared", "deleted_count": count}
+
 
 @router.delete("/{case_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_case(
@@ -101,13 +154,12 @@ def delete_case(
     db: Session = Depends(get_db),
     user: CurrentUser = Depends(get_current_user)
 ):
-    """Delete a single diagnostic case."""
+    """Delete a single diagnostic case and all associated child data."""
     case_obj = db.get(Case, case_id)
     if not case_obj:
         raise HTTPException(status_code=404, detail="Case not found")
     
-    db.delete(case_obj)
-    db.commit()
+    delete_single_case_data(case_id, db)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 @router.post("/{case_id}/slide/upload", status_code=status.HTTP_202_ACCEPTED)

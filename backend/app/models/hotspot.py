@@ -14,8 +14,8 @@ class Hotspot(Base):
     __tablename__ = "hotspots"
 
     id = Column(String, primary_key=True)
-    case_id = Column(GUID, ForeignKey("cases.id"), primary_key=True, index=True)
-    stage_execution_id = Column(GUID, ForeignKey("stage_executions.id"), nullable=False)
+    case_id = Column(GUID, ForeignKey("cases.id", ondelete="CASCADE"), primary_key=True, index=True)
+    stage_execution_id = Column(GUID, ForeignKey("stage_executions.id", ondelete="CASCADE"), nullable=False)
     polygon_um = Column(JSON, nullable=False) # List of [x, y] in base micrometers
     area_mm2 = Column(Float, nullable=True)
     prob_mean = Column(Float, nullable=True)

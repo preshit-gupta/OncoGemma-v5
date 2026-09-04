@@ -15,7 +15,7 @@ class Detection(Base):
     __tablename__ = "detections"
 
     id = Column(String, primary_key=True) # e.g. m_0001
-    case_id = Column(GUID, ForeignKey("cases.id"), primary_key=True, index=True)
+    case_id = Column(GUID, ForeignKey("cases.id", ondelete="CASCADE"), primary_key=True, index=True)
     hotspot_id = Column(String, nullable=True)
     centroid_um = Column(JSONType, nullable=False) # [x, y] in base micrometers
     det_conf = Column(Float, nullable=True) # YOLO detector confidence

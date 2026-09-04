@@ -10,7 +10,7 @@ class Slide(Base):
     __tablename__ = "slides"
 
     id: Mapped[uuid.UUID] = mapped_column(GUID, primary_key=True, default=uuid.uuid4)
-    case_id: Mapped[uuid.UUID] = mapped_column(GUID, ForeignKey("cases.id"), nullable=False)
+    case_id: Mapped[uuid.UUID] = mapped_column(GUID, ForeignKey("cases.id", ondelete="CASCADE"), nullable=False)
     
     gcs_uri_original: Mapped[str] = mapped_column(String, nullable=False)
     gcs_uri_pyramid: Mapped[str | None] = mapped_column(String, nullable=True)
