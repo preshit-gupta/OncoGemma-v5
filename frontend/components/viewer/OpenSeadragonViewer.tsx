@@ -349,67 +349,84 @@ export function OpenSeadragonViewer({
 
   // Sync heatmap overlay and opacity smoothly without re-downloading or stacking duplicate images
   useEffect(() => {
-    const viewer = viewerRef.current;
-    if (!viewer?.world) return;
-    const world = viewer.world;
+    try {
+      const viewer = viewerRef.current;
+      if (!viewer?.world) return;
+      const world = viewer.world;
 
-    const targetOpacity = showOverlay ? overlayOpacity : 0.0;
+      const targetOpacity = showOverlay ? overlayOpacity : 0.0;
 
-    // When overlay URI changes, remove old overlay and load the new one
-    if (overlayImageUri !== currentOverlayUriRef.current) {
-      if (overlayItemRef.current) {
-        try {
-          world.removeItem(overlayItemRef.current);
-        } catch (_) {}
-        overlayItemRef.current = null;
-      }
-      currentOverlayUriRef.current = overlayImageUri;
-
-      // Purge any orphan overlays, keeping only the primary slide at index 0
-      while (world.getItemCount() > 1) {
-        try {
-          world.removeItem(world.getItemAt(1));
-        } catch (_) {
-          break;
+      // When overlay URI changes, remove old overlay and load the new one
+      if (overlayImageUri !== currentOverlayUriRef.current) {
+        if (overlayItemRef.current) {
+          try {
+            world.removeItem(overlayItemRef.current);
+          } catch (_) {}
+          overlayItemRef.current = null;
         }
-      }
+        currentOverlayUriRef.current = overlayImageUri;
 
-      if (overlayImageUri) {
-        isAddingOverlayRef.current = true;
-        viewer.addSimpleImage({
-          url: overlayImageUri,
-          opacity: targetOpacity,
-          x: 0,
-          y: 0,
-          width: 1.0,
-          success: (event: any) => {
-            overlayItemRef.current = event.item;
-            isAddingOverlayRef.current = false;
-            if (event.item && typeof event.item.setOpacity === "function") {
-              event.item.setOpacity(targetOpacity);
-            }
-            viewer.viewport?.requestRedraw();
-          },
-          error: () => {
-            isAddingOverlayRef.current = false;
+        // Purge any orphan overlays, keeping only the primary slide at index 0
+        try {
+          while (world.getItemCount() > 1) {
+            world.removeItem(world.getItemAt(1));
           }
-        });
-      }
-    } else {
-      // Same URI: smoothly update opacity on all overlay items and immediately redraw viewport
-      const count = world.getItemCount();
-      for (let i = 1; i < count; i++) {
-        const item = world.getItemAt(i);
-        if (item && typeof item.setOpacity === "function") {
-          item.setOpacity(targetOpacity);
+        } catch (_) {}
+
+        if (overlayImageUri) {
+          isAddingOverlayRef.current = true;
+          viewer.addSimpleImage({
+            url: overlayImageUri,
+            opacity: targetOpacity,
+            x: 0,
+            y: 0,
+            width: 1.0,
+            success: (event: any) => {
+              try {
+                overlayItemRef.current = event.item;
+                isAddingOverlayRef.current = false;
+                if (event.item && typeof event.item.setOpacity === "function") {
+                  event.item.setOpacity(targetOpacity);
+                }
+                if (viewer && typeof viewer.requestRedraw === "function") {
+                  viewer.requestRedraw();
+                } else if (viewer && typeof viewer.forceRedraw === "function") {
+                  viewer.forceRedraw();
+                }
+              } catch (_) {}
+            },
+            error: () => {
+              isAddingOverlayRef.current = false;
+            }
+          });
+        }
+      } else {
+        // Same URI: smoothly update opacity on all overlay items and trigger redraw
+        const count = world.getItemCount();
+        for (let i = 1; i < count; i++) {
+          const item = world.getItemAt(i);
+          if (item && typeof item.setOpacity === "function") {
+            try {
+              item.setOpacity(targetOpacity);
+            } catch (_) {}
+          }
+        }
+        if (overlayItemRef.current && typeof overlayItemRef.current.setOpacity === "function") {
+          try {
+            overlayItemRef.current.setOpacity(targetOpacity);
+          } catch (_) {}
+        }
+        if (viewer && typeof viewer.requestRedraw === "function") {
+          viewer.requestRedraw();
+        } else if (viewer && typeof viewer.forceRedraw === "function") {
+          viewer.forceRedraw();
         }
       }
-      if (overlayItemRef.current && typeof overlayItemRef.current.setOpacity === "function") {
-        overlayItemRef.current.setOpacity(targetOpacity);
-      }
-      viewer.viewport?.requestRedraw();
+    } catch (err) {
+      console.warn("[OpenSeadragonViewer Overlay Sync Note]", err);
     }
   }, [overlayOpacity, showOverlay, overlayImageUri]);
+
 
 
   // Update SVG polygon coordinates when hotspots change or are added
