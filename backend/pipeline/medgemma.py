@@ -173,11 +173,13 @@ class MedGemmaClient:
                 if preds and len(preds) > 0:
                     return json.dumps(preds[0])
                     
-            return "{}"
+            raise RuntimeError("Vertex AI MedGemma endpoint returned empty predictions.")
         except Exception as e:
-            # Fallback to quantitative image morphometrics with clear log
-            print(f"[MedGemma Vertex AI Note] Live endpoint call note ({e}). Using quantitative image morphometrics.")
-            return self._mock_fallback_response(prompt, img_b64)
+            if settings.USE_MOCK_VERTEX_AI:
+                # Fallback to quantitative image morphometrics with clear log
+                print(f"[MedGemma Vertex AI Note] Live endpoint call note ({e}). Using quantitative image morphometrics.")
+                return self._mock_fallback_response(prompt, img_b64)
+            raise e
 
     def _mock_fallback_response(self, prompt: str, image_b64: Optional[str] = None) -> str:
         """
@@ -592,9 +594,9 @@ class MedGemmaClient:
         t_score = case_data.get("nottingham_grade", {}).get("tubule_score", 2)
         p_score = case_data.get("nottingham_grade", {}).get("pleo_score", 2)
         m_score = case_data.get("nottingham_grade", {}).get("mitotic_score", 2)
-        pt = case_data.get("staging", {}).get("pt_stage", "pT1c")
+        pt = case_data.get("staging", {}).get("pt_stage", "pTX")
         pn = case_data.get("staging", {}).get("pn_stage", "pNX")
-        stage_grp = case_data.get("staging", {}).get("stage_group", "IA")
+        stage_grp = case_data.get("staging", {}).get("stage_group", "Unknown")
 
         return {
             "diagnosis_line": f"{lat} BREAST, {proc}: INVASIVE BREAST CARCINOMA OF {htype.upper()}, NOTTINGHAM HISTOLOGIC GRADE {grade}.",

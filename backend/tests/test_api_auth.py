@@ -64,3 +64,27 @@ def test_create_and_get_case():
     assert res_detail.status_code == 200
     detail = res_detail.json()
     assert detail["id"] == case_id
+
+
+def test_rbac_case_permissions():
+    # 1. Viewer cannot create a case -> 403
+    res_v_create = client.post("/api/v1/cases", headers={"X-User-Role": "viewer", "X-User-Id": "viewer_1"})
+    assert res_v_create.status_code == 403
+
+    # 2. Admin can create a case -> 201
+    res_a_create = client.post("/api/v1/cases", headers={"X-User-Role": "admin", "X-User-Id": "admin_1"})
+    assert res_a_create.status_code == 201
+    case_id = res_a_create.json()["id"]
+
+    # 3. Viewer cannot delete a case -> 403
+    res_v_del = client.delete(f"/api/v1/cases/{case_id}", headers={"X-User-Role": "viewer"})
+    assert res_v_del.status_code == 403
+
+    # 4. Pathologist cannot clear all cases -> 403
+    res_p_clear = client.delete("/api/v1/cases", headers={"X-User-Role": "pathologist"})
+    assert res_p_clear.status_code == 403
+
+    # 5. Admin can clear all cases -> 200
+    res_a_clear = client.delete("/api/v1/cases", headers={"X-User-Role": "admin"})
+    assert res_a_clear.status_code == 200
+    assert res_a_clear.json()["status"] == "cleared"

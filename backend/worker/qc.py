@@ -44,6 +44,17 @@ def run_qc(stage_execution: StageExecution, session: Session) -> tuple[str, dict
         raise ValueError(f"Slide not found for case {case_id}")
 
     slide_obj = session.get(Slide, str(slide_id))
+    if not slide_obj:
+        raise ValueError(f"Slide object {slide_id} not found in database")
+
+    # Halt QC stage if MPP is missing per PRD 01-stage-v4.0 §2.3 step 4
+    if not getattr(slide_obj, "mpp_x", None) or slide_obj.mpp_x <= 0 or not getattr(slide_obj, "mpp_y", None) or slide_obj.mpp_y <= 0:
+        raise ValueError(f"Slide {slide_obj.id} is missing valid MPP (status='needs_mpp'). Cannot execute QC stage.")
+
+    mpp_x = float(slide_obj.mpp_x)
+    mpp_y = float(slide_obj.mpp_y)
+    checksum = getattr(slide_obj, "checksum_sha256", "default_checksum") or "default_checksum"
+
     scratch_dir = tempfile.mkdtemp(prefix="og_qc_")
 
     try:
@@ -64,10 +75,6 @@ def run_qc(stage_execution: StageExecution, session: Session) -> tuple[str, dict
             slide = openslide.OpenSlide(local_slide_path)
         except Exception:
             slide = Image.open(local_slide_path)
-
-        mpp_x = float(getattr(slide_obj, "mpp_x", 0.25) or 0.25)
-        mpp_y = float(getattr(slide_obj, "mpp_y", 0.25) or 0.25)
-        checksum = getattr(slide_obj, "checksum_sha256", "default_checksum") or "default_checksum"
 
         # Obtain stain matrix & tissue mask
         normalizer, stain_params, tissue_mask_1bit = fit_macenko_stain(

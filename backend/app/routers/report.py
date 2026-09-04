@@ -5,6 +5,7 @@ import uuid
 import hashlib
 import tempfile
 import shutil
+import copy
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Literal
 from fastapi import APIRouter, Depends, HTTPException, status, Response
@@ -22,6 +23,8 @@ from app.core.gcs import (
     blob_exists
 )
 from app.core.db import get_db
+from app.core.auth import get_current_user, CurrentUser
+
 from app.models.case import Case
 from app.models.slide import Slide
 from app.models.stage_execution import StageExecution
@@ -49,9 +52,9 @@ router = APIRouter(prefix="/api/v1/stages/report", tags=["report"])
 # ---------------------------------------------------------------------------
 
 class MarginsPayload(BaseModel):
-    status: Literal["negative", "positive", "cannot_be_assessed"] = "negative"
-    closest_margin_mm: Optional[float] = Field(default=5.0, ge=0.0)
-    closest_margin_name: Optional[str] = "posterior"
+    status: Optional[Literal["negative", "positive", "cannot_be_assessed"]] = None
+    closest_margin_mm: Optional[float] = Field(default=None, ge=0.0)
+    closest_margin_name: Optional[str] = None
     positive_margins: List[str] = Field(default_factory=list)
 
 
@@ -63,21 +66,21 @@ class LymphNodesPayload(BaseModel):
 
 
 class BiomarkersPayload(BaseModel):
-    er: Dict[str, Any] = Field(default_factory=lambda: {"status": "positive", "percent": 95, "allred_score": 8})
-    pr: Dict[str, Any] = Field(default_factory=lambda: {"status": "positive", "percent": 80, "allred_score": 7})
-    her2: Dict[str, Any] = Field(default_factory=lambda: {"ihc_score": "1+", "fish_status": "not_performed", "result": "negative"})
-    ki67: Dict[str, Any] = Field(default_factory=lambda: {"percent": 18})
+    er: Optional[Dict[str, Any]] = None
+    pr: Optional[Dict[str, Any]] = None
+    her2: Optional[Dict[str, Any]] = None
+    ki67: Optional[Dict[str, Any]] = None
 
 
 class UpdateReportPayload(BaseModel):
     case_id: str
-    specimen_type: Optional[str] = "core_biopsy"
-    procedure: Optional[str] = "Core Needle Biopsy"
-    laterality: Optional[str] = "right"
-    tumor_site: Optional[str] = "upper_outer_quadrant"
-    tumor_size_mm: Optional[float] = Field(default=18.0, ge=0.0)
-    lvi_status: Optional[Literal["absent", "present", "indeterminate"]] = "absent"
-    dcis_present: Optional[bool] = False
+    specimen_type: Optional[str] = None
+    procedure: Optional[str] = None
+    laterality: Optional[str] = None
+    tumor_site: Optional[str] = None
+    tumor_size_mm: Optional[float] = Field(default=None, ge=0.0)
+    lvi_status: Optional[Literal["absent", "present", "indeterminate"]] = None
+    dcis_present: Optional[bool] = None
     margins: Optional[MarginsPayload] = None
     lymph_nodes: Optional[LymphNodesPayload] = None
     biomarkers: Optional[BiomarkersPayload] = None
@@ -113,8 +116,10 @@ def to_uuid(val: Any) -> uuid.UUID:
 
 
 def _ensure_report_record(case_uid: uuid.UUID, db: Session) -> Report:
-    """Retrieve existing report or create initial draft from verified Stage 5 data."""
-    report = db.scalars(select(Report).where(Report.case_id == case_uid)).first()
+    """Retrieve existing latest report or create initial draft from verified Stage 5 data."""
+    report = db.scalars(
+        select(Report).where(Report.case_id == case_uid).order_by(Report.version.desc())
+    ).first()
     if report:
         return report
 
@@ -123,27 +128,23 @@ def _ensure_report_record(case_uid: uuid.UUID, db: Session) -> Report:
 
     report = Report(
         case_id=case_uid,
+        version=1,
         specimen_type="core_biopsy",
         procedure="Core Needle Biopsy",
         laterality="right",
         tumor_site="upper_outer_quadrant",
         histologic_type=htype,
-        tumor_size_mm=18.0,
+        tumor_size_mm=None,
         lvi_status="absent",
         dcis_present=False,
-        margins={"status": "negative", "closest_margin_mm": 5.0, "closest_margin_name": "posterior", "positive_margins": []},
+        margins=None,
         lymph_nodes={"examined_count": 0, "positive_count": 0, "extranodal_extension": False, "largest_metastasis_mm": 0.0},
-        biomarkers={
-            "er": {"status": "positive", "percent": 95, "allred_score": 8},
-            "pr": {"status": "positive", "percent": 80, "allred_score": 7},
-            "her2": {"ihc_score": "1+", "fish_status": "not_performed", "result": "negative"},
-            "ki67": {"percent": 18}
-        },
-        staging={"ajcc_version": "8th/9th Edition", "pt_stage": "pT1c", "pn_stage": "pNX", "pm_stage": "cM0", "stage_group": "IA"},
+        biomarkers=None,
+        staging={"ajcc_version": "8th/9th Edition", "pt_stage": "pTX", "pn_stage": "pNX", "pm_stage": "cM0", "stage_group": "Unknown"},
         narrative={
             "diagnosis_line": f"RIGHT BREAST, CORE NEEDLE BIOPSY: INVASIVE BREAST CARCINOMA OF {htype.upper()}, NOTTINGHAM HISTOLOGIC GRADE {grading.grade if grading else 2}.",
             "microscopic_findings": "Invasive carcinoma showing moderate tubular differentiation and nuclear pleomorphism. No lymphovascular invasion identified.",
-            "clinical_correlation": "Pathologic findings consistent with Stage IA invasive carcinoma. Clinical and receptor biomarker correlation recommended."
+            "clinical_correlation": "Pathologic findings consistent with invasive carcinoma. Clinical and receptor biomarker correlation recommended."
         },
         status="draft"
     )
@@ -285,7 +286,7 @@ def _build_report_response_dict(case_id: str, db: Session) -> Dict[str, Any]:
     }
 
     # Staging recalculation if needed
-    tumor_size = report.tumor_size_mm or 18.0
+    tumor_size = report.tumor_size_mm
     nodes_info = report.lymph_nodes or {}
     n_exam = nodes_info.get("examined_count", 0)
     n_pos = nodes_info.get("positive_count", 0)
@@ -304,6 +305,7 @@ def _build_report_response_dict(case_id: str, db: Session) -> Dict[str, Any]:
 
     return {
         "case_id": str(case_id),
+        "version": report.version,
         "slide_id": str(slide.id) if slide else None,
         "status": report.status,
         "stage_status": stage_exec.status if stage_exec else "awaiting_review",
@@ -334,7 +336,7 @@ def _build_report_response_dict(case_id: str, db: Session) -> Dict[str, Any]:
         "signed_at": report.signed_at.isoformat() if report.signed_at else None,
         "integrity_hash": report.integrity_hash,
         "amendments": report.amendments,
-        "can_sign": report.status in ("draft", "in_review")
+        "can_sign": report.status in ("draft", "in_review", "amended")
     }
 
 
@@ -352,11 +354,17 @@ def get_report_data(case_id: str, db: Session = Depends(get_db)):
 
 @router.post("/update")
 @router.put("/{case_id}")
-def update_report_data(payload: UpdateReportPayload, db: Session = Depends(get_db)):
+def update_report_data(
+    payload: UpdateReportPayload,
+    db: Session = Depends(get_db),
+    user: CurrentUser = Depends(get_current_user)
+):
     """
     Live reactive update of synoptic gross, margin, nodal, and biomarker inputs.
     Automatically recalculates AJCC staging, marks status as 'in_review', and updates PDF in GCS.
     """
+    if user.role not in ("admin", "pathologist"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Pathologist or Admin role required to update report data.")
     case_uid = to_uuid(payload.case_id)
     report = _ensure_report_record(case_uid, db)
     grading = db.scalars(select(Grading).where(Grading.case_id == case_uid)).first()
@@ -392,7 +400,7 @@ def update_report_data(payload: UpdateReportPayload, db: Session = Depends(get_d
         report.narrative = payload.narrative
 
     # Recalculate AJCC Staging
-    tumor_size = report.tumor_size_mm or 18.0
+    tumor_size = report.tumor_size_mm
     nodes_info = report.lymph_nodes or {}
     n_exam = nodes_info.get("examined_count", 0)
     n_pos = nodes_info.get("positive_count", 0)
@@ -447,7 +455,7 @@ def resynthesize_narrative(payload: UpdateReportPayload, db: Session = Depends(g
         "nottingham_sum": grading.nottingham_sum if grading and grading.nottingham_sum else 6
     }
 
-    tumor_size = payload.tumor_size_mm or report.tumor_size_mm or 18.0
+    tumor_size = payload.tumor_size_mm if payload.tumor_size_mm is not None else report.tumor_size_mm
     nodes_info = (payload.lymph_nodes.model_dump() if payload.lymph_nodes else report.lymph_nodes) or {}
     n_exam = nodes_info.get("examined_count", 0)
     n_pos = nodes_info.get("positive_count", 0)
@@ -593,16 +601,24 @@ def get_report_json(case_id: str, db: Session = Depends(get_db)):
 
 
 @router.post("/sign")
-def sign_final_report(payload: SignReportPayload, db: Session = Depends(get_db)):
+def sign_final_report(
+    payload: SignReportPayload,
+    db: Session = Depends(get_db),
+    user: CurrentUser = Depends(get_current_user)
+):
     """
     Pathologist Digital Sign-Off & Attestation Gate.
     Calculates cryptographic SHA-256 integrity hash over all elements, seals report,
     advances Stage 6 status to 'completed', and logs full immutable audit event.
     """
+    if user.role not in ("admin", "pathologist"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Pathologist or Admin role required to digitally sign a report.")
+
     case_uid = to_uuid(payload.case_id)
     report = _ensure_report_record(case_uid, db)
     case = db.scalars(select(Case).where(Case.id == case_uid)).first()
     grading = db.scalars(select(Grading).where(Grading.case_id == case_uid)).first()
+
 
     if report.status == "signed":
         # Idempotent return if already signed
@@ -680,36 +696,96 @@ def sign_final_report(payload: SignReportPayload, db: Session = Depends(get_db))
 
 
 @router.post("/amend")
-def amend_signed_report(payload: AmendReportPayload, db: Session = Depends(get_db)):
+def amend_signed_report(
+    payload: AmendReportPayload,
+    db: Session = Depends(get_db),
+    user: CurrentUser = Depends(get_current_user)
+):
     """
     Formal Versioned Amendment workflow for signed reports.
-    Appends an amendment entry with version (e.g. v1.1), reason, and timestamps.
+    Creates a new versioned Report row (version = current.version + 1) with status 'amended',
+    preserving the original signed report row as immutable.
     """
+    if user.role not in ("admin", "pathologist"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Pathologist or Admin role required to amend a report.")
     case_uid = to_uuid(payload.case_id)
-    report = _ensure_report_record(case_uid, db)
-    if report.status != "signed" and report.status != "amended":
+    current_report = _ensure_report_record(case_uid, db)
+    if current_report.status != "signed" and current_report.status != "amended":
         raise HTTPException(status_code=400, detail="Only finalized/signed reports can be amended.")
 
-    now_iso = datetime.now(timezone.utc).isoformat()
-    current_amendments = list(report.amendments or [])
+    now_utc = datetime.now(timezone.utc)
+    now_iso = now_utc.isoformat()
+    current_amendments = list(current_report.amendments or [])
     amendment_ver = f"v1.{len(current_amendments) + 1}"
+    new_version = current_report.version + 1
 
     amendment_entry = {
         "version": amendment_ver,
         "amended_by": payload.amended_by,
         "amended_at": now_iso,
         "reason": payload.amendment_reason,
-        "previous_hash": report.integrity_hash,
+        "previous_hash": current_report.integrity_hash,
         "updated_fields": payload.updated_fields
     }
-    current_amendments.append(amendment_entry)
-    report.amendments = current_amendments
-    report.status = "amended"
+    new_amendments = current_amendments + [amendment_entry]
 
-    # Apply updated fields if provided
+    # Create an immutable new Report row for the amended version
+    new_report = Report(
+        case_id=current_report.case_id,
+        version=new_version,
+        specimen_type=current_report.specimen_type,
+        procedure=current_report.procedure,
+        laterality=current_report.laterality,
+        tumor_site=current_report.tumor_site,
+        histologic_type=current_report.histologic_type,
+        tumor_size_mm=current_report.tumor_size_mm,
+        lvi_status=current_report.lvi_status,
+        dcis_present=current_report.dcis_present,
+        margins=copy.deepcopy(current_report.margins) if current_report.margins else None,
+        lymph_nodes=copy.deepcopy(current_report.lymph_nodes) if current_report.lymph_nodes else None,
+        biomarkers=copy.deepcopy(current_report.biomarkers) if current_report.biomarkers else None,
+        staging=copy.deepcopy(current_report.staging) if current_report.staging else None,
+        narrative=copy.deepcopy(current_report.narrative) if current_report.narrative else None,
+        visual_evidence=copy.deepcopy(current_report.visual_evidence) if current_report.visual_evidence else None,
+        status="amended",
+        pdf_path=None,
+        signed_by=None,
+        npi=None,
+        attestation_statement=None,
+        signed_at=None,
+        integrity_hash=None,
+        amendments=new_amendments,
+        created_at=now_utc,
+        updated_at=now_utc
+    )
+
+    ALLOWED_UPDATE_FIELDS = {
+        "specimen_type", "procedure", "laterality", "tumor_site",
+        "histologic_type", "tumor_size_mm", "lvi_status", "dcis_present",
+        "margins", "lymph_nodes", "biomarkers", "staging", "narrative"
+    }
     for k, v in payload.updated_fields.items():
-        if hasattr(report, k):
-            setattr(report, k, v)
+        if k in ALLOWED_UPDATE_FIELDS and hasattr(new_report, k):
+            setattr(new_report, k, v)
+
+    # Recalculate AJCC Staging if tumor_size_mm or lymph_nodes changed
+    if "tumor_size_mm" in payload.updated_fields or "lymph_nodes" in payload.updated_fields:
+        tumor_size = new_report.tumor_size_mm
+        nodes_info = new_report.lymph_nodes or {}
+        n_exam = nodes_info.get("examined_count", 0)
+        n_pos = nodes_info.get("positive_count", 0)
+        pt_stage = calculate_ajcc_pt_stage(tumor_size)
+        pn_stage = calculate_ajcc_pn_stage(n_exam, n_pos)
+        stage_grp = calculate_ajcc_stage_group(pt_stage, pn_stage)
+        new_report.staging = {
+            "ajcc_version": "8th/9th Edition",
+            "pt_stage": pt_stage,
+            "pn_stage": pn_stage,
+            "pm_stage": "cM0",
+            "stage_group": stage_grp
+        }
+
+    db.add(new_report)
 
     audit_evt = AuditEvent(
         case_id=str(payload.case_id),
@@ -718,12 +794,22 @@ def amend_signed_report(payload: AmendReportPayload, db: Session = Depends(get_d
         stage="report",
         payload={
             "version": amendment_ver,
+            "report_version": new_version,
             "reason": payload.amendment_reason,
-            "amended_at": now_iso
+            "amended_at": now_iso,
+            "previous_version": current_report.version,
+            "previous_hash": current_report.integrity_hash
         }
     )
     db.add(audit_evt)
     db.commit()
-    db.refresh(report)
+    db.refresh(new_report)
+
+    # Re-render amended draft PDF
+    grading = db.scalars(select(Grading).where(Grading.case_id == case_uid)).first()
+    try:
+        render_and_upload_report_pdf(str(payload.case_id), new_report, grading, db)
+    except Exception as e:
+        print(f"[Amended PDF Render Note] {e}")
 
     return _build_report_response_dict(payload.case_id, db)

@@ -5,7 +5,7 @@ from app.core.config import settings
 class CurrentUser(BaseModel):
     id: str
     email: str
-    role: str # pathologist, technician, viewer
+    role: str # admin, pathologist, technician, viewer
 
 def get_current_user(
     x_user_id: str | None = Header(None, alias="X-User-Id"),
@@ -21,7 +21,7 @@ def get_current_user(
         role = x_user_role or settings.DEFAULT_MOCK_ROLE
         email = x_user_email or f"{user_id}@oncogemma.health"
         
-        if role not in ["pathologist", "technician", "viewer"]:
+        if role not in ["admin", "pathologist", "technician", "viewer"]:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"Invalid user role: {role}"

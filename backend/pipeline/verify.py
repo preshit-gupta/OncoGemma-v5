@@ -31,16 +31,18 @@ class HoVerNetMitosisVerifier:
         self.threshold = threshold
         self.device = device
         self.model = None
-        self.model_version = "hovernet_fast_mitosis@v1.2"
+        self.model_version = "od_heuristic@dev"
 
         if weights_path and os.path.exists(weights_path):
             try:
                 import torch
                 self.model = torch.load(weights_path, map_location=device)
+                self.model_version = "hovernet_fast_mitosis@v1.2"
                 print(f"[HoVerNetVerifier] Loaded weights from {weights_path}")
             except Exception as e:
                 print(f"[HoVerNetVerifier Warning] Failed to load {weights_path}: {e}. Using morphological verification engine.")
                 self.model = None
+                self.model_version = "od_heuristic@dev"
 
     def verify(self, crop_rgb: np.ndarray) -> Tuple[float, Optional[List[List[int]]]]:
         """

@@ -72,6 +72,9 @@ class VertexPathFoundationClient:
             rng = np.random.RandomState(42)
             return rng.randn(patch_count, 384).astype(np.float32)
 
+        if not patches or len(patches) == 0:
+            raise ValueError("Real patches are required when calling Vertex AI Path Foundation endpoint. Flat dummy images are prohibited.")
+
         try:
             from google.cloud import aiplatform
             aiplatform.init(
@@ -90,16 +93,13 @@ class VertexPathFoundationClient:
                 chunk_len = min(batch_size, patch_count - i)
                 instances = []
                 for j in range(chunk_len):
-                    if patches is not None and (i + j) < len(patches):
+                    if (i + j) < len(patches):
                         p_img = patches[i + j].convert("RGB").resize((224, 224), Image.BILINEAR)
                         buf = io.BytesIO()
                         p_img.save(buf, format="PNG")
                         b64_str = base64.b64encode(buf.getvalue()).decode("utf-8")
                     else:
-                        dummy_png = Image.new("RGB", (224, 224), color=(200, 200, 200))
-                        buf = io.BytesIO()
-                        dummy_png.save(buf, format="PNG")
-                        b64_str = base64.b64encode(buf.getvalue()).decode("utf-8")
+                        raise ValueError("Patch count exceeds available patches; dummy padding prohibited.")
 
                     instances.append({
                         "raw_image_bytes": b64_str,
@@ -129,9 +129,11 @@ class VertexPathFoundationClient:
 
             return np.vstack(all_embeddings)
         except Exception as e:
-            print(f"[Vertex AI Path Foundation Note] Endpoint error ({e}). Falling back to deterministic embeddings.")
-            rng = np.random.RandomState(42)
-            return rng.randn(patch_count, 384).astype(np.float32)
+            if settings.USE_MOCK_VERTEX_AI:
+                print(f"[Vertex AI Path Foundation Note] Endpoint error ({e}). Falling back to deterministic embeddings.")
+                rng = np.random.RandomState(42)
+                return rng.randn(patch_count, 384).astype(np.float32)
+            raise RuntimeError(f"Vertex AI Path Foundation prediction failed: {e}") from e
 
 
 def load_config(config_dir: str = "configs") -> tuple[dict, dict]:
@@ -234,13 +236,17 @@ def run_triage(stage_execution: StageExecution, session: Session) -> tuple[str, 
     patch_size_px = triage_cfg.get("patch_size_px", 224)
     stride_um = patch_size_px * mpp_target # 224 µm stride
 
-    mpp_x = float(getattr(slide_obj, "mpp_x", 0.25) or 0.25)
+    if not getattr(slide_obj, "mpp_x", None) or slide_obj.mpp_x <= 0 or not getattr(slide_obj, "mpp_y", None) or slide_obj.mpp_y <= 0:
+        raise ValueError(f"Slide {slide_obj.id} is missing valid MPP (status='needs_mpp'). Cannot execute triage stage.")
+
+    mpp_x = float(slide_obj.mpp_x)
+    mpp_y = float(slide_obj.mpp_y)
     width_px = int(getattr(slide_obj, "width_px", 20000) or 20000)
     height_px = int(getattr(slide_obj, "height_px", 20000) or 20000)
 
     # Compute grid dimensions
     width_um = width_px * mpp_x
-    height_um = height_px * mpp_x
+    height_um = height_px * mpp_y
 
     nx = max(1, int(np.ceil(width_um / stride_um)))
     ny = max(1, int(np.ceil(height_um / stride_um)))
@@ -273,7 +279,7 @@ def run_triage(stage_execution: StageExecution, session: Session) -> tuple[str, 
         ny = max(1, int(round(nx * (height_px / max(width_px, 1)))))
 
         stride_x_um = (width_px * mpp_x) / nx
-        stride_y_um = (height_px * mpp_x) / ny
+        stride_y_um = (height_px * mpp_y) / ny
         stride_um = stride_x_um
 
         stain_map = np.zeros((ny, nx), dtype=float)
@@ -310,15 +316,16 @@ def run_triage(stage_execution: StageExecution, session: Session) -> tuple[str, 
             tissue_mask_overview = np.ones((ny, nx), dtype=bool)
             stain_map = np.full((ny, nx), 0.5)
 
-        # 2. Sample real 224x224 patches from tissue locations for Google Path Foundation
+        # 2. Sample real 224px @ 1.0 mpp patches from tissue locations for Google Path Foundation
         sample_patches = []
+        sampled_cells = []
         tissue_coords = [(ix, iy) for iy in range(ny) for ix in range(nx) if tissue_mask_overview[iy, ix]]
 
         if os_slide and tissue_coords:
-            step = max(1, len(tissue_coords) // 16)
-            sampled_cells = tissue_coords[::step][:16]
+            step = max(1, len(tissue_coords) // 128)
+            candidate_cells = tissue_coords[::step][:128]
             patch_dim_px = int(round(224.0 / mpp_x))
-            for ix, iy in sampled_cells:
+            for ix, iy in candidate_cells:
                 try:
                     cx_px = int((ix + 0.5) * (width_px / nx))
                     cy_px = int((iy + 0.5) * (height_px / ny))
@@ -326,26 +333,63 @@ def run_triage(stage_execution: StageExecution, session: Session) -> tuple[str, 
                     y0 = max(0, min(height_px - patch_dim_px, cy_px - patch_dim_px // 2))
                     p_img = os_slide.read_region((x0, y0), 0, (patch_dim_px, patch_dim_px)).convert("RGB").resize((224, 224), Image.Resampling.BILINEAR)
                     sample_patches.append(p_img)
+                    sampled_cells.append((ix, iy))
                 except Exception as pe:
                     print(f"[Triage Patch Extract Note] {pe}")
+        elif not os_slide and tissue_coords:
+            sampled_cells = tissue_coords[:16]
+            if settings.USE_MOCK_VERTEX_AI:
+                sample_patches = [Image.new("RGB", (224, 224), (220, 200, 210)) for _ in sampled_cells]
+
+        gcs_parquet_path = f"cases/{case_id}/triage/pathfoundation_{model_version}.parquet"
+        cached_embeddings = None
+        try:
+            cached_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, gcs_parquet_path)
+            reader = pa.BufferReader(cached_bytes)
+            t = pq.read_table(reader)
+            cached_embeddings = t.to_pandas().values.astype(np.float32)
+            endpoint_calls_made = 0
+            print(f"[Triage Worker] Loaded cached Path Foundation embeddings from GCS ({cached_embeddings.shape})")
+        except Exception:
+            cached_embeddings = None
+
+        if not sample_patches and not settings.USE_MOCK_VERTEX_AI and cached_embeddings is None:
+            raise RuntimeError(f"Could not extract real 224px @ 1.0 mpp patches from slide for case {case_id}")
 
         patch_count = max(len(sample_patches), 1)
 
-        # 3. Call Live Vertex AI Path Foundation in asia-south1 (Mumbai)
-        if settings.VERTEX_PATH_FOUNDATION_ENDPOINT_ID and not settings.USE_MOCK_VERTEX_AI:
+        # 3. Call Live Vertex AI Path Foundation or use cached embeddings
+        if cached_embeddings is not None:
+            embeddings = cached_embeddings
+            endpoint_calls_made = 0
+        elif settings.VERTEX_PATH_FOUNDATION_ENDPOINT_ID and not settings.USE_MOCK_VERTEX_AI:
             client = VertexPathFoundationClient(
                 endpoint_id=settings.VERTEX_PATH_FOUNDATION_ENDPOINT_ID,
                 location=settings.VERTEX_PATH_FOUNDATION_LOCATION,
                 project_id=settings.GCP_PROJECT_ID,
                 api_endpoint=settings.VERTEX_PATH_FOUNDATION_API_ENDPOINT
             )
-            embeddings = client.predict_embeddings(patch_count=patch_count, patches=sample_patches if sample_patches else None, batch_size=16)
+            embeddings = client.predict_embeddings(patch_count=patch_count, patches=sample_patches, batch_size=16)
             endpoint_calls_made = patch_count
-        elif settings.USE_MOCK_VERTEX_AI or settings.ENV in ("dev", "test"):
+            try:
+                table = pa.Table.from_pandas(pd.DataFrame(embeddings))
+                pq.write_table(table, parquet_path)
+                with open(parquet_path, "rb") as pf:
+                    upload_blob_from_bytes(settings.GCS_ARTIFACTS_BUCKET, gcs_parquet_path, pf.read(), "application/octet-stream")
+            except Exception as pe:
+                print(f"[Triage Worker Parquet Save Note] {pe}")
+        elif settings.USE_MOCK_VERTEX_AI:
             embeddings = asyncio.run(mock_vertex_ai_endpoint(patch_count))
             endpoint_calls_made = patch_count
+            try:
+                table = pa.Table.from_pandas(pd.DataFrame(embeddings))
+                pq.write_table(table, parquet_path)
+                with open(parquet_path, "rb") as pf:
+                    upload_blob_from_bytes(settings.GCS_ARTIFACTS_BUCKET, gcs_parquet_path, pf.read(), "application/octet-stream")
+            except Exception as pe:
+                print(f"[Triage Worker Parquet Save Note] {pe}")
         else:
-            raise RuntimeError("Vertex AI Path Foundation Endpoint ID is required!")
+            raise RuntimeError("Vertex AI Path Foundation Endpoint ID is required when USE_MOCK_VERTEX_AI is false!")
 
         # 4. Predict Tumor Probabilities via Calibrated Linear Probe
         probe_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../models/probe"))
@@ -358,27 +402,26 @@ def run_triage(stage_execution: StageExecution, session: Session) -> tuple[str, 
         avg_path_prob = float(np.mean(raw_probs)) if len(raw_probs) > 0 else 0.60
         print(f"[Triage Worker] Path Foundation embeddings shape: {embeddings.shape}, Mean Tumor Probe Prob: {avg_path_prob:.3f}")
 
-        # 5. Build 2D probability grid [ny, nx] informed directly by Vertex AI Path Foundation probe
+        # 5. Build 2D probability grid [ny, nx] by mapping raw_probs directly back onto the (ix, iy) grid
         prob_grid = np.full((ny, nx), np.nan, dtype=np.float32)
 
-        if np.any(tissue_mask_overview):
-            tissue_densities = stain_map[tissue_mask_overview]
-            p10 = float(np.percentile(tissue_densities, 10))
-            p90 = float(np.percentile(tissue_densities, 90))
-            p_denom = max(p90 - p10, 1e-3)
+        n_match = min(len(sampled_cells), len(raw_probs))
+        if n_match > 0:
+            for k in range(n_match):
+                ix, iy = sampled_cells[k]
+                prob_grid[iy, ix] = float(np.clip(raw_probs[k], 0.05, 0.98))
 
-            for iy in range(ny):
-                for ix in range(nx):
-                    if tissue_mask_overview[iy, ix]:
-                        density = float(stain_map[iy, ix])
-                        norm_density = (density - p10) / p_denom
-                        # Blend Path Foundation probe score with normalized local nuclear density
-                        combined_prob = float(np.clip(
-                            0.35 * avg_path_prob + 0.65 * (0.15 + 0.82 * norm_density),
-                            0.08,
-                            0.98
-                        ))
-                        prob_grid[iy, ix] = combined_prob
+            matched_cells = sampled_cells[:n_match]
+            unsampled_tissue = [(ix, iy) for (ix, iy) in tissue_coords if np.isnan(prob_grid[iy, ix])]
+            if unsampled_tissue:
+                from scipy.spatial import KDTree
+                kdtree = KDTree(matched_cells)
+                _, nn_indices = kdtree.query(unsampled_tissue)
+                for (ux, uy), nn_idx in zip(unsampled_tissue, nn_indices):
+                    prob_grid[uy, ux] = float(np.clip(raw_probs[nn_idx], 0.05, 0.98))
+        elif tissue_coords:
+            for ix, iy in tissue_coords:
+                prob_grid[iy, ix] = avg_path_prob
 
         # Extract Hotspot ROIs
         hotspots = extract_hotspots(
@@ -424,8 +467,8 @@ def run_triage(stage_execution: StageExecution, session: Session) -> tuple[str, 
         except Exception as ne:
             print(f"[Triage Worker Note] Stain normalizer load note: {ne}")
 
-        mpp_x = float(getattr(slide_obj, "mpp_x", 0.25) or 0.25)
-        mpp_y = float(getattr(slide_obj, "mpp_y", 0.25) or 0.25)
+        mpp_x = float(slide_obj.mpp_x)
+        mpp_y = float(slide_obj.mpp_y)
 
         for hs in hotspots:
             hs_id = hs["id"]

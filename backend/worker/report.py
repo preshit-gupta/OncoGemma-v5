@@ -55,58 +55,85 @@ def run_report(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str, 
     hpfs = list(db.scalars(select(HpfSite).where(HpfSite.case_id == case_uid)).all())
     hotspots = list(db.scalars(select(Hotspot).where(Hotspot.case_id == case_uid)).all())
 
-    # 1. Extract verified Stage 4 & 5 values
-    grade_val = grading.grade if grading and grading.grade else 2
-    tubule_score = grading.tubule_score if grading and grading.tubule_score else 2
-    tubule_pct = grading.tubule_percent if grading and grading.tubule_percent is not None else 45.0
-    pleo_score = grading.pleo_score if grading and grading.pleo_score else 2
-    mitotic_score = grading.mitotic_score if grading and grading.mitotic_score else 2
-    nottingham_sum = grading.nottingham_sum if grading and grading.nottingham_sum else (tubule_score + pleo_score + mitotic_score)
-    histologic_type = grading.histologic_type if grading and grading.histologic_type else "IDC-NST"
+    # 1. Check if triage or case indicated benign (no invasive tumor)
+    input_ref = stage_exec.input_ref or {}
+    is_benign = bool(input_ref.get("benign_flag", False))
+
+    # Extract verified Stage 4 & 5 values
+    if is_benign:
+        histologic_type = "Benign / No invasive carcinoma identified"
+        grade_val = None
+        tubule_score = None
+        tubule_pct = None
+        pleo_score = None
+        mitotic_score = None
+        nottingham_sum = None
+        tumor_size = 0.0
+        pt_stage = "N/A"
+        pn_stage = "N/A"
+        stage_grp = "Benign"
+    else:
+        grade_val = grading.grade if grading and grading.grade else 2
+        tubule_score = grading.tubule_score if grading and grading.tubule_score else 2
+        tubule_pct = grading.tubule_percent if grading and grading.tubule_percent is not None else 45.0
+        pleo_score = grading.pleo_score if grading and grading.pleo_score else 2
+        mitotic_score = grading.mitotic_score if grading and grading.mitotic_score else 2
+        nottingham_sum = grading.nottingham_sum if grading and grading.nottingham_sum else (tubule_score + pleo_score + mitotic_score)
+        histologic_type = grading.histologic_type if grading and grading.histologic_type else "IDC-NST"
 
     # 2. Check existing report record or initialize default
-    report_record = db.scalars(select(Report).where(Report.case_id == case_uid)).first()
+    report_record = db.scalars(
+        select(Report).where(Report.case_id == case_uid).order_by(Report.version.desc())
+    ).first()
     if not report_record:
         report_record = Report(
             case_id=case_uid,
+            version=1,
             specimen_type="core_biopsy",
             procedure="Core Needle Biopsy",
             laterality="right",
             tumor_site="upper_outer_quadrant",
             histologic_type=histologic_type,
-            tumor_size_mm=18.0,
+            tumor_size_mm=0.0 if is_benign else None,
             lvi_status="absent",
             dcis_present=False,
-            margins={"status": "negative", "closest_margin_mm": 5.0, "closest_margin_name": "posterior", "positive_margins": []},
+            margins=None,
             lymph_nodes={"examined_count": 0, "positive_count": 0, "extranodal_extension": False, "largest_metastasis_mm": 0.0},
-            biomarkers={
-                "er": {"status": "positive", "percent": 95, "allred_score": 8},
-                "pr": {"status": "positive", "percent": 80, "allred_score": 7},
-                "her2": {"ihc_score": "1+", "fish_status": "not_performed", "result": "negative"},
-                "ki67": {"percent": 18}
-            },
+            biomarkers=None,
             status="draft"
         )
         db.add(report_record)
         db.flush()
 
     # 3. Deterministic AJCC Staging Calculation
-    tumor_size = report_record.tumor_size_mm or 18.0
-    nodes_info = report_record.lymph_nodes or {}
-    n_exam = nodes_info.get("examined_count", 0)
-    n_pos = nodes_info.get("positive_count", 0)
+    if is_benign:
+        report_record.histologic_type = histologic_type
+        report_record.tumor_size_mm = 0.0
+        report_record.staging = {
+            "ajcc_version": "8th/9th Edition",
+            "pt_stage": "N/A",
+            "pn_stage": "N/A",
+            "pm_stage": "cM0",
+            "stage_group": "Benign"
+        }
+    else:
+        tumor_size = report_record.tumor_size_mm
+        nodes_info = report_record.lymph_nodes or {}
+        n_exam = nodes_info.get("examined_count", 0)
+        n_pos = nodes_info.get("positive_count", 0)
 
-    pt_stage = calculate_ajcc_pt_stage(tumor_size)
-    pn_stage = calculate_ajcc_pn_stage(n_exam, n_pos)
-    stage_grp = calculate_ajcc_stage_group(pt_stage, pn_stage)
+        pt_stage = calculate_ajcc_pt_stage(tumor_size)
+        pn_stage = calculate_ajcc_pn_stage(n_exam, n_pos)
+        stage_grp = calculate_ajcc_stage_group(pt_stage, pn_stage)
 
-    report_record.staging = {
-        "ajcc_version": "8th/9th Edition",
-        "pt_stage": pt_stage,
-        "pn_stage": pn_stage,
-        "pm_stage": "cM0",
-        "stage_group": stage_grp
-    }
+        report_record.staging = {
+            "ajcc_version": "8th/9th Edition",
+            "pt_stage": pt_stage,
+            "pn_stage": pn_stage,
+            "pm_stage": "cM0",
+            "stage_group": stage_grp
+        }
+
 
     # 4. Synthesize Grounded Narrative via MedGemma 1.5
     prompt_tpl, prompt_hash = load_prompt_template("cap_report", "v1")
@@ -138,10 +165,18 @@ def run_report(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str, 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
-    narrative_dict = loop.run_until_complete(
-        medgemma_client.generate_cap_report_narrative(case_summary_payload, prompt_tpl)
-    )
+    if is_benign:
+        narrative_dict = {
+            "diagnosis_line": f"{report_record.laterality.upper()} BREAST, BIOPSY: BENIGN BREAST TISSUE, NEGATIVE FOR INVASIVE CARCINOMA.",
+            "microscopic_findings": "Sections show benign breast parenchyma without evidence of cytologic atypia, architectural disruption, or invasive carcinoma. No mitotic figures suspicious for malignancy identified.",
+            "clinical_correlation": "Negative for invasive or in-situ carcinoma. Follow-up as clinically indicated."
+        }
+    else:
+        narrative_dict = loop.run_until_complete(
+            medgemma_client.generate_cap_report_narrative(case_summary_payload, prompt_tpl)
+        )
     report_record.narrative = narrative_dict
+
 
     # 5. Generate Clinical PDF via temporary scratch directory
     scratch_dir = tempfile.mkdtemp(prefix="og_report_")

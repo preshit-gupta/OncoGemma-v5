@@ -14,6 +14,7 @@ export interface CaseDetail extends Case {
     gcs_uri_pyramid?: string;
     format?: string;
     scanner?: string;
+    status?: string;
     mpp_x?: number;
     mpp_y?: number;
     base_mag?: number;
@@ -761,5 +762,27 @@ export async function amendReport(payload: {
   }
   return res.json();
 }
+
+export async function updateSlideMpp(
+  caseId: string,
+  slideId: string,
+  mppX: number,
+  mppY?: number
+): Promise<any> {
+  const res = await fetch(`${API_BASE}/api/v1/cases/${caseId}/slides/${slideId}/mpp`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      "X-User-Role": "pathologist"
+    },
+    body: JSON.stringify({ mpp_x: mppX, mpp_y: mppY })
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: "Failed to update MPP" }));
+    throw new Error(err.detail || "Failed to update MPP");
+  }
+  return res.json();
+}
+
 
 

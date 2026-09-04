@@ -92,6 +92,8 @@ export function TriageViewer({
   const [isAddingRoiMode, setIsAddingRoiMode] = useState<boolean>(false);
   const [noInvasiveTumor, setNoInvasiveTumor] = useState<boolean>(false);
   const [excludeReasonInput, setExcludeReasonInput] = useState<{ [id: string]: string }>({});
+  const [deletedHotspotIds, setDeletedHotspotIds] = useState<string[]>([]);
+
 
   const fetchTriageData = async (silent: boolean = false) => {
     try {
@@ -105,6 +107,12 @@ export function TriageViewer({
       const json = await res.json();
       setData(json);
       setHotspotsList(json.effective_hotspots || []);
+      if (json.review_edits && Array.isArray(json.review_edits)) {
+        const deleted = json.review_edits
+          .filter((e: any) => e.op === "delete" && e.id)
+          .map((e: any) => e.id);
+        setDeletedHotspotIds(deleted);
+      }
     } catch (err: any) {
       if (!silent) setError(err.message || "Failed to load triage data");
     } finally {
@@ -154,8 +162,10 @@ export function TriageViewer({
   };
 
   const handleDeleteHotspot = (id: string) => {
+    setDeletedHotspotIds((prev) => Array.from(new Set([...prev, id])));
     setHotspotsList((prev) => prev.filter((h) => h.id !== id));
   };
+
 
   const handleAddRoiFromClick = (x_um: number, y_um: number) => {
     const half_um = 300.0;
@@ -188,14 +198,17 @@ export function TriageViewer({
   const handleSaveDraftEdits = async () => {
     try {
       setSubmitting(true);
-      const edits = hotspotsList.map((h) => {
-        if (h.excluded) {
-          return { op: "exclude", id: h.id, reason: h.exclude_reason };
-        } else if (h.source === "pathologist_added") {
-          return { op: "add", id: h.id, polygon_um: h.polygon_um, area_mm2: h.area_mm2 };
-        }
-        return { op: "modify", id: h.id, polygon_um: h.polygon_um };
-      });
+      const edits = [
+        ...deletedHotspotIds.map((id) => ({ op: "delete", id })),
+        ...hotspotsList.map((h) => {
+          if (h.excluded) {
+            return { op: "exclude", id: h.id, reason: h.exclude_reason };
+          } else if (h.source === "pathologist_added") {
+            return { op: "add", id: h.id, polygon_um: h.polygon_um, area_mm2: h.area_mm2 };
+          }
+          return { op: "modify", id: h.id, polygon_um: h.polygon_um };
+        })
+      ];
 
       const res = await fetch(`${API_BASE}/api/v1/stages/triage/edits`, {
         method: "POST",
@@ -210,6 +223,7 @@ export function TriageViewer({
         throw new Error("Failed to save draft edits");
       }
     } catch (err: any) {
+
       alert(`Error saving edits: ${err.message}`);
     } finally {
       setSubmitting(false);

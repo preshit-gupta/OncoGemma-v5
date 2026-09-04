@@ -3,7 +3,7 @@
 import React, { useEffect, useState } from "react";
 import Link from "next/link";
 import { ArrowLeft, RefreshCcw, Info, X, Microscope, AlertTriangle, CheckCircle2, RotateCcw } from "lucide-react";
-import { fetchCaseDetail, CaseDetail, retryStage, approveStage } from "@/lib/api";
+import { fetchCaseDetail, CaseDetail, retryStage, approveStage, updateSlideMpp } from "@/lib/api";
 import { formatISTDateTime } from "@/lib/utils";
 import dynamic from "next/dynamic";
 import { StageRail } from "@/components/viewer/StageRail";
@@ -95,6 +95,37 @@ export default function CaseWorkspacePage({ params }: { params: { id: string } }
   const isIngestDone = ingestStage?.status === "completed" || ingestStage?.status === "done";
   const isIngestRunning = ingestStage?.status === "running" || ingestStage?.status === "queued" || !ingestStage;
   const isIngestFailed = ingestStage?.status === "failed";
+  const isNeedsMpp = slide?.status === "needs_mpp" || caseDetail?.status === "needs_mpp" || (isIngestDone && (!slide?.mpp_x || slide?.mpp_x <= 0));
+
+  const [mppInput, setMppInput] = useState<string>("0.25");
+  const [mppYInput, setMppYInput] = useState<string>("");
+  const [mppSubmitting, setMppSubmitting] = useState<boolean>(false);
+  const [mppError, setMppError] = useState<string | null>(null);
+
+  const handleMppSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!slide?.id) return;
+    const valX = parseFloat(mppInput);
+    if (isNaN(valX) || valX <= 0) {
+      setMppError("Please enter a valid positive number for MPP X.");
+      return;
+    }
+    const valY = mppYInput ? parseFloat(mppYInput) : undefined;
+    if (valY !== undefined && (isNaN(valY) || valY <= 0)) {
+      setMppError("Please enter a valid positive number for MPP Y.");
+      return;
+    }
+    setMppSubmitting(true);
+    setMppError(null);
+    try {
+      await updateSlideMpp(caseId, slide.id, valX, valY);
+      await loadData();
+    } catch (err: any) {
+      setMppError(err?.message || "Failed to update MPP");
+    } finally {
+      setMppSubmitting(false);
+    }
+  };
 
   const isPreprocessDone = preprocessStage?.status === "done" || preprocessStage?.status === "confirmed" || preprocessStage?.status === "awaiting_review";
   const isTriageDone = triageStage?.status === "done" || triageStage?.status === "confirmed" || triageStage?.status === "awaiting_review";
@@ -213,9 +244,9 @@ export default function CaseWorkspacePage({ params }: { params: { id: string } }
               </span>
             </div>
             <div className="text-[11px] text-slate-400 flex items-center space-x-3 mt-0.5">
-              <span>MPP: {slide?.mpp_x || 0.25} µm/px</span>
+              <span>MPP: {slide?.mpp_x ? `${slide.mpp_x} µm/px` : "Needs Calibration (Missing MPP)"}</span>
               <span>•</span>
-              <span className="font-mono text-slate-300">Base Scan: {slide?.base_mag || 40}× Objective (400× Optical / {slide?.mpp_x || 0.25} µm/px)</span>
+              <span className="font-mono text-slate-300">Base Scan: {slide?.base_mag ? `${slide.base_mag}× Objective` : "Pending MPP"} {slide?.mpp_x ? `(400× Optical / ${slide.mpp_x} µm/px)` : ""}</span>
               <span>•</span>
               <span>Created: {formatISTDateTime(caseDetail?.created_at)}</span>
             </div>
@@ -368,6 +399,65 @@ export default function CaseWorkspacePage({ params }: { params: { id: string } }
                 >
                   Retry Ingest Stage
                 </button>
+              </div>
+            </div>
+          ) : isNeedsMpp ? (
+            <div className="flex flex-col items-center justify-center h-full text-slate-300 space-y-4 bg-slate-950 p-8">
+              <div className="relative w-16 h-16 flex items-center justify-center bg-amber-500/10 rounded-full border border-amber-500/30">
+                <AlertTriangle className="w-8 h-8 text-amber-400" />
+              </div>
+              <div className="text-center max-w-lg">
+                <h3 className="text-base font-bold text-white tracking-tight">Slide Calibration Required (Missing MPP)</h3>
+                <p className="text-xs text-slate-400 mt-2 leading-relaxed">
+                  Per PRD 01-stage-v4.0 §2.3 step 4, the whole-slide scanner did not record micrometers-per-pixel (MPP).
+                  Automatic guessing of 0.25 µm/px is strictly forbidden to prevent miscalculation of mitotic density and Nottingham Grade.
+                  Please enter the calibrated scanner MPP to begin preprocessing.
+                </p>
+                <form onSubmit={handleMppSubmit} className="mt-5 bg-slate-900 border border-slate-800 rounded-xl p-4 text-left space-y-3">
+                  <div>
+                    <label className="block text-[11px] font-medium text-slate-300 mb-1">
+                      MPP X (µm/pixel) <span className="text-rose-400">*</span>
+                    </label>
+                    <input
+                      type="number"
+                      step="0.000001"
+                      min="0.001"
+                      required
+                      value={mppInput}
+                      onChange={(e) => setMppInput(e.target.value)}
+                      placeholder="e.g. 0.25 for 40× or 0.50 for 20×"
+                      className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-sky-500 font-mono"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-medium text-slate-300 mb-1">
+                      MPP Y (µm/pixel) <span className="text-slate-500 text-[10px]">(optional, defaults to MPP X)</span>
+                    </label>
+                    <input
+                      type="number"
+                      step="0.000001"
+                      min="0.001"
+                      value={mppYInput}
+                      onChange={(e) => setMppYInput(e.target.value)}
+                      placeholder="Leave blank for square pixels"
+                      className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-sky-500 font-mono"
+                    />
+                  </div>
+                  {mppError && (
+                    <p className="text-[11px] text-rose-400 font-medium">{mppError}</p>
+                  )}
+                  <button
+                    type="submit"
+                    disabled={mppSubmitting}
+                    className="w-full bg-sky-600 hover:bg-sky-500 disabled:opacity-50 text-white text-xs font-semibold py-2 px-4 rounded-lg transition shadow flex items-center justify-center space-x-2"
+                  >
+                    {mppSubmitting ? (
+                      <span>Saving & Queuing Preprocess...</span>
+                    ) : (
+                      <span>Save Calibration & Queue Preprocess</span>
+                    )}
+                  </button>
+                </form>
               </div>
             </div>
           ) : activeStage === "report" ? (

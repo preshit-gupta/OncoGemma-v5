@@ -56,11 +56,17 @@ def ensure_schema_up_to_date():
     from sqlalchemy import text
     try:
         with engine.begin() as conn:
-            conn.execute(text("ALTER TABLE detections ADD COLUMN IF NOT EXISTS medgemma_verdict VARCHAR;"))
-            conn.execute(text("ALTER TABLE detections ADD COLUMN IF NOT EXISTS medgemma_rationale TEXT;"))
-            conn.execute(text("ALTER TABLE detections ADD COLUMN IF NOT EXISTS medgemma_confidence VARCHAR;"))
-            conn.execute(text("ALTER TABLE detections ALTER COLUMN medgemma_confidence TYPE VARCHAR USING medgemma_confidence::VARCHAR;"))
-            logger.info("[Database Schema] Verified all columns exist on 'detections' table.")
+            if conn.dialect.name == "postgresql":
+                conn.execute(text("ALTER TABLE detections ADD COLUMN IF NOT EXISTS medgemma_verdict VARCHAR;"))
+                conn.execute(text("ALTER TABLE detections ADD COLUMN IF NOT EXISTS medgemma_rationale TEXT;"))
+                conn.execute(text("ALTER TABLE detections ADD COLUMN IF NOT EXISTS medgemma_confidence VARCHAR;"))
+                conn.execute(text("ALTER TABLE detections ALTER COLUMN medgemma_confidence TYPE VARCHAR USING medgemma_confidence::VARCHAR;"))
+                conn.execute(text("ALTER TABLE slides ADD COLUMN IF NOT EXISTS status VARCHAR DEFAULT 'ready';"))
+            elif conn.dialect.name == "sqlite":
+                cols = [c[1] for c in conn.execute(text("PRAGMA table_info(slides);")).fetchall()]
+                if cols and "status" not in cols:
+                    conn.execute(text("ALTER TABLE slides ADD COLUMN status VARCHAR DEFAULT 'ready';"))
+            logger.info("[Database Schema] Verified all columns exist on 'detections' and 'slides' tables.")
 
             # On PostgreSQL: ensure foreign key constraints on child tables have ON DELETE CASCADE
             if conn.dialect.name == "postgresql":

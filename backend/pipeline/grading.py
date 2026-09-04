@@ -191,36 +191,56 @@ def validate_grading_invariants(
 
 def calculate_mitotic_score_from_hpfs(
     hpf_mitotic_counts: List[int],
-    cfg: Optional[Dict[str, Any]] = None
+    cfg: Optional[Dict[str, Any]] = None,
+    radius_um: float = 262.0
 ) -> Tuple[int, int]:
     """
-    Calculate total mitoses and Nottingham Mitotic Score (1, 2, or 3) across 10 standard HPFs.
+    Calculate total mitoses and Nottingham Mitotic Score (1, 2, or 3) across standard HPFs
+    using area-normalized density (mitoses/mm²).
     
     Standard Cutoffs for 10 HPFs (0.2157 mm² per HPF, 2.157 mm² total):
-    - Score 1: < 8 mitoses (< 3.7 / mm²)
-    - Score 2: 8 - 15 mitoses (3.7 - 7.2 / mm²)
-    - Score 3: >= 16 mitoses (> 7.2 / mm²)
+    - Score 1: < 3.65 / mm² (< 8 mitoses in 10 standard HPFs)
+    - Score 2: 3.65 - 7.30 / mm² (8 - 15 mitoses in 10 standard HPFs)
+    - Score 3: >= 7.30 / mm² (>= 16 mitoses in 10 standard HPFs)
     
     Returns:
         (total_mitoses, mitotic_score)
     """
     total_mitoses = sum(hpf_mitotic_counts) if hpf_mitotic_counts else 0
+    from pipeline.scoring import compute_nottingham_mitotic_score
+    n_hpf = len(hpf_mitotic_counts) if hpf_mitotic_counts else 10
+    summary = compute_nottingham_mitotic_score(
+        count_total=total_mitoses,
+        n_hpf=n_hpf,
+        radius_um=radius_um,
+        config_dict=cfg
+    )
+    return total_mitoses, summary["mitotic_score"]
+
+
+def calculate_mitotic_score_from_detections_and_hpfs(
+    detections: List[Dict[str, Any]],
+    hpfs: List[Dict[str, Any]],
+    cfg: Optional[Dict[str, Any]] = None
+) -> Tuple[int, int]:
+    """
+    Calculate total mitoses and Nottingham Mitotic Score (1, 2, or 3) across virtual HPFs,
+    ensuring that mitoses falling inside overlapping HPF circles are counted ONCE (no double counting).
+    Uses standardized area-normalized density (mitoses/mm²).
     
-    cutoff1 = 8
-    cutoff2 = 16
-    if cfg and "mitosis" in cfg:
-        mit_cfg = cfg["mitosis"].get("cutoffs", {})
-        cutoff1 = mit_cfg.get("score2_min", 8)
-        cutoff2 = mit_cfg.get("score3_min", 16)
-        
-    if total_mitoses < cutoff1:
-        score = 1
-    elif total_mitoses < cutoff2:
-        score = 2
-    else:
-        score = 3
-        
-    return total_mitoses, score
+    Returns:
+        (unique_total_mitoses, mitotic_score)
+    """
+    from pipeline.scoring import calculate_hpf_mitosis_counts, compute_nottingham_mitotic_score
+    updated_hpfs, unique_total = calculate_hpf_mitosis_counts(detections, hpfs)
+    r_um = updated_hpfs[0].get("radius_um", 262.0) if updated_hpfs else 262.0
+    summary = compute_nottingham_mitotic_score(
+        count_total=unique_total,
+        n_hpf=len(updated_hpfs) if updated_hpfs else 10,
+        radius_um=r_um,
+        config_dict=cfg
+    )
+    return unique_total, summary["mitotic_score"]
 
 
 def aggregate_grading_findings(

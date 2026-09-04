@@ -4,7 +4,7 @@ Integration tests for Stage 4 Mitosis REST API endpoints, live recompute, and sa
 import uuid
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -14,6 +14,7 @@ from app.models.case import Case
 from app.models.stage_execution import StageExecution
 from app.models.detection import Detection
 from app.models.hpf_site import HpfSite
+from app.models.report import Report
 
 SQLALCHEMY_DATABASE_URL = "sqlite:///:memory:"
 
@@ -214,3 +215,50 @@ def test_confirm_safety_gate_blocking_and_success(setup_test_case):
     )
     assert res_success.status_code == 200
     assert res_success.json()["next_stage"] == "grading"
+
+
+def test_confirm_mitosis_guards_signed_report(setup_test_case):
+    case_id = setup_test_case
+    case_uid = uuid.UUID(case_id)
+
+    db = TestingSessionLocal()
+    # Add a signed report
+    signed_rep = Report(
+        case_id=case_uid,
+        status="signed",
+        signed_by="Dr. Attending Pathologist",
+        signed_at=None,
+        integrity_hash="abcdef123456"
+    )
+    db.add(signed_rep)
+
+    # Set grading stage execution to done
+    grading_exec = StageExecution(
+        case_id=case_uid,
+        stage="grading",
+        attempt=1,
+        status="done"
+    )
+    db.add(grading_exec)
+    db.commit()
+    db.close()
+
+    # Clear unreviewed detections
+    client.post(
+        "/api/v1/stages/mitosis/bulk_action",
+        json={"case_id": case_id, "action": "reject_remaining_unreviewed", "reviewed_by": "pathologist_01"},
+        headers={"X-User-Role": "pathologist"}
+    )
+
+    # Calling confirm should succeed but NOT reset grading stage to queued
+    res_confirm = client.post(
+        "/api/v1/stages/mitosis/confirm",
+        json={"case_id": case_id, "reviewed_by": "pathologist_01"},
+        headers={"X-User-Role": "pathologist"}
+    )
+    assert res_confirm.status_code == 200
+
+    db = TestingSessionLocal()
+    g_exec = db.scalars(select(StageExecution).where(StageExecution.case_id == case_uid, StageExecution.stage == "grading")).first()
+    assert g_exec.status == "done"  # Preserved, not clobbered to queued
+    db.close()

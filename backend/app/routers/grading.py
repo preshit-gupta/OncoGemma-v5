@@ -34,12 +34,14 @@ from app.models.case import Case
 from app.models.slide import Slide
 from app.models.stage_execution import StageExecution
 from app.models.hpf_site import HpfSite
+from app.models.detection import Detection
 from app.models.grading import Grading
 from app.models.audit import AuditEvent
 from pipeline.grading import (
     calculate_nottingham_grade,
     calculate_tubule_score,
     calculate_mitotic_score_from_hpfs,
+    calculate_mitotic_score_from_detections_and_hpfs,
     aggregate_grading_findings,
     validate_grading_invariants,
     load_scoring_config
@@ -129,8 +131,28 @@ def _build_grading_stage_data_dict(
 
     if not grading_record or not grading_record.machine:
         hpf_sites = list(db.scalars(select(HpfSite).where(HpfSite.case_id == case_uid)).all())
-        total_mitoses = sum(getattr(h, "mitotic_count", 0) for h in hpf_sites) if hpf_sites else 0
-        m_score = 1 if total_mitoses < 8 else (2 if total_mitoses < 16 else 3)
+        confirmed_dets = list(db.scalars(select(Detection).where(Detection.case_id == case_uid, Detection.label == "mitosis")).all())
+        m_score = 1
+        total_mitoses = 0
+        if hpf_sites and confirmed_dets:
+            cands_for_score = [{"id": d.id, "centroid_um": d.centroid_um, "label": "mitosis"} for d in confirmed_dets]
+            hpfs_for_score = [{"seq": h.seq, "center_um": h.center_um, "radius_um": h.radius_um, "count": 0} for h in hpf_sites]
+            total_mitoses, m_score = calculate_mitotic_score_from_detections_and_hpfs(cands_for_score, hpfs_for_score)
+        elif hpf_sites:
+            hpf_counts = [getattr(h, "mitotic_count", 0) for h in hpf_sites]
+            r_um = float(getattr(hpf_sites[0], "radius_um", 262.0) or 262.0)
+            total_mitoses, m_score = calculate_mitotic_score_from_hpfs(hpf_counts, radius_um=r_um)
+        else:
+            try:
+                m_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/mitosis/output.json")
+                m_data = json.loads(m_bytes.decode("utf-8"))
+                if "summary" in m_data and "mitotic_score" in m_data["summary"]:
+                    m_score = m_data["summary"]["mitotic_score"]
+                    total_mitoses = m_data["summary"].get("total_mitoses", 0)
+            except Exception:
+                m_score = 1
+                total_mitoses = 0
+
 
         return {
             "case_id": str(case_id),
@@ -561,8 +583,9 @@ def get_patch_image(case_id: str, patch_id: str, db: Session = Depends(get_db)):
                 if patch_id.startswith("p_") and patch_id[2:].isdigit():
                     p_idx = int(patch_id[2:]) - 1
 
-                hotspots = list(db.scalars(select(Hotspot).where(Hotspot.case_id == case_uid)).all())
-                mpp_x = (slide.mpp_x or 0.25) if slide else 0.25
+                if not slide or not slide.mpp_x:
+                    raise HTTPException(status_code=400, detail="Slide is missing valid MPP (status='needs_mpp'). Cannot extract grading patch.")
+                mpp_x = float(slide.mpp_x)
 
                 if hotspots and p_idx < len(hotspots):
                     hs = hotspots[p_idx]
@@ -580,7 +603,9 @@ def get_patch_image(case_id: str, patch_id: str, db: Session = Depends(get_db)):
                     cx_px = 20000 + col * 3000
                     cy_px = 18000 + row * 3000
             else:
-                mpp_x = (slide.mpp_x or 0.25) if slide else 0.25
+                if not slide or not slide.mpp_x:
+                    raise HTTPException(status_code=400, detail="Slide is missing valid MPP (status='needs_mpp'). Cannot extract grading patch.")
+                mpp_x = float(slide.mpp_x)
 
             with OPENSLIDE_GLOBAL_LOCK:
                 oslide = openslide.OpenSlide(local_slide_path)
@@ -771,26 +796,34 @@ def confirm_grading_stage(payload: ConfirmGradingPayload, db: Session = Depends(
         stage_exec.reviewed_at = datetime.now(timezone.utc)
         stage_exec.reviewed_by = payload.reviewed_by
 
-    # 8. Queue Stage 6 (Report Generation)
+    # 8. Queue Stage 6 (Report Generation) - Guarded against overwriting signed reports
     next_exec = db.scalars(
         select(StageExecution).where(
             (StageExecution.case_id == case_uid) | (StageExecution.case_id == str(case_id)),
             StageExecution.stage == "report"
         )
     ).first()
-    if not next_exec:
-        next_exec = StageExecution(
-            case_id=case_uid,
-            stage="report",
-            attempt=1,
-            status="queued"
-        )
-        db.add(next_exec)
-    else:
-        next_exec.status = "queued"
-        next_exec.started_at = None
-        next_exec.completed_at = None
-        next_exec.error = None
+    from app.models.report import Report
+    existing_report = db.scalars(
+        select(Report).where(Report.case_id == case_uid)
+    ).first()
+
+
+    if not (existing_report and existing_report.status in ("signed", "amended")):
+        if not next_exec:
+            next_exec = StageExecution(
+                case_id=case_uid,
+                stage="report",
+                attempt=1,
+                status="queued"
+            )
+            db.add(next_exec)
+        elif next_exec.status not in ("confirmed", "done"):
+            next_exec.status = "queued"
+            next_exec.started_at = None
+            next_exec.completed_at = None
+            next_exec.error = None
+
 
     # 9. Record Audit Events
     audit_confirm = AuditEvent(

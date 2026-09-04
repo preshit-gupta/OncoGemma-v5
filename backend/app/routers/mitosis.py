@@ -166,8 +166,8 @@ def get_mitosis_stage_data(case_id: str, db: Session = Depends(get_db)):
     slide_info = {
         "width_px": slide_obj.width_px if slide_obj else 20000,
         "height_px": slide_obj.height_px if slide_obj else 20000,
-        "mpp_x": float(slide_obj.mpp_x) if slide_obj and slide_obj.mpp_x else 0.25,
-        "mpp_y": float(slide_obj.mpp_y) if slide_obj and slide_obj.mpp_y else 0.25
+        "mpp_x": float(slide_obj.mpp_x) if slide_obj and slide_obj.mpp_x else None,
+        "mpp_y": float(slide_obj.mpp_y) if slide_obj and slide_obj.mpp_y else None
     }
 
     return {
@@ -226,7 +226,10 @@ def get_candidate_crop(
     stmt = select(Slide).where((Slide.case_id == case_uid) | (Slide.case_id == str(case_id))).limit(1)
     slide_obj = db.scalars(stmt).first()
 
-    if not det or not slide_obj:
+    if not slide_obj or not getattr(slide_obj, "mpp_x", None) or slide_obj.mpp_x <= 0 or not getattr(slide_obj, "mpp_y", None) or slide_obj.mpp_y <= 0:
+        raise HTTPException(status_code=400, detail="Slide is missing valid MPP (status='needs_mpp'). Cannot extract crop.")
+
+    if not det:
         rehydrate_case_from_gcs(case_id, db)
         det = db.scalars(
             select(Detection).where(
@@ -234,9 +237,6 @@ def get_candidate_crop(
                 Detection.id == candidate_id
             )
         ).first()
-        slide_obj = db.scalars(stmt).first()
-        if not slide_obj:
-            slide_obj = db.scalars(select(Slide)).first()
 
     cx_um = None
     cy_um = None
@@ -254,6 +254,12 @@ def get_candidate_crop(
             pass
 
     if cx_um is not None and cy_um is not None:
+        if not slide_obj or not getattr(slide_obj, "mpp_x", None) or slide_obj.mpp_x <= 0 or not getattr(slide_obj, "mpp_y", None) or slide_obj.mpp_y <= 0:
+            raise HTTPException(status_code=400, detail="Slide is missing valid MPP (status='needs_mpp'). Cannot extract crop.")
+
+        mpp_x = float(slide_obj.mpp_x)
+        mpp_y = float(slide_obj.mpp_y)
+
         try:
             gcs_uri_original = resolve_slide_raw_uri(case_id, slide_obj) or getattr(slide_obj, "gcs_uri_original", None) or f"gs://{settings.GCS_RAW_BUCKET}/cases/{case_id}/slide.svs"
             raw_bucket_name, r_blob_name = parse_gcs_uri(gcs_uri_original)
@@ -265,8 +271,6 @@ def get_candidate_crop(
                     os_slide = None
                     try:
                         os_slide = openslide.OpenSlide(local_slide_path)
-                        mpp_x = float(os_slide.properties.get(openslide.PROPERTY_NAME_MPP_X, 0.265018))
-                        mpp_y = float(os_slide.properties.get(openslide.PROPERTY_NAME_MPP_Y, mpp_x))
                         crop_size_px = 128
                         half_crop_px = crop_size_px // 2
                         cx_px = int(cx_um / mpp_x)
@@ -346,14 +350,14 @@ def get_hpf_thumbnail(
     stmt = select(Slide).where((Slide.case_id == case_uid) | (Slide.case_id == str(case_id))).limit(1)
     slide_obj = db.scalars(stmt).first()
 
-    if not hpf_site or not slide_obj:
+    if not slide_obj or not getattr(slide_obj, "mpp_x", None) or slide_obj.mpp_x <= 0 or not getattr(slide_obj, "mpp_y", None) or slide_obj.mpp_y <= 0:
+        raise HTTPException(status_code=400, detail="Slide is missing valid MPP (status='needs_mpp'). Cannot extract HPF thumbnail.")
+
+    if not hpf_site:
         rehydrate_case_from_gcs(case_id, db)
         hpf_site = db.scalars(
             select(HpfSite).where((HpfSite.case_id == case_uid) | (HpfSite.case_id == str(case_id)), HpfSite.seq == seq)
         ).first()
-        slide_obj = db.scalars(stmt).first()
-        if not slide_obj:
-            slide_obj = db.scalars(select(Slide)).first()
 
     cx_um = None
     cy_um = None
@@ -373,8 +377,11 @@ def get_hpf_thumbnail(
     if cx_um is None or cy_um is None:
         cx_um, cy_um = 1423.8, 2371.9
 
-    mpp_x = float(getattr(slide_obj, "mpp_x", 0.265018) or 0.265018)
-    mpp_y = float(getattr(slide_obj, "mpp_y", 0.265018) or mpp_x)
+    if not slide_obj or not getattr(slide_obj, "mpp_x", None) or slide_obj.mpp_x <= 0 or not getattr(slide_obj, "mpp_y", None) or slide_obj.mpp_y <= 0:
+        raise HTTPException(status_code=400, detail="Slide is missing valid MPP (status='needs_mpp'). Cannot extract HPF thumbnail.")
+
+    mpp_x = float(slide_obj.mpp_x)
+    mpp_y = float(slide_obj.mpp_y)
 
     # Resolution mapping calibrated to frontend HPF reticle canvas (r=236 px -> radius_um=262.0)
     field_size_um = 577.29
@@ -569,14 +576,23 @@ def add_pathologist_mitosis(payload: AddCandidatePayload, db: Session = Depends(
     new_id = f"m_user_{count_dets + 1:03d}"
 
     # Generate crop via transient scratch dir
-    stmt = select(Slide).where(Slide.case_id == case_id).limit(1)
+    try:
+        case_uid = uuid.UUID(str(case_id))
+    except Exception:
+        case_uid = case_id
+    stmt = select(Slide).where((Slide.case_id == case_id) | (Slide.case_id == case_uid)).limit(1)
     slide_obj = db.scalars(stmt).first()
-    mpp_x = float(getattr(slide_obj, "mpp_x", 0.25) or 0.25)
+    if slide_obj:
+        if not getattr(slide_obj, "mpp_x", None):
+            raise HTTPException(status_code=400, detail="Slide is missing valid MPP (status='needs_mpp'). Cannot generate crop.")
+        mpp_x = float(slide_obj.mpp_x)
+    else:
+        mpp_x = None
 
     scratch_dir = tempfile.mkdtemp(prefix="og_add_mit_")
     crop_pil = None
     try:
-        if slide_obj:
+        if slide_obj and mpp_x:
             gcs_uri_original = resolve_slide_raw_uri(case_id, slide_obj) or getattr(slide_obj, "gcs_uri_original", None) or f"gs://{settings.GCS_RAW_BUCKET}/cases/{case_id}/{slide_obj.id}.svs"
             raw_bucket_name, blob_name = parse_gcs_uri(gcs_uri_original)
             ext = os.path.splitext(blob_name)[1] or ".svs"
@@ -694,11 +710,15 @@ def re_place_hpfs(payload: BulkActionPayload, db: Session = Depends(get_db)):
 
     # Fetch slide dimensions and MPP for accurate physical metric
     slide_row = db.scalars(select(Slide).where((Slide.case_id == case_uid) | (Slide.case_id == str(case_id)))).first()
-    mpp_x = float(getattr(slide_row, "mpp_x", 0.25) or 0.25) if slide_row else 0.25
-    mpp_y = float(getattr(slide_row, "mpp_y", 0.25) or 0.25) if slide_row else 0.25
-    w_px = float(getattr(slide_row, "width_px", 20000) or 20000) if slide_row else 20000.0
-    h_px = float(getattr(slide_row, "height_px", 20000) or 20000) if slide_row else 20000.0
-    slide_dims_um = (w_px * mpp_x, h_px * mpp_y)
+    slide_dims_um = None
+    if slide_row:
+        if not getattr(slide_row, "mpp_x", None) or not getattr(slide_row, "mpp_y", None):
+            raise HTTPException(status_code=400, detail="Slide is missing valid MPP (status='needs_mpp'). Cannot compute HPF scores.")
+        mpp_x = float(slide_row.mpp_x)
+        mpp_y = float(slide_row.mpp_y)
+        w_px = float(getattr(slide_row, "width_px", 20000) or 20000)
+        h_px = float(getattr(slide_row, "height_px", 20000) or 20000)
+        slide_dims_um = (w_px * mpp_x, h_px * mpp_y)
 
     # Fetch preprocess tissue mask from GCS
     tissue_mask = None
@@ -797,8 +817,13 @@ def confirm_mitosis_stage(payload: MitosisConfirmPayload, db: Session = Depends(
     stage_exec.reviewed_at = datetime.now(timezone.utc)
     stage_exec.reviewed_by = payload.reviewed_by
 
-    # Queue Stage 5 (grading)
+    # Queue Stage 5 (grading) - Guarded against overwriting signed reports
     case_uid = to_uuid(case_id)
+    from app.models.report import Report
+    existing_report = db.scalars(
+        select(Report).where(Report.case_id == case_uid)
+    ).first()
+
     next_exec = db.scalars(
         select(StageExecution).where(
             (StageExecution.case_id == case_uid) | (StageExecution.case_id == str(case_id)),
@@ -806,19 +831,66 @@ def confirm_mitosis_stage(payload: MitosisConfirmPayload, db: Session = Depends(
         )
     ).first()
 
-    if not next_exec:
-        next_exec = StageExecution(
-            case_id=case_uid,
-            stage="grading",
-            attempt=1,
-            status="queued"
+    if not (existing_report and existing_report.status in ("signed", "amended")):
+        if not next_exec:
+            next_exec = StageExecution(
+                case_id=case_uid,
+                stage="grading",
+                attempt=1,
+                status="queued"
+            )
+            db.add(next_exec)
+        elif next_exec.status not in ("confirmed", "done"):
+            next_exec.status = "queued"
+            next_exec.started_at = None
+            next_exec.completed_at = None
+            next_exec.error = None
+
+    # Synchronize confirmed detections & HPFs back to GCS output.json
+    try:
+        from pipeline.grading import calculate_mitotic_score_from_detections_and_hpfs
+        all_dets = db.scalars(select(Detection).where((Detection.case_id == case_uid) | (Detection.case_id == str(case_id)))).all()
+        hpf_rows = db.scalars(select(HpfSite).where((HpfSite.case_id == case_uid) | (HpfSite.case_id == str(case_id))).order_by(HpfSite.seq.asc())).all()
+        cand_dicts = [
+            {
+                "id": d.id,
+                "centroid_um": d.centroid_um,
+                "label": d.label,
+                "label_source": d.label_source,
+                "det_conf": d.det_conf,
+                "ver_conf": d.ver_conf,
+                "hotspot_id": d.hotspot_id,
+                "crop_uri": d.crop_uri,
+                "crop_orig_uri": d.crop_orig_uri
+            }
+            for d in all_dets
+        ]
+        hpf_dicts = [
+            {"seq": h.seq, "center_um": h.center_um, "radius_um": h.radius_um, "count": h.mitotic_count, "source": h.source}
+            for h in hpf_rows
+        ]
+        total_m, conf_score = calculate_mitotic_score_from_detections_and_hpfs(cand_dicts, hpf_dicts)
+        r_um = hpf_dicts[0]["radius_um"] if hpf_dicts else 262.0
+        scoring_summary = compute_nottingham_mitotic_score(count_total=total_m, n_hpf=len(hpf_dicts) or 10, radius_um=r_um)
+
+        existing_out = {}
+        try:
+            raw_out = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/mitosis/output.json")
+            existing_out = json.loads(raw_out.decode("utf-8"))
+        except Exception:
+            pass
+        existing_out["case_id"] = str(case_id)
+        existing_out["candidates"] = cand_dicts
+        existing_out["hpfs"] = hpf_dicts
+        existing_out["summary"] = scoring_summary
+        upload_blob_from_bytes(
+            settings.GCS_ARTIFACTS_BUCKET,
+            f"cases/{case_id}/mitosis/output.json",
+            json.dumps(existing_out, indent=2).encode("utf-8"),
+            "application/json"
         )
-        db.add(next_exec)
-    else:
-        next_exec.status = "queued"
-        next_exec.started_at = None
-        next_exec.completed_at = None
-        next_exec.error = None
+    except Exception as ge:
+        print(f"[Confirm Mitosis GCS Sync Note] {ge}")
 
     audit = AuditEvent(
         case_id=case_id,

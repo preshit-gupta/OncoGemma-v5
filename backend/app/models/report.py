@@ -17,39 +17,35 @@ class Report(Base):
     case_id: Mapped[uuid.UUID] = mapped_column(
         GUID, ForeignKey("cases.id", ondelete="CASCADE"), primary_key=True
     )
+    version: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
     specimen_type: Mapped[str] = mapped_column(String, nullable=False, default="core_biopsy")
     procedure: Mapped[str] = mapped_column(String, nullable=False, default="Core Needle Biopsy")
     laterality: Mapped[str] = mapped_column(String, nullable=False, default="right")
     tumor_site: Mapped[str] = mapped_column(String, nullable=False, default="upper_outer_quadrant")
     histologic_type: Mapped[str] = mapped_column(String, nullable=False, default="IDC-NST")
-    tumor_size_mm: Mapped[Optional[float]] = mapped_column(Float, nullable=True, default=18.0)
+    tumor_size_mm: Mapped[Optional[float]] = mapped_column(Float, nullable=True, default=None)
     lvi_status: Mapped[str] = mapped_column(String, nullable=False, default="absent")
     dcis_present: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     
-    margins: Mapped[Dict[str, Any]] = mapped_column(
+    margins: Mapped[Optional[Dict[str, Any]]] = mapped_column(
         JSON_TYPE,
-        nullable=False,
-        default=lambda: {"status": "negative", "closest_margin_mm": 5.0, "closest_margin_name": "posterior", "positive_margins": []}
+        nullable=True,
+        default=None
     )
     lymph_nodes: Mapped[Dict[str, Any]] = mapped_column(
         JSON_TYPE,
         nullable=False,
         default=lambda: {"examined_count": 0, "positive_count": 0, "extranodal_extension": False, "largest_metastasis_mm": 0.0}
     )
-    biomarkers: Mapped[Dict[str, Any]] = mapped_column(
+    biomarkers: Mapped[Optional[Dict[str, Any]]] = mapped_column(
         JSON_TYPE,
-        nullable=False,
-        default=lambda: {
-            "er": {"status": "positive", "percent": 95, "allred_score": 8},
-            "pr": {"status": "positive", "percent": 80, "allred_score": 7},
-            "her2": {"ihc_score": "1+", "fish_status": "not_performed", "result": "negative"},
-            "ki67": {"percent": 18}
-        }
+        nullable=True,
+        default=None
     )
     staging: Mapped[Dict[str, Any]] = mapped_column(
         JSON_TYPE,
         nullable=False,
-        default=lambda: {"ajcc_version": "8th/9th Edition", "pt_stage": "pT1c", "pn_stage": "pNX", "pm_stage": "cM0", "stage_group": "IA"}
+        default=lambda: {"ajcc_version": "8th/9th Edition", "pt_stage": "pTX", "pn_stage": "pNX", "pm_stage": "cM0", "stage_group": "Unknown"}
     )
     narrative: Mapped[Dict[str, Any]] = mapped_column(
         JSON_TYPE,
@@ -83,4 +79,4 @@ class Report(Base):
         onupdate=lambda: datetime.now(timezone.utc)
     )
 
-    case = relationship("Case", back_populates="report")
+    case = relationship("Case", back_populates="reports")

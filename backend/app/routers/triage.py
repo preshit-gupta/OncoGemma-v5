@@ -316,8 +316,11 @@ def get_hotspot_thumbnail(
     if not slide_obj:
         slide_obj = db.scalars(select(Slide)).first()
 
-    mpp_x = float(getattr(slide_obj, "mpp_x", 0.25) or 0.25)
-    mpp_y = float(getattr(slide_obj, "mpp_y", 0.25) or mpp_x)
+    if not slide_obj or not getattr(slide_obj, "mpp_x", None) or not getattr(slide_obj, "mpp_y", None):
+        raise HTTPException(status_code=400, detail="Slide is missing valid MPP (status='needs_mpp'). Cannot extract patch.")
+
+    mpp_x = float(slide_obj.mpp_x)
+    mpp_y = float(slide_obj.mpp_y)
 
     cx_um = None
     cy_um = None
@@ -581,12 +584,13 @@ def confirm_triage(payload: TriageConfirmPayload, db: Session = Depends(get_db))
             input_ref=input_data
         )
         db.add(next_exec)
-    else:
+    elif next_exec.status not in ("confirmed", "done"):
         next_exec.status = "queued"
         next_exec.input_ref = input_data
         next_exec.started_at = None
         next_exec.completed_at = None
         next_exec.error = None
+
 
     audit = AuditEvent(
         case_id=payload.case_id,

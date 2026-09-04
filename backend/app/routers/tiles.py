@@ -54,8 +54,10 @@ def generate_tile_on_the_fly(
 
             slide_w = float(getattr(slide_obj, "width_px", 2048) or 2048)
             slide_h = float(getattr(slide_obj, "height_px", 2048) or 2048)
-            mpp_x = float(getattr(slide_obj, "mpp_x", 0.25) or 0.25)
-            mpp_y = float(getattr(slide_obj, "mpp_y", 0.25) or 0.25)
+            if not getattr(slide_obj, "mpp_x", None) or not getattr(slide_obj, "mpp_y", None):
+                raise HTTPException(status_code=400, detail="Slide is missing valid MPP (status='needs_mpp'). Cannot render tile.")
+            mpp_x = float(slide_obj.mpp_x)
+            mpp_y = float(slide_obj.mpp_y)
 
             max_dim = max(slide_w, slide_h)
             max_level = int(math.ceil(math.log2(max_dim))) if max_dim > 0 else 11

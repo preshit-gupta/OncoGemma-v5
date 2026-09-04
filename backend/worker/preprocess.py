@@ -44,8 +44,7 @@ def generate_norm_dzi_pyramid(slide_obj, normalizer, local_slide_path: str, scra
         slide = openslide.OpenSlide(local_slide_path)
         dz = DeepZoomGenerator(slide, tile_size=256, overlap=0, limit_bounds=False)
         
-        max_norm_pregen_level = min(12, dz.level_count)
-        for level in range(0, max_norm_pregen_level):
+        for level in range(0, dz.level_count):
             norm_level_dir = os.path.join(norm_pyramid_dir, str(level))
             os.makedirs(norm_level_dir, exist_ok=True)
             cols, rows = dz.level_tiles[level]
@@ -124,6 +123,13 @@ def run_preprocess(stage_execution: StageExecution, session: Session) -> tuple[s
     if not slide_obj:
         raise ValueError(f"Slide object {slide_id} not found in database")
 
+    # Halt preprocess stage if MPP is missing per PRD 01-stage-v4.0 §2.3 step 4
+    if not getattr(slide_obj, "mpp_x", None) or slide_obj.mpp_x <= 0 or not getattr(slide_obj, "mpp_y", None) or slide_obj.mpp_y <= 0:
+        raise ValueError(f"Slide {slide_id} is missing valid MPP (status='needs_mpp'). Cannot execute preprocess stage.")
+
+    mpp_x = float(slide_obj.mpp_x)
+    mpp_y = float(slide_obj.mpp_y)
+
     scratch_dir = tempfile.mkdtemp(prefix="og_preprocess_")
 
     try:
@@ -138,9 +144,6 @@ def run_preprocess(stage_execution: StageExecution, session: Session) -> tuple[s
 
         if not os.path.exists(local_slide_path):
             raise FileNotFoundError(f"Raw slide file not found in GCS for preprocess stage in case {case_id}")
-
-        mpp_x = float(getattr(slide_obj, "mpp_x", 0.25) or 0.25)
-        mpp_y = float(getattr(slide_obj, "mpp_y", 0.25) or 0.25)
         checksum = getattr(slide_obj, "checksum_sha256", "default_checksum") or "default_checksum"
 
         try:
@@ -158,7 +161,13 @@ def run_preprocess(stage_execution: StageExecution, session: Session) -> tuple[s
             mpp_y=mpp_y
         )
 
-        px_area_mm2 = (8.0 * mpp_x / 0.25) * (8.0 * mpp_y / 0.25) * 1e-6
+        slide_w_px = float(getattr(slide_obj, "width_px", 2048) or 2048)
+        slide_h_px = float(getattr(slide_obj, "height_px", 2048) or 2048)
+        if hasattr(slide, "dimensions"):
+            slide_w_px, slide_h_px = float(slide.dimensions[0]), float(slide.dimensions[1])
+        thumb_w_um = min(50000.0, slide_w_px * mpp_x)
+        thumb_h_um = min(50000.0, slide_h_px * mpp_y)
+        px_area_mm2 = (thumb_w_um / 512.0) * (thumb_h_um / 512.0) * 1e-6
         tissue_area_mm2 = float(np.count_nonzero(tissue_mask_1bit) * px_area_mm2)
 
         from pipeline.tiles import check_icc_profile

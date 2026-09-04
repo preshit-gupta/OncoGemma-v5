@@ -28,17 +28,19 @@ class YoloMitosisDetector:
         self.device = device
         self.weights_path = weights_path
         self.model = None
-        self.model_version = "midog22_yolov8x_sweep@v1.0"
+        self.model_version = "od_heuristic@dev"
 
         if weights_path and os.path.exists(weights_path):
             try:
                 import torch
                 # If torch and model weights are present, attempt loading
                 self.model = torch.load(weights_path, map_location=device)
+                self.model_version = "midog22_yolov8x_sweep@v1.0"
                 print(f"[MitosisDetector] Loaded published weights from {weights_path}")
             except Exception as e:
                 print(f"[MitosisDetector Warning] Failed to load {weights_path}: {e}. Running in algorithmic fallback mode.")
                 self.model = None
+                self.model_version = "od_heuristic@dev"
 
     def detect(self, tile_rgb: np.ndarray) -> List[Tuple[float, float, float]]:
         """
@@ -184,7 +186,7 @@ def apply_global_nms(
 def enumerate_hotspot_tiles(
     hotspot_polygon_um: List[List[float]],
     tile_size_px: int = 1024,
-    mpp: float = 0.25,
+    mpp: float | None = None,
     stride_px: int = 960,
     tissue_mask: Optional[np.ndarray] = None,
     slide_dimensions_um: Optional[Tuple[float, float]] = None,
@@ -197,6 +199,9 @@ def enumerate_hotspot_tiles(
     """
     if not hotspot_polygon_um:
         return []
+
+    if mpp is None or mpp <= 0:
+        raise ValueError(f"Valid positive MPP is required for tile enumeration, got: {mpp}")
 
     xs = [p[0] for p in hotspot_polygon_um]
     ys = [p[1] for p in hotspot_polygon_um]

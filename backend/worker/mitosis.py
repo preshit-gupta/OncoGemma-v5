@@ -83,8 +83,11 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
         raise ValueError(f"No slide found for case {case_id}")
 
     slide_id = str(slide_obj.id)
-    mpp_x = float(getattr(slide_obj, "mpp_x", 0.25) or 0.25)
-    mpp_y = float(getattr(slide_obj, "mpp_y", 0.25) or 0.25)
+    if not getattr(slide_obj, "mpp_x", None) or slide_obj.mpp_x <= 0 or not getattr(slide_obj, "mpp_y", None) or slide_obj.mpp_y <= 0:
+        raise ValueError(f"Slide {slide_id} is missing valid MPP (status='needs_mpp'). Cannot execute mitosis stage.")
+
+    mpp_x = float(slide_obj.mpp_x)
+    mpp_y = float(slide_obj.mpp_y)
     width_px = int(getattr(slide_obj, "width_px", 20000) or 20000)
     height_px = int(getattr(slide_obj, "height_px", 20000) or 20000)
 
@@ -170,9 +173,11 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
         hotspots.sort(key=lambda h: (h.get("prob_mean") or 0.0), reverse=True)
         print(f"[Worker:Mitosis] Prioritized {len(hotspots)} confirmed hotspots by cellular density: {[h['id'] for h in hotspots]}")
 
-        # Initialize detectors & verifiers
-        detector = YoloMitosisDetector(conf_threshold=det_thresh)
-        verifier = HoVerNetMitosisVerifier(threshold=ver_thresh)
+        # Initialize detectors & verifiers with weights from config
+        det_weights = det_cfg.get("weights_path")
+        ver_weights = ver_cfg.get("weights_path")
+        detector = YoloMitosisDetector(weights_path=det_weights, conf_threshold=det_thresh)
+        verifier = HoVerNetMitosisVerifier(weights_path=ver_weights, threshold=ver_thresh)
 
         # Download raw slide from GCS to transient scratch file for tile & crop sampling
         gcs_uri_original = resolve_slide_raw_uri(case_id, slide_obj) or slide_obj.gcs_uri_original or f"gs://{settings.GCS_RAW_BUCKET}/cases/{case_id}/{slide_id}.svs"
@@ -189,7 +194,8 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
                     openslide_slide = openslide.OpenSlide(local_slide_path)
                     print(f"[Worker:Mitosis] Successfully opened SVS slide with OpenSlide from GCS {blob_name}")
         except Exception as e:
-            print(f"[Worker:Mitosis Warning] Could not open slide with OpenSlide: {e}")
+            print(f"[Worker:Mitosis Error] Could not open slide with OpenSlide: {e}")
+            raise RuntimeError(f"Could not open slide for case {case_id} ({raw_bucket_name}/{blob_name}): {e}") from e
 
         if openslide_slide is None:
             raise RuntimeError(f"Could not open authentic gigapixel slide for case {case_id} ({raw_bucket_name}/{blob_name}). Aborting Stage 4 to prevent synthetic mock generation.")
@@ -491,8 +497,38 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
             except Exception:
                 pass
 
+        # Fetch existing pathologist detections before re-populating to preserve reviews & additions
+        existing_pathologist_dets = list(
+            db.scalars(
+                select(Detection).where(
+                    Detection.case_id == case_obj.id,
+                    Detection.label_source == "pathologist"
+                )
+            ).all()
+        )
+        existing_pathologist_ids = {d.id for d in existing_pathologist_dets}
+
+        # Combine model candidates and preserved pathologist detections
+        all_candidates = []
+        for cand in candidates:
+            if cand["id"] not in existing_pathologist_ids:
+                all_candidates.append(cand)
+        for pd in existing_pathologist_dets:
+            all_candidates.append({
+                "id": pd.id,
+                "case_id": str(case_obj.id),
+                "hotspot_id": pd.hotspot_id,
+                "centroid_um": pd.centroid_um,
+                "det_conf": pd.det_conf,
+                "ver_conf": pd.ver_conf,
+                "label": pd.label,
+                "label_source": "pathologist",
+                "crop_uri": pd.crop_uri,
+                "crop_orig_uri": pd.crop_orig_uri
+            })
+
         # Calculate HPF Mitotic Containment Counts
-        hpfs, total_mitoses_in_hpfs = calculate_hpf_mitosis_counts(candidates, hpfs)
+        hpfs, total_mitoses_in_hpfs = calculate_hpf_mitosis_counts(all_candidates, hpfs)
 
         # Calculate Nottingham Mitotic Score
         scoring_summary = compute_nottingham_mitotic_score(
@@ -501,11 +537,18 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
             radius_um=radius_um
         )
 
-        # Persist to Database (detections & hpf_sites tables)
-        db.execute(delete(Detection).where(Detection.case_id == case_obj.id))
+        # Persist to Database: preserve pathologist annotations, only replace model detections
+        db.execute(
+            delete(Detection).where(
+                Detection.case_id == case_obj.id,
+                Detection.label_source != "pathologist"
+            )
+        )
         db.execute(delete(HpfSite).where(HpfSite.case_id == case_obj.id))
 
         for cand in candidates:
+            if cand["id"] in existing_pathologist_ids:
+                continue
             det_row = Detection(
                 id=cand["id"],
                 case_id=case_obj.id,
@@ -544,7 +587,7 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
         output_payload = {
             "case_id": case_id,
             "stage_execution_id": str(stage_exec.id),
-            "candidates": candidates,
+            "candidates": all_candidates,
             "hpfs": hpfs,
             "summary": scoring_summary,
             "grid": grid_meta,

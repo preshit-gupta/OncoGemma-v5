@@ -18,6 +18,7 @@ class Slide(Base):
     
     format: Mapped[str | None] = mapped_column(String, nullable=True)
     scanner: Mapped[str | None] = mapped_column(String, nullable=True)
+    status: Mapped[str | None] = mapped_column(String, nullable=True, default="ready") # ready, needs_mpp, failed
     
     mpp_x: Mapped[float | None] = mapped_column(Float, nullable=True)
     mpp_y: Mapped[float | None] = mapped_column(Float, nullable=True)

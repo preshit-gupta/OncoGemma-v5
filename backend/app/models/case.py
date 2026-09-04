@@ -21,7 +21,11 @@ class Case(Base):
     slides = relationship("Slide", back_populates="case", cascade="all, delete-orphan", passive_deletes=True)
     stage_executions = relationship("StageExecution", back_populates="case", cascade="all, delete-orphan", passive_deletes=True)
     grading = relationship("Grading", back_populates="case", uselist=False, cascade="all, delete-orphan", passive_deletes=True)
-    report = relationship("Report", back_populates="case", uselist=False, cascade="all, delete-orphan", passive_deletes=True)
+    reports = relationship("Report", back_populates="case", cascade="all, delete-orphan", passive_deletes=True, order_by="desc(Report.version)")
     hotspots = relationship("Hotspot", cascade="all, delete-orphan", passive_deletes=True)
+
+    @property
+    def report(self):
+        return self.reports[0] if self.reports else None
     detections = relationship("Detection", cascade="all, delete-orphan", passive_deletes=True)
     hpf_sites = relationship("HpfSite", cascade="all, delete-orphan", passive_deletes=True)

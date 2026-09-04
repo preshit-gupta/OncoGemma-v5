@@ -63,12 +63,14 @@ def extract_10x_patch(
     center_y: int,
     patch_size_px: int = 512,
     target_mpp: float = 1.0,
-    base_mpp: float = 0.25
+    base_mpp: float | None = None
 ) -> Image.Image:
     """
     Extract 512x512 patch @ 1.0 um/pixel (10x magnification) centered at (center_x, center_y).
     """
-    downsample = target_mpp / max(base_mpp, 0.1)  # e.g., 1.0 / 0.25 = 4.0
+    if base_mpp is None or base_mpp <= 0:
+        raise ValueError(f"Valid positive base_mpp is required for patch extraction, got: {base_mpp}")
+    downsample = target_mpp / base_mpp  # e.g., 1.0 / 0.25 = 4.0
     crop_w_l0 = int(patch_size_px * downsample)
     crop_h_l0 = int(patch_size_px * downsample)
     
@@ -296,6 +298,11 @@ def run_grading(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str,
     slide = case.slides[0]
     slide_id = str(slide.id)
 
+    # Halt grading stage if MPP is missing per PRD 01-stage-v4.0 §2.3 step 4
+    if not slide or not getattr(slide, "mpp_x", None) or slide.mpp_x <= 0 or not getattr(slide, "mpp_y", None) or slide.mpp_y <= 0:
+        raise ValueError(f"Slide for case {case_id} is missing valid MPP (status='needs_mpp'). Cannot execute grading stage.")
+    base_mpp = float(slide.mpp_x)
+
     scratch_dir = tempfile.mkdtemp(prefix="og_grading_")
 
     try:
@@ -309,7 +316,6 @@ def run_grading(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str,
             raise FileNotFoundError(f"Whole slide image file for case {case_id} not found in GCS.")
 
         # 1. Fetch Stage 3 Hotspots & Stage 4 Mitotic Score
-        base_mpp = float(getattr(slide, "mpp_x", getattr(slide, "mpp", 0.25)) or 0.25)
         stmt_hotspots = select(Hotspot).where(Hotspot.case_id == case.id).order_by(Hotspot.prob_mean.desc())
         db_hotspots = list(db.scalars(stmt_hotspots).all())
         hotspots = [h for h in db_hotspots if not getattr(h, "excluded", False)]
@@ -323,17 +329,37 @@ def run_grading(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str,
             except Exception:
                 pass
 
-        # Retrieve confirmed Mitotic Score from Stage 4
-        stmt_hpfs = select(HpfSite).where(HpfSite.case_id == case.id)
+        # Retrieve confirmed Mitotic Score from Stage 4 (no double-counting across overlapping HPFs)
+        stmt_hpfs = select(HpfSite).where(HpfSite.case_id == case.id).order_by(HpfSite.seq.asc())
         hpf_sites = list(db.scalars(stmt_hpfs).all())
-        
-        total_mitoses = sum(getattr(h, "mitotic_count", 0) for h in hpf_sites) if hpf_sites else 0
-        if total_mitoses < 8:
-            mitotic_score = 1
-        elif total_mitoses < 16:
-            mitotic_score = 2
+
+        stmt_dets = select(Detection).where(Detection.case_id == case.id, Detection.label == "mitosis")
+        confirmed_dets = list(db.scalars(stmt_dets).all())
+
+        mitotic_score = 1
+        total_mitoses = 0
+
+        if hpf_sites and confirmed_dets:
+            from pipeline.grading import calculate_mitotic_score_from_detections_and_hpfs
+            cands_for_score = [{"id": d.id, "centroid_um": d.centroid_um, "label": "mitosis"} for d in confirmed_dets]
+            hpfs_for_score = [{"seq": h.seq, "center_um": h.center_um, "radius_um": h.radius_um, "count": 0} for h in hpf_sites]
+            total_mitoses, mitotic_score = calculate_mitotic_score_from_detections_and_hpfs(cands_for_score, hpfs_for_score)
+        elif hpf_sites:
+            from pipeline.grading import calculate_mitotic_score_from_hpfs
+            hpf_counts = [getattr(h, "mitotic_count", 0) for h in hpf_sites]
+            r_um = float(getattr(hpf_sites[0], "radius_um", 262.0) or 262.0)
+            total_mitoses, mitotic_score = calculate_mitotic_score_from_hpfs(hpf_counts, radius_um=r_um)
         else:
-            mitotic_score = 3
+            try:
+                m_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/mitosis/output.json")
+                m_data = json.loads(m_bytes.decode("utf-8"))
+                if "summary" in m_data and "mitotic_score" in m_data["summary"]:
+                    mitotic_score = m_data["summary"]["mitotic_score"]
+                    total_mitoses = m_data["summary"].get("total_mitoses", total_mitoses)
+            except Exception:
+                mitotic_score = 1
+                total_mitoses = 0
+
 
         scoring_cfg = load_scoring_config()
         n_patches = scoring_cfg.get("grading", {}).get("n_patches", 24)
@@ -347,7 +373,7 @@ def run_grading(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str,
             slide_obj = openslide.OpenSlide(local_slide_path)
 
         slide_w, slide_h = slide_obj.dimensions
-        slide_dims_um = (float(slide_w * base_mpp), float(slide_h * base_mpp))
+        slide_dims_um = (float(slide_w * base_mpp), float(slide_h * float(slide.mpp_y)))
 
         tissue_mask = None
         try:
@@ -461,6 +487,8 @@ def run_grading(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str,
                     try:
                         return await medgemma.evaluate_tubule(img_bytes, tubule_prompt)
                     except SchemaRetryExhaustedError as e:
+                        if not settings.USE_MOCK_VERTEX_AI:
+                            raise
                         print(f"[Worker Grading Warning] Tubule patch {p_id} schema error: {e}")
                         return TubuleResponse(tubule_percent=20, tumor_present=True, confidence="low")
 
@@ -469,6 +497,8 @@ def run_grading(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str,
                     try:
                         return await medgemma.evaluate_pleomorphism(img_bytes, pleo_prompt)
                     except SchemaRetryExhaustedError as e:
+                        if not settings.USE_MOCK_VERTEX_AI:
+                            raise
                         print(f"[Worker Grading Warning] Pleo patch {p_id} schema error: {e}")
                         return PleoResponse(pleomorphism_score=2, rationale="Moderate variation (fallback)", confidence="low")
 
@@ -484,6 +514,8 @@ def run_grading(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str,
             try:
                 type_res = await type_task
             except Exception as e:
+                if not settings.USE_MOCK_VERTEX_AI:
+                    raise
                 print(f"[Worker Grading Warning] Histologic type error: {e}")
                 type_res = HistologicTypeResponse(
                     type="IDC-NST",

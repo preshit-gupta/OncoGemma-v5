@@ -33,6 +33,10 @@ class SlideFinalizeRequest(BaseModel):
     gcs_uri: str
     client_sha256: str | None = None
 
+class SlideMppUpdateRequest(BaseModel):
+    mpp_x: float
+    mpp_y: float | None = None
+
 class CaseDetailResponse(BaseModel):
     id: UUID
     created_by: str

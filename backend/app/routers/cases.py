@@ -35,6 +35,7 @@ from app.schemas.case import (
     SlideUploadUrlRequest,
     SlideUploadUrlResponse,
     SlideFinalizeRequest,
+    SlideMppUpdateRequest,
     CaseDetailResponse
 )
 
@@ -45,6 +46,8 @@ def create_case(
     db: Session = Depends(get_db),
     user: CurrentUser = Depends(get_current_user)
 ):
+    if user.role not in ("admin", "pathologist"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Pathologist or Admin role required to create cases.")
     case_obj = Case(created_by=user.id)
     db.add(case_obj)
     db.commit()
@@ -75,14 +78,12 @@ def list_cases(
             bucket = client.bucket(settings.GCS_ARTIFACTS_BUCKET)
             blobs = bucket.list_blobs(prefix="cases/", delimiter="/")
             list(blobs)
-            for prefix in blobs.prefixes:
+            for prefix in getattr(blobs, "prefixes", []):
                 parts = prefix.strip("/").split("/")
                 if len(parts) >= 2:
                     rehydrate_case_from_gcs(parts[1], db)
         except Exception as e:
-            print(f"[List Cases Rehydrate Error] {e}")
-            for cid in ["2e92d296-2417-4ca0-b8b7-83750833e25f", "4bc214ca-d38a-46b5-8673-6ae1a6f639d8"]:
-                rehydrate_case_from_gcs(cid, db)
+            print(f"[List Cases Rehydrate Note] {e}")
         cases = db.scalars(stmt).all()
     return cases
 
@@ -139,7 +140,9 @@ def clear_all_cases(
     db: Session = Depends(get_db),
     user: CurrentUser = Depends(get_current_user)
 ):
-    """Clear all diagnostic cases, associated relational child data, and storage artifacts."""
+    """Clear all diagnostic cases, associated relational child data, and storage artifacts (Admin only)."""
+    if user.role != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin role required to clear all cases.")
     cases = db.scalars(select(Case)).all()
     count = len(cases)
     for c in cases:
@@ -154,13 +157,16 @@ def delete_case(
     db: Session = Depends(get_db),
     user: CurrentUser = Depends(get_current_user)
 ):
-    """Delete a single diagnostic case and all associated child data."""
+    """Delete a single diagnostic case and all associated child data (Pathologist or Admin only)."""
+    if user.role not in ("admin", "pathologist"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Pathologist or Admin role required to delete a case.")
     case_obj = db.get(Case, case_id)
     if not case_obj:
         raise HTTPException(status_code=404, detail="Case not found")
     
     delete_single_case_data(case_id, db)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
 
 @router.post("/{case_id}/slide/upload", status_code=status.HTTP_202_ACCEPTED)
 async def upload_slide_file(
@@ -541,6 +547,7 @@ def get_case_detail(
     slides_data = [
         {
             "id": str(s.id),
+            "status": getattr(s, "status", "ready") or "ready",
             "gcs_uri_original": s.gcs_uri_original,
             "gcs_uri_pyramid": s.gcs_uri_pyramid,
             "format": s.format,
@@ -585,4 +592,89 @@ def get_case_detail(
         tile_url_template=tile_template,
         cdn_base_url=settings.CDN_BASE_URL
     )
+
+
+@router.patch("/{case_id}/slides/{slide_id}/mpp", status_code=status.HTTP_200_OK)
+@router.put("/{case_id}/slides/{slide_id}/mpp", status_code=status.HTTP_200_OK)
+def update_slide_mpp(
+    case_id: uuid.UUID,
+    slide_id: uuid.UUID,
+    req: SlideMppUpdateRequest,
+    db: Session = Depends(get_db),
+    user: CurrentUser = Depends(get_current_user)
+):
+    """
+    Allow pathologist or admin to manually provide valid MPP for a slide marked 'needs_mpp'.
+    Unblocks downstream processing by setting slide status to 'ready' and chaining preprocess stage.
+    """
+    if user.role not in ("admin", "pathologist"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Pathologist or Admin role required.")
+
+    if req.mpp_x <= 0 or (req.mpp_y is not None and req.mpp_y <= 0):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="MPP values must be positive numbers.")
+
+    slide = db.get(Slide, slide_id)
+    if not slide:
+        slide = db.scalars(select(Slide).where(Slide.id == str(slide_id))).first()
+    if not slide or str(slide.case_id) != str(case_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Slide not found in case.")
+
+    slide.mpp_x = float(req.mpp_x)
+    slide.mpp_y = float(req.mpp_y) if req.mpp_y is not None else float(req.mpp_x)
+    slide.status = "ready"
+    db.flush()
+
+    # If case status was needs_mpp and all slides now have valid MPP, restore open status
+    case_str = str(case_id)
+    case_obj = db.get(Case, case_id)
+    if not case_obj:
+        case_obj = db.scalars(select(Case).where(Case.id == case_str)).first()
+
+    if case_obj and case_obj.status == "needs_mpp":
+        case_slides = db.scalars(
+            select(Slide).where((Slide.case_id == case_id) | (Slide.case_id == case_str))
+        ).all()
+        remaining = [s for s in case_slides if s.status == "needs_mpp"]
+        if not remaining:
+            case_obj.status = "open"
+
+    db.commit()
+    db.refresh(slide)
+
+    # If ingest output exists and preprocess is not yet queued, auto-queue preprocess
+    existing_prep = db.scalars(
+        select(StageExecution).where(
+            StageExecution.case_id == case_id,
+            StageExecution.stage == "preprocess"
+        )
+    ).first()
+
+    if not existing_prep:
+        output_ref = f"gs://{settings.GCS_ARTIFACTS_BUCKET}/cases/{case_id}/ingest_output.json"
+        next_prep_stage = StageExecution(
+            case_id=case_id,
+            stage="preprocess",
+            attempt=1,
+            status="queued",
+            input_ref={"slide_id": str(slide.id), "ingest_output_ref": output_ref}
+        )
+        db.add(next_prep_stage)
+        db.commit()
+        db.refresh(next_prep_stage)
+
+        from app.core.cloud_tasks import dispatch_stage_task
+        dispatch_stage_task(
+            case_id=str(case_id),
+            stage="preprocess",
+            stage_exec_id=str(next_prep_stage.id),
+            payload={"slide_id": str(slide.id), "ingest_output_ref": output_ref}
+        )
+
+    return {
+        "slide_id": str(slide.id),
+        "status": slide.status,
+        "mpp_x": slide.mpp_x,
+        "mpp_y": slide.mpp_y
+    }
+
 

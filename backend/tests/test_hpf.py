@@ -108,8 +108,22 @@ def test_greedy_place_hpfs_overlap_relaxation_fallback():
         relaxed_min_separation_um=393.0
     )
 
-    # Must return 10 HPFs via relaxation fallback
-    assert len(hpfs) == 10
+    # Issue #718: Must return ONLY fields that actually fit (no spiral padding to 10)
+    assert 1 <= len(hpfs) < 10
+    for i in range(len(hpfs)):
+        for j in range(i + 1, len(hpfs)):
+            c1 = hpfs[i]["center_um"]
+            c2 = hpfs[j]["center_um"]
+            dist = math.hypot(c1[0] - c2[0], c1[1] - c2[1])
+            assert dist >= 393.0 - 1e-2
+
+    # Verify area-normalized scoring uses actual counted area per PRD 04 §4.2
+    from pipeline.scoring import compute_nottingham_mitotic_score
+    score_res = compute_nottingham_mitotic_score(count_total=5, n_hpf=len(hpfs), radius_um=262.0)
+    single_hpf_area = math.pi * (0.262 ** 2)
+    expected_area = round(len(hpfs) * single_hpf_area, 3)
+    assert score_res["n_hpf"] == len(hpfs)
+    assert score_res["area_mm2"] == expected_area
 
 
 def test_greedy_place_hpfs_rejects_empty_glass():

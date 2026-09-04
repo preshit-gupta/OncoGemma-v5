@@ -97,6 +97,12 @@ def calculate_ajcc_stage_group(
     """
     if pm_stage in ("pM1", "cM1"):
         return "IV"
+
+    if pt_stage == "N/A" or pn_stage == "N/A":
+        return "Benign"
+
+    if pt_stage in ("pTX", "TX"):
+        return "Unknown"
         
     if pt_stage == "pTis" and pn_stage in ("pN0", "pNX"):
         return "0"
@@ -146,7 +152,7 @@ def calculate_ajcc_stage_group(
     elif pn_stage == "pN1a":
         return "IIA"
         
-    return "IA"
+    return "Unknown"
 
 
 def validate_staging_invariants(

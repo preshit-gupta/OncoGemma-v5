@@ -58,7 +58,10 @@ raw_uploads/
 scratch/
 fake_gcs/
 data/
-oncogemma_local.db
+oncogemma_local.db*
+models/**/*.pt
+models/**/*.pth
+models/**/*.onnx
 *key*.json
 sa-key.json
 infra/sa-key.json

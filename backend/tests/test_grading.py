@@ -184,3 +184,67 @@ def test_database_check_constraint_enforcement():
 
     session.rollback()
     session.close()
+
+
+def test_mitotic_score_no_double_counting_in_overlapping_hpfs():
+    """
+    Verify Finding #357: Mitoses falling within overlapping HPF circles are counted once,
+    preventing double-counting in Nottingham score calculation.
+    """
+    from pipeline.grading import calculate_mitotic_score_from_detections_and_hpfs
+
+    # Two overlapping HPFs
+    hpfs = [
+        {"seq": 1, "center_um": [1000.0, 1000.0], "radius_um": 262.0},
+        {"seq": 2, "center_um": [1200.0, 1000.0], "radius_um": 262.0}
+    ]
+
+    # One mitosis right in the intersection
+    detections = [
+        {"id": "m_overlap_01", "centroid_um": [1100.0, 1000.0], "label": "mitosis"}
+    ]
+
+    unique_total, score = calculate_mitotic_score_from_detections_and_hpfs(detections, hpfs)
+    assert unique_total == 1  # Not 2! Counted once despite being in both HPF 1 and HPF 2
+    assert score == 1
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
+@pytest.mark.anyio
+async def test_medgemma_endpoint_failure_raises_when_mock_disabled(monkeypatch):
+    """
+    Issue #135 & #13:
+    Verify that when USE_MOCK_VERTEX_AI is False, _call_vertex_endpoint does NOT
+    silently return canned tubule/pleo/type responses, but re-raises exceptions.
+    """
+    import sys
+    from unittest.mock import MagicMock
+    import google.cloud
+    from pipeline.medgemma import MedGemmaClient, SchemaRetryExhaustedError
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "USE_MOCK_VERTEX_AI", False)
+    client = MedGemmaClient()
+
+    # Mock aiplatform to simulate live endpoint failure
+    mock_aiplatform = MagicMock()
+    mock_endpoint = MagicMock()
+    mock_endpoint.predict.side_effect = RuntimeError("Endpoint 503 Service Unavailable")
+    mock_endpoint.raw_predict.side_effect = RuntimeError("Raw predict failed")
+    mock_aiplatform.Endpoint.return_value = mock_endpoint
+
+    monkeypatch.setitem(sys.modules, "google.cloud.aiplatform", mock_aiplatform)
+    monkeypatch.setattr(google.cloud, "aiplatform", mock_aiplatform, raising=False)
+
+    # Calling vertex endpoint must re-raise the RuntimeError instead of returning canned mock string
+    with pytest.raises(RuntimeError, match="predict failed"):
+        await client._call_vertex_endpoint("Analyze tubule_percent for this patch", [])
+
+    # evaluate_tubule must exhaust retries and raise SchemaRetryExhaustedError wrapping RuntimeError
+    with pytest.raises(SchemaRetryExhaustedError):
+        await client.evaluate_tubule(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR", "Analyze tubule_percent")
+

@@ -5,7 +5,7 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-009688.svg)](https://fastapi.tiangolo.com)
 [![Next.js](https://img.shields.io/badge/Next.js-14.2+-black.svg)](https://nextjs.org)
 [![Google Cloud](https://img.shields.io/badge/GCP-Cloud%20Storage%20%7C%20Vertex%20AI-4285F4.svg)](https://cloud.google.com)
-[![Tests](https://img.shields.io/badge/Tests-58%2F58%20Passing-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/Tests-78%2F78%20Passing-brightgreen.svg)](tests/)
 
 **OncoGemma v5** is an enterprise-grade clinical AI platform and diagnostic copilot designed for pathologists to analyze Whole-Slide Images (WSIs) of invasive breast carcinoma. It automates gigapixel slide ingestion, quality control, tumor bed triage, mitotic figure quantification, Nottingham Histologic Grading (Elston-Ellis modification), and College of American Pathologists (CAP) synoptic cancer reporting with AJCC 8th/9th Edition staging.
 
@@ -210,12 +210,23 @@ abla^2 I)$). Flags blurred fields with $	ext{score} < 85.0$.
 
 ---
 
-### 🚀 Recent Platform Updates (August / September 2026)
-* **Stage 5 Max-Density Hotspot Morphological Extraction**: Continuous 2D tissue density mapping on tissue masks to guarantee all 24 evidence patches are extracted from peak cellularity regions ($>96\%$ inside hotspots, mean $93.1\%$), eliminating empty glass and lumina.
-* **MedGemma Output Cleanliness**: Fixed prompt routing order and response sanitization, guaranteeing clean Pydantic schema validation and natural diagnostic clinical prose without JSON leakage.
-* **Pathologist Workspace Metadata Badging**: Added hotspot origin and live tissue density percentage badges across the patch grid and deep inspection modal.
-* **Stage 4 True 40× High-Power Optical Magnification**: Full gigapixel Level 0 extraction ($2048\times 2048$ px @ $0.28\,\mu\text{m/px}$) for mitotic figure identification.
-* **Dependency-Ordered Case Deletion**: Safe recursive purge of cases across database relations and Google Cloud Storage buckets.
+### 🛡️ Comprehensive Clinical Code Audit & Hardening (September 2026)
+* **Clinical Correctness & Zero Fabricated Defaults**:
+  * Eliminated hardcoded defaults (ER 95%, PR 80%, HER2 1+, tumor size 18.0 mm, negative 5 mm margins). Unassessed fields now render as `Not assessed` / `Pending`.
+  * Fixed unassessed tumor staging (`pTX`, `pNX`) in `calculate_ajcc_stage_group` to evaluate strictly to `Unknown` instead of defaulting to `IA`.
+  * Added dedicated Benign Pathology Synoptic Protocol preventing false Grade 2 carcinoma reports or `NoneType` crashes on non-invasive slides.
+  * Solved Stage 5 mitotic score double-counting across overlapping HPFs ($1.5r < 2r$) via spatial deduplication and calibrated area-normalized thresholds.
+* **Security, Role-Based Access Control (RBAC) & Audit Integrity**:
+  * Implemented strict RBAC (`admin`, `pathologist`, `technician`, `viewer`) on mutating and destructive endpoints (`DELETE /cases`, report signing/amendments).
+  * Prominent diagonal `DRAFT` watermark on unsigned/draft PDFs; suppressed fabricated pathologist signature blocks until authenticated electronic sign-off.
+  * Implemented immutable report versioning: amendments generate `version = current.version + 1` drafts while original signed reports remain permanently sealed.
+* **Ingest, Geometry & Full-Depth Pyramids**:
+  * Implemented `needs_mpp` state and interactive pathologist calibration; eliminated silent $0.25\,\mu\text{m/px}$ guessing.
+  * Removed quaternary flat pink pyramid generators; unreadable slides fail fast with true diagnostic error logs.
+  * Implemented byte-level TIFF IFD unlinking and PHI data zeroing before setting `label_stripped_at`.
+  * Removed arbitrary level 11/12 DZI pregeneration ceilings, generating full-depth pyramids to support instant high-magnification ($20\times/40\times$) review.
+* **100% Offline Test Isolation & CI Reliability**:
+  * Implemented session-level test isolation in `conftest.py` with GCS mock `.prefixes` support, running all 78 tests completely offline.
 
 ---
 
@@ -335,14 +346,23 @@ cd backend
 pytest tests/ -v
 ```
 
-### Test Coverage Summary (58/58 Tests Passing)
-* `tests/test_staging.py` (AJCC pT, pN, Stage Group matrix invariants, numerical consistency guardrails)
-* `tests/test_report.py` (ReportLab PDF generation, synoptic updates, digital attestation, versioned amendments)
-* `tests/test_grading.py` (MedGemma tubule, pleomorphism, pure code Nottingham aggregation, flags)
-* `tests/test_mitosis.py` (YOLO detection, virtual HPF spatial placement, mitotic rate thresholds)
-* `tests/test_triage_api.py` (Path Foundation embeddings, linear probe, KDE contouring)
-* `tests/test_stain.py` (Calibrated Macenko optical density deconvolution, color invariants)
-* `tests/test_tiles.py` (DeepZoom tile streaming, OpenSeadragon compatibility)
+### Test Coverage Summary (78/78 Tests Passing Across 16 Suites)
+* `backend/tests/test_api_auth.py` (Authentication, bearer tokens, RBAC roles: admin, pathologist, technician, viewer)
+* `backend/tests/test_cap_reporting.py` (CAP synoptic PDF generation, benign protocols, digital signatures, multi-version immutable amendments)
+* `backend/tests/test_coords.py` (Micron-to-pixel coordinate transforms and geometric scaling)
+* `backend/tests/test_grading.py` (Nottingham grading, MedGemma integration, spatial candidate deduplication across overlapping HPFs)
+* `backend/tests/test_grading_api.py` (Grading review, manual overrides, confirmation lifecycle)
+* `backend/tests/test_hotspots.py` (Triage peak detection and tumor bed ROI extraction)
+* `backend/tests/test_hpf.py` (High-Power Field greedy spatial packing and non-overlap invariants)
+* `backend/tests/test_ingest_fixes.py` (De-identification, MPP validation, needs_mpp calibration state, full-depth DZI generation)
+* `backend/tests/test_mitosis_api.py` (Mitosis review, candidate labeling, HPF synchronization, signed report immutability)
+* `backend/tests/test_morphometrics.py` (Nuclear pleomorphism morphology, nuclear atypia scoring)
+* `backend/tests/test_nms.py` (Non-Maximum Suppression algorithms across optical tiles)
+* `backend/tests/test_qc_checks.py` (Tissue coverage, focus sharpness, and artifact detection)
+* `backend/tests/test_scoring.py` (Nottingham histologic scoring tables, Elston-Ellis boundary metrics)
+* `backend/tests/test_stain.py` (Pure NumPy Macenko optical density deconvolution)
+* `backend/tests/test_triage_api.py` (Triage review endpoints, draft edit replay)
+* `backend/tests/test_triage_worker.py` (Path Foundation embeddings, linear probe triage, GCS caching)
 
 ---
 

@@ -333,28 +333,5 @@ def greedy_place_hpfs(
                 else:
                     working_density[gy, gx] = 0.0
 
-    # Pass 4: Fallback for synthetic unconstrained unit tests where tissue_mask is None
-    if len(placed_hpfs) < count and tissue_mask is None:
-        while len(placed_hpfs) < count:
-            seq_num = len(placed_hpfs) + 1
-            if placed_centers:
-                base_x, base_y = placed_centers[0]
-            else:
-                base_x = origin_x + (nx * stride) / 2.0
-                base_y = origin_y + (ny * stride) / 2.0
-            angle = seq_num * (2 * math.pi / count)
-            dist_offset = (radius_um * 0.75) * (1 + (seq_num // 4))
-            cx_um = base_x + dist_offset * math.cos(angle)
-            cy_um = base_y + dist_offset * math.sin(angle)
-            placed_hpfs.append({
-                "seq": seq_num,
-                "center_um": [float(cx_um), float(cy_um)],
-                "radius_um": float(radius_um),
-                "count": 0,
-                "density_val": 0.0,
-                "tissue_coverage": 1.0,
-                "source": "model"
-            })
-
     return placed_hpfs[:count]
 
