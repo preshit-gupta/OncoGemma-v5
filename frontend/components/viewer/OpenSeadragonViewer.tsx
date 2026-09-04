@@ -402,7 +402,6 @@ export function OpenSeadragonViewer({
 
         isAddingOverlayRef.current = true;
         const uriToLoad = overlayImageUri;
-        const heightRatio = (imageWidthPx && imageHeightPx) ? imageHeightPx / imageWidthPx : undefined;
 
         viewer.addSimpleImage({
           url: uriToLoad,
@@ -410,7 +409,7 @@ export function OpenSeadragonViewer({
           x: 0,
           y: 0,
           width: 1.0,
-          height: heightRatio,
+          index: world.getItemCount(),
           success: (event: any) => {
             try {
               isAddingOverlayRef.current = false;

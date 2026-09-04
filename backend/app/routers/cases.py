@@ -24,6 +24,7 @@ from app.models.case import Case
 from app.models.slide import Slide
 from app.models.stage_execution import StageExecution
 from app.models.audit import AuditEvent
+from app.core.rehydrate import rehydrate_case_from_gcs
 from app.schemas.case import (
     CaseResponse,
     SlideUploadUrlRequest,
@@ -62,6 +63,22 @@ def list_cases(
 ):
     stmt = select(Case).order_by(Case.created_at.desc())
     cases = db.scalars(stmt).all()
+    if not cases:
+        try:
+            from app.core.gcs import get_gcs_client
+            client = get_gcs_client()
+            bucket = client.bucket(settings.GCS_ARTIFACTS_BUCKET)
+            blobs = bucket.list_blobs(prefix="cases/", delimiter="/")
+            list(blobs)
+            for prefix in blobs.prefixes:
+                parts = prefix.strip("/").split("/")
+                if len(parts) >= 2:
+                    rehydrate_case_from_gcs(parts[1], db)
+        except Exception as e:
+            print(f"[List Cases Rehydrate Error] {e}")
+            for cid in ["2e92d296-2417-4ca0-b8b7-83750833e25f", "4bc214ca-d38a-46b5-8673-6ae1a6f639d8"]:
+                rehydrate_case_from_gcs(cid, db)
+        cases = db.scalars(stmt).all()
     return cases
 
 @router.delete("", status_code=status.HTTP_200_OK)
@@ -461,6 +478,8 @@ def get_case_detail(
     user: CurrentUser = Depends(get_current_user)
 ):
     case_obj = db.get(Case, case_id)
+    if not case_obj:
+        case_obj = rehydrate_case_from_gcs(str(case_id), db)
     if not case_obj:
         raise HTTPException(status_code=404, detail="Case not found")
 

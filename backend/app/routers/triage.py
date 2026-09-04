@@ -31,6 +31,7 @@ from app.models.slide import Slide
 from app.models.stage_execution import StageExecution
 from app.models.hotspot import Hotspot
 from app.models.audit import AuditEvent
+from app.core.rehydrate import rehydrate_case_from_gcs
 
 router = APIRouter(prefix="/api/v1/stages/triage", tags=["triage"])
 
@@ -104,6 +105,15 @@ def get_triage_data(case_id: str, db: Session = Depends(get_db)):
             StageExecution.stage == "triage"
         ).order_by(StageExecution.attempt.desc())
     ).first()
+
+    if not stage_exec:
+        rehydrate_case_from_gcs(case_id, db)
+        stage_exec = db.scalars(
+            select(StageExecution).where(
+                StageExecution.case_id == case_id,
+                StageExecution.stage == "triage"
+            ).order_by(StageExecution.attempt.desc())
+        ).first()
 
     if not stage_exec:
         raise HTTPException(

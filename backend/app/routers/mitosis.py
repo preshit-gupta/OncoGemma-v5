@@ -32,6 +32,7 @@ from app.models.hotspot import Hotspot
 from app.models.detection import Detection
 from app.models.hpf_site import HpfSite
 from app.models.audit import AuditEvent
+from app.core.rehydrate import rehydrate_case_from_gcs
 from pipeline.hpf import generate_mitosis_density_map, greedy_place_hpfs
 from pipeline.scoring import calculate_hpf_mitosis_counts, compute_nottingham_mitotic_score
 from pipeline.stain import MacenkoNormalizer
@@ -84,6 +85,8 @@ def get_mitosis_stage_data(case_id: str, db: Session = Depends(get_db)):
     if not case_obj:
         case_obj = db.scalars(select(Case).where(Case.id == str(case_id))).first()
     if not case_obj:
+        case_obj = rehydrate_case_from_gcs(case_id, db)
+    if not case_obj:
         raise HTTPException(status_code=404, detail="Case not found")
 
     stmt = select(StageExecution).where(
@@ -92,6 +95,9 @@ def get_mitosis_stage_data(case_id: str, db: Session = Depends(get_db)):
     ).order_by(StageExecution.attempt.desc()).limit(1)
 
     stage_exec = db.scalars(stmt).first()
+    if not stage_exec:
+        rehydrate_case_from_gcs(case_id, db)
+        stage_exec = db.scalars(stmt).first()
     if not stage_exec:
         raise HTTPException(status_code=404, detail="Stage 4 (mitosis) not found for this case")
 
