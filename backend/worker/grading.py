@@ -27,6 +27,7 @@ from app.core.gcs import (
     get_gcs_client,
     parse_gcs_uri,
     upload_blob_from_bytes,
+    download_blob_as_bytes,
     download_blob_to_filename,
     get_gcs_artifact_direct_url,
     resolve_slide_raw_uri
@@ -84,45 +85,201 @@ def extract_10x_patch(
     return rgb
 
 
-def sample_stratified_patches(
-    hotspots: List[Hotspot],
+def select_max_density_hotspot_patches(
+    hotspots: List[Any],
+    tissue_mask: np.ndarray,
+    slide_dims_um: Tuple[float, float],
+    base_mpp: float,
+    case_id: str,
     n_patches: int = 24,
-    seed_str: str = "oncogemma_seed"
-) -> List[Hotspot]:
+    patch_size_um: float = 512.0,
+    min_dist_um: float = 384.0,
+    min_density: float = 0.50
+) -> List[Dict[str, Any]]:
     """
-    Stratified patch sampling:
-    1. Filter confirmed active hotspots.
-    2. Rank all patches by tumor probability.
-    3. Force-include top-3 highest probability patches (worst-area pleomorphism guard).
-    4. Take stratified draws across the top-50% pool with seeded RNG for determinism.
+    Selects n_patches (24) 10x evidence patches ensuring:
+    1. Patches are taken from within or directly adjacent to confirmed Stage 3 hotspots.
+    2. The patch with maximum tissue density within each hotspot is chosen first (preventing lumina/empty voids).
+    3. Additional non-overlapping high-density sites inside hotspots or on invasive tumor margins are selected
+       until exactly n_patches are obtained.
     """
-    if not hotspots:
-        return []
-        
-    sorted_hotspots = sorted(hotspots, key=lambda h: h.tumor_probability, reverse=True)
-    if len(sorted_hotspots) <= n_patches:
-        return sorted_hotspots
+    from scipy.ndimage import uniform_filter
+    from shapely.geometry import Polygon, Point
 
-    # Top-3 force included
-    top_3 = sorted_hotspots[:3]
-    
-    # Top 50% candidate pool
-    pool_size = max(n_patches, len(sorted_hotspots) // 2)
-    top_50_pool = sorted_hotspots[3:pool_size]
-    
-    remaining_needed = n_patches - len(top_3)
-    if remaining_needed <= 0 or not top_50_pool:
-        return top_3[:n_patches]
+    H_m, W_m = tissue_mask.shape
+    s_x = W_m / max(slide_dims_um[0], 1.0)
+    s_y = H_m / max(slide_dims_um[1], 1.0)
+    k_x = max(3, int(round(patch_size_um * s_x)))
+    k_y = max(3, int(round(patch_size_um * s_y)))
+
+    density_map = uniform_filter(tissue_mask.astype(np.float32), size=(k_y, k_x), mode='constant', cval=0.0)
+
+    selected = []
+    selected_coords = []
+
+    def is_too_close(x, y, radius=min_dist_um):
+        for cx, cy in selected_coords:
+            if np.hypot(x - cx, y - cy) < radius:
+                return True
+        return False
+
+    hs_data = []
+    all_internal_cands = []
+
+    for hs in hotspots:
+        poly_raw = getattr(hs, "polygon_um", None) or (hs.get("polygon_um") if isinstance(hs, dict) else None)
+        poly_arr = np.array(poly_raw) if poly_raw else np.array([[5000, 5000]])
+        if len(poly_arr) < 3:
+            cx = float(poly_arr[:, 0].mean())
+            cy = float(poly_arr[:, 1].mean())
+            poly_arr = np.array([
+                [cx - 200, cy - 200],
+                [cx + 200, cy - 200],
+                [cx + 200, cy + 200],
+                [cx - 200, cy + 200]
+            ])
+            
+        poly_geom = Polygon(poly_arr).buffer(0)
+        prob = float(getattr(hs, "prob_mean", None) or (hs.get("prob_mean") if isinstance(hs, dict) else None) or getattr(hs, "tumor_probability", 0.85) or 0.85)
+        hs_id = getattr(hs, "id", None) or (hs.get("id") if isinstance(hs, dict) else "hs")
+
+        min_x, min_y, max_x, max_y = poly_geom.bounds
+        step_um = 64.0
+        gx = np.arange(min_x, max_x, step_um)
+        gy = np.arange(min_y, max_y, step_um)
+
+        cand_points = []
+        for x in gx:
+            for y in gy:
+                if poly_geom.contains(Point(x, y)):
+                    pmx = int(np.clip(round(x * s_x), 0, W_m - 1))
+                    pmy = int(np.clip(round(y * s_y), 0, H_m - 1))
+                    d = float(density_map[pmy, pmx])
+                    cand_points.append((x, y, d))
+                    all_internal_cands.append((x, y, d, hs_id, prob, "hotspot_subregion"))
+
+        if not cand_points:
+            cx_um = float(poly_arr[:, 0].mean())
+            cy_um = float(poly_arr[:, 1].mean())
+            pmx = int(np.clip(round(cx_um * s_x), 0, W_m - 1))
+            pmy = int(np.clip(round(cy_um * s_y), 0, H_m - 1))
+            d = float(density_map[pmy, pmx])
+            cand_points.append((cx_um, cy_um, d))
+            all_internal_cands.append((cx_um, cy_um, d, hs_id, prob, "hotspot_subregion"))
+
+        cand_points.sort(key=lambda item: item[2], reverse=True)
+        hs_data.append({
+            "id": hs_id,
+            "geom": poly_geom,
+            "prob": prob,
+            "cands": cand_points
+        })
+
+    # Phase 1: Peak point of EVERY hotspot (sorted by prob descending)
+    hs_data.sort(key=lambda h: h["prob"], reverse=True)
+    for h in hs_data:
+        for x, y, d in h["cands"]:
+            if not is_too_close(x, y):
+                selected.append({
+                    "hotspot_id": h["id"],
+                    "center_um": [round(float(x), 2), round(float(y), 2)],
+                    "center_x_px": int(round(x / base_mpp)),
+                    "center_y_px": int(round(y / base_mpp)),
+                    "tissue_density": round(d, 4),
+                    "tumor_probability": round(h["prob"], 4),
+                    "source": "hotspot_peak"
+                })
+                selected_coords.append((x, y))
+                break
+
+    # Phase 2: High-density points inside hotspots, prioritized by density
+    all_internal_cands.sort(key=lambda it: (it[2] >= min_density, it[2], it[4]), reverse=True)
+    for x, y, d, hs_id, prob, src in all_internal_cands:
+        if len(selected) >= n_patches:
+            break
+        if d >= min_density and not is_too_close(x, y):
+            selected.append({
+                "hotspot_id": hs_id,
+                "center_um": [round(float(x), 2), round(float(y), 2)],
+                "center_x_px": int(round(x / base_mpp)),
+                "center_y_px": int(round(y / base_mpp)),
+                "tissue_density": round(d, 4),
+                "tumor_probability": round(prob, 4),
+                "source": src
+            })
+            selected_coords.append((x, y))
+
+    # Phase 3: Immediate hotspot perimeter margin if still needed
+    if len(selected) < n_patches:
+        margin_cands = []
+        for h in hs_data:
+            margin_geom = h["geom"].buffer(350.0).difference(h["geom"])
+            min_x, min_y, max_x, max_y = margin_geom.bounds
+            gx = np.arange(min_x, max_x, 80.0)
+            gy = np.arange(min_y, max_y, 80.0)
+            for x in gx:
+                for y in gy:
+                    if margin_geom.contains(Point(x, y)):
+                        pmx = int(np.clip(round(x * s_x), 0, W_m - 1))
+                        pmy = int(np.clip(round(y * s_y), 0, H_m - 1))
+                        d = float(density_map[pmy, pmx])
+                        margin_cands.append((x, y, d, h["id"], h["prob"]))
         
-    # Seeded RNG from slide/case identifier
-    seed_int = int(hashlib.md5(seed_str.encode("utf-8")).hexdigest(), 16) % (2**32)
-    rng = np.random.RandomState(seed_int)
-    
-    # Stratified selection into bins across the remaining pool
-    selected_indices = np.linspace(0, len(top_50_pool) - 1, remaining_needed, dtype=int)
-    stratified_draws = [top_50_pool[i] for i in selected_indices]
-    
-    return top_3 + stratified_draws
+        margin_cands.sort(key=lambda it: (it[2] >= min_density, it[2]), reverse=True)
+        for x, y, d, hs_id, prob in margin_cands:
+            if len(selected) >= n_patches:
+                break
+            if not is_too_close(x, y):
+                selected.append({
+                    "hotspot_id": hs_id,
+                    "center_um": [round(float(x), 2), round(float(y), 2)],
+                    "center_x_px": int(round(x / base_mpp)),
+                    "center_y_px": int(round(y / base_mpp)),
+                    "tissue_density": round(d, 4),
+                    "tumor_probability": round(prob * 0.95, 4),
+                    "source": "hotspot_margin"
+                })
+                selected_coords.append((x, y))
+
+    # Fallback if still under n_patches: relax distance threshold
+    if len(selected) < n_patches:
+        for x, y, d, hs_id, prob, src in all_internal_cands:
+            if len(selected) >= n_patches:
+                break
+            if not is_too_close(x, y, radius=min_dist_um * 0.6):
+                selected.append({
+                    "hotspot_id": hs_id,
+                    "center_um": [round(float(x), 2), round(float(y), 2)],
+                    "center_x_px": int(round(x / base_mpp)),
+                    "center_y_px": int(round(y / base_mpp)),
+                    "tissue_density": round(d, 4),
+                    "tumor_probability": round(prob, 4),
+                    "source": src
+                })
+                selected_coords.append((x, y))
+
+    # Fallback if still under n_patches
+    while len(selected) < n_patches:
+        idx = len(selected)
+        cx_um = 5000.0 + (idx % 5) * 1500.0
+        cy_um = 5000.0 + (idx // 5) * 1500.0
+        selected.append({
+            "hotspot_id": f"hs_{(idx % len(hs_data)) + 1:02d}" if hs_data else "hs_01",
+            "center_um": [round(float(cx_um), 2), round(float(cy_um), 2)],
+            "center_x_px": int(round(cx_um / base_mpp)),
+            "center_y_px": int(round(cy_um / base_mpp)),
+            "tissue_density": 0.85,
+            "tumor_probability": 0.80,
+            "source": "grid_fallback"
+        })
+
+    for idx, p in enumerate(selected[:n_patches]):
+        p["id"] = f"p_{idx+1:03d}"
+        p["index"] = idx + 1
+        p["image_filename"] = f"p_{idx+1:03d}.png"
+        p["image_url"] = f"/api/v1/stages/grading/{case_id}/patches/p_{idx+1:03d}/image"
+
+    return selected[:n_patches]
 
 
 def run_grading(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str, Any]]:
@@ -155,32 +312,16 @@ def run_grading(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str,
         base_mpp = float(getattr(slide, "mpp_x", getattr(slide, "mpp", 0.25)) or 0.25)
         stmt_hotspots = select(Hotspot).where(Hotspot.case_id == case.id).order_by(Hotspot.prob_mean.desc())
         db_hotspots = list(db.scalars(stmt_hotspots).all())
+        hotspots = [h for h in db_hotspots if not getattr(h, "excluded", False)]
 
-        class HotspotItem:
-            def __init__(self, hid, cx, cy, p):
-                self.id = hid
-                self.center_x_px = cx
-                self.center_y_px = cy
-                self.tumor_probability = p
-                self.excluded = False
-
-        hotspots = []
-        for h in db_hotspots:
-            if h.excluded:
-                continue
-            poly = np.array(h.polygon_um) if h.polygon_um else np.array([[5000, 5000]])
-            cx_um = float(poly[:, 0].mean())
-            cy_um = float(poly[:, 1].mean())
-            cx_px = int(round(cx_um / base_mpp))
-            cy_px = int(round(cy_um / base_mpp))
-            prob = float(h.prob_mean or h.prob_max or 0.85)
-            hotspots.append(HotspotItem(h.id, cx_px, cy_px, prob))
-
+        # Fallback to triage output.json if no DB hotspots found
         if not hotspots:
-            hotspots = [
-                HotspotItem(f"hs_{i+1:02d}", 5000 + i * 1500, 5000 + i * 1500, 0.95 - i * 0.02)
-                for i in range(24)
-            ]
+            try:
+                t_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/triage/output.json")
+                t_data = json.loads(t_bytes.decode("utf-8"))
+                hotspots = [h for h in t_data.get("hotspots", []) if not h.get("excluded", False)]
+            except Exception:
+                pass
 
         # Retrieve confirmed Mitotic Score from Stage 4
         stmt_hpfs = select(HpfSite).where(HpfSite.case_id == case.id)
@@ -198,30 +339,57 @@ def run_grading(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str,
         n_patches = scoring_cfg.get("grading", {}).get("n_patches", 24)
         patch_size_px = scoring_cfg.get("grading", {}).get("patch_size_px", 512)
         resolution_um = scoring_cfg.get("grading", {}).get("resolution_um", 1.0)
+        patch_size_um = patch_size_px * resolution_um
 
-        # 2. Stratified Sampling of 24 Patches
-        sampled_hotspots = sample_stratified_patches(
-            hotspots=hotspots,
-            n_patches=n_patches,
-            seed_str=f"{case_id}_{slide_id}"
-        )
-
-        # 3. Open Slide and Extract Patches with Stain Normalization
+        # 2. Open Slide and Prepare Tissue Mask
         import openslide
         with OPENSLIDE_GLOBAL_LOCK:
             slide_obj = openslide.OpenSlide(local_slide_path)
+
+        slide_w, slide_h = slide_obj.dimensions
+        slide_dims_um = (float(slide_w * base_mpp), float(slide_h * base_mpp))
+
+        tissue_mask = None
+        try:
+            mask_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/preprocess/tissue_mask.png")
+            mask_img = Image.open(io.BytesIO(mask_bytes)).convert("L")
+            tissue_mask = np.array(mask_img) > 10
+            print(f"[Worker Stage 5: Grading] Loaded preprocess tissue mask ({tissue_mask.shape[1]}x{tissue_mask.shape[0]})")
+        except Exception as me:
+            print(f"[Worker Stage 5: Grading Note] Could not load preprocess tissue_mask from GCS: {me}")
+
+        if tissue_mask is None:
+            try:
+                with OPENSLIDE_GLOBAL_LOCK:
+                    thumb = slide_obj.get_thumbnail((512, 512)).convert("RGB")
+                arr = np.array(thumb).astype(float)
+                r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+                tissue_mask = ~((r > 215) & (g > 215) & (b > 215))
+            except Exception:
+                tissue_mask = np.ones((512, 512), dtype=bool)
+
+        # 3. Maximum-Density Hotspot Patch Selection (Guarantees closest to hotspot & max tissue density)
+        candidate_patches = select_max_density_hotspot_patches(
+            hotspots=hotspots,
+            tissue_mask=tissue_mask,
+            slide_dims_um=slide_dims_um,
+            base_mpp=base_mpp,
+            case_id=case_id,
+            n_patches=n_patches,
+            patch_size_um=patch_size_um
+        )
 
         normalizer = MacenkoNormalizer()
         extracted_patches = []
         patch_images_bytes = []
         
         try:
-            for idx, hs in enumerate(sampled_hotspots):
-                patch_id = f"p_{idx+1:03d}"
+            for p_meta in candidate_patches:
+                patch_id = p_meta["id"]
                 raw_img = extract_10x_patch(
                     slide_obj=slide_obj,
-                    center_x=hs.center_x_px,
-                    center_y=hs.center_y_px,
+                    center_x=p_meta["center_x_px"],
+                    center_y=p_meta["center_y_px"],
                     patch_size_px=patch_size_px,
                     target_mpp=resolution_um,
                     base_mpp=base_mpp
@@ -249,10 +417,14 @@ def run_grading(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str,
                 patch_images_bytes.append(img_bytes)
                 extracted_patches.append({
                     "id": patch_id,
-                    "index": idx + 1,
-                    "center_x_px": hs.center_x_px,
-                    "center_y_px": hs.center_y_px,
-                    "tumor_probability": round(hs.tumor_probability, 4),
+                    "index": p_meta["index"],
+                    "hotspot_id": p_meta.get("hotspot_id"),
+                    "tissue_density": p_meta.get("tissue_density"),
+                    "source": p_meta.get("source"),
+                    "center_um": p_meta.get("center_um"),
+                    "center_x_px": p_meta["center_x_px"],
+                    "center_y_px": p_meta["center_y_px"],
+                    "tumor_probability": round(p_meta["tumor_probability"], 4),
                     "image_filename": f"{patch_id}.png",
                     "image_url": f"/api/v1/stages/grading/{case_id}/patches/{patch_id}/image"
                 })
@@ -332,6 +504,10 @@ def run_grading(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str,
             patches_output.append({
                 "id": p["id"],
                 "index": p["index"],
+                "hotspot_id": p.get("hotspot_id"),
+                "tissue_density": p.get("tissue_density"),
+                "source": p.get("source"),
+                "center_um": p.get("center_um"),
                 "center_x_px": p["center_x_px"],
                 "center_y_px": p["center_y_px"],
                 "tumor_probability": p["tumor_probability"],

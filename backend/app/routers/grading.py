@@ -547,28 +547,40 @@ def get_patch_image(case_id: str, patch_id: str, db: Session = Depends(get_db)):
         download_blob_to_filename(raw_bucket_name, slide_blob, local_slide_path)
 
         if os.path.exists(local_slide_path):
-            p_idx = 0
-            if patch_id.startswith("p_") and patch_id[2:].isdigit():
-                p_idx = int(patch_id[2:]) - 1
+            cx_px, cy_px = None, None
+            grading_rec = db.scalars(select(Grading).where(Grading.case_id == case_uid)).first()
+            if grading_rec and grading_rec.machine:
+                for p in grading_rec.machine.get("patches", []):
+                    if p.get("id") == patch_id and "center_x_px" in p:
+                        cx_px = p["center_x_px"]
+                        cy_px = p["center_y_px"]
+                        break
 
-            hotspots = list(db.scalars(select(Hotspot).where(Hotspot.case_id == case_uid)).all())
-            mpp_x = (slide.mpp_x or 0.25) if slide else 0.25
+            if cx_px is None or cy_px is None:
+                p_idx = 0
+                if patch_id.startswith("p_") and patch_id[2:].isdigit():
+                    p_idx = int(patch_id[2:]) - 1
 
-            if hotspots and p_idx < len(hotspots):
-                hs = hotspots[p_idx]
-                poly = hs.polygon_um
-                if isinstance(poly, str):
-                    poly = json.loads(poly)
-                if poly:
-                    cx_px = int(np.mean([pt[0] for pt in poly]) / mpp_x)
-                    cy_px = int(np.mean([pt[1] for pt in poly]) / mpp_x)
+                hotspots = list(db.scalars(select(Hotspot).where(Hotspot.case_id == case_uid)).all())
+                mpp_x = (slide.mpp_x or 0.25) if slide else 0.25
+
+                if hotspots and p_idx < len(hotspots):
+                    hs = hotspots[p_idx]
+                    poly = hs.polygon_um
+                    if isinstance(poly, str):
+                        poly = json.loads(poly)
+                    if poly:
+                        cx_px = int(np.mean([pt[0] for pt in poly]) / mpp_x)
+                        cy_px = int(np.mean([pt[1] for pt in poly]) / mpp_x)
+                    else:
+                        cx_px, cy_px = 25000, 20000
                 else:
-                    cx_px, cy_px = 25000, 20000
+                    row = p_idx // 6
+                    col = p_idx % 6
+                    cx_px = 20000 + col * 3000
+                    cy_px = 18000 + row * 3000
             else:
-                row = p_idx // 6
-                col = p_idx % 6
-                cx_px = 20000 + col * 3000
-                cy_px = 18000 + row * 3000
+                mpp_x = (slide.mpp_x or 0.25) if slide else 0.25
 
             with OPENSLIDE_GLOBAL_LOCK:
                 oslide = openslide.OpenSlide(local_slide_path)

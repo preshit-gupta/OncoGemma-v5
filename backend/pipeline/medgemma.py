@@ -119,7 +119,12 @@ class MedGemmaClient:
         if start_idx != -1 and end_idx != -1 and end_idx >= start_idx:
             cleaned = cleaned[start_idx:end_idx + 1]
             
-        return json.loads(cleaned)
+        try:
+            return json.loads(cleaned)
+        except Exception:
+            import re
+            cleaned_fixed = re.sub(r",\s*([\]}])", r"\1", cleaned)
+            return json.loads(cleaned_fixed)
 
     async def _call_vertex_endpoint(self, prompt: str, image_b64_list: List[str]) -> str:
         """
@@ -241,32 +246,86 @@ class MedGemmaClient:
             except Exception as me:
                 print(f"[Morphometrics Analysis Note] {me}")
 
-        if "tubule" in prompt_lower:
+        # Check tasks strictly: narrative & reports first, then subtype, then individual patch subscores
+        if "findings narrative" in prompt_lower or ("narrative" in prompt_lower and "findings" in prompt_lower) or "write a clear, concise diagnostic findings narrative" in prompt_lower:
+            htype = "Invasive Breast Carcinoma of No Special Type (IDC-NST)"
+            grade = 2
+            sum_score = 6
+            tub_str = "moderate (10-75%, Score 2)"
+            pleo_str = "moderate (Score 2) with perceptible variation in nuclear contours and visible nucleoli"
+            mit_str = "moderate (Score 2)"
+            
+            try:
+                if "{" in prompt and "}" in prompt:
+                    j_start = prompt.find("{")
+                    j_end = prompt.rfind("}")
+                    pj = json.loads(prompt[j_start:j_end+1])
+                    agg = pj.get("aggregate", {})
+                    grade = agg.get("grade", grade)
+                    sum_score = agg.get("nottingham_sum", sum_score)
+                    ht = pj.get("histologic_type", {}).get("type", "IDC-NST") if isinstance(pj.get("histologic_type"), dict) else "IDC-NST"
+                    if ht == "IDC-NST":
+                        htype = "Invasive Breast Carcinoma of No Special Type (IDC-NST)"
+                    elif ht == "ILC":
+                        htype = "Invasive Lobular Carcinoma (ILC)"
+                    else:
+                        htype = f"Invasive Breast Carcinoma ({ht})"
+                    
+                    t_score = agg.get("tubule_score", 2)
+                    t_val = agg.get("tubule_percent", 20)
+                    if t_score == 1:
+                        tub_str = f"prominent (>75%, Score 1, {t_val:.0f}%) with definite glandular lumen formation"
+                    elif t_score == 2:
+                        tub_str = f"moderate (10-75%, Score 2, {t_val:.0f}%) with localized tubular differentiation"
+                    else:
+                        tub_str = f"minimal (<10%, Score 3, {t_val:.0f}%) with predominantly sheet-like infiltrative growth"
+
+                    p_sc = agg.get("pleo_score", 2)
+                    if p_sc == 1:
+                        pleo_str = "mild (Score 1) with uniform regular nuclei and inconspicuous nucleoli"
+                    elif p_sc == 3:
+                        pleo_str = "marked (Score 3) with prominent nuclear pleomorphism, coarse vesicular chromatin, and macronucleoli"
+                    else:
+                        pleo_str = "moderate (Score 2) with perceptible variation in nuclear size/shape and visible nucleoli"
+
+                    m_sc = agg.get("mitotic_score", 2)
+                    m_tot = pj.get("mitotic_summary", {}).get("total_mitoses", 10)
+                    mit_str = f"Score {m_sc} ({m_tot} mitoses across 10 standardized HPFs, 2.16 mm²)"
+            except Exception as pe:
+                print(f"[Narrative Synthesis Note] {pe}")
+
+            grade_desc = "Well Differentiated" if grade == 1 else ("Moderately Differentiated" if grade == 2 else "Poorly Differentiated")
+            return (
+                f"{htype}, Nottingham Histological Grade {grade} ({grade_desc}, Combined Score {sum_score}/9). "
+                f"Tubule formation is {tub_str}. "
+                f"Nuclear pleomorphism is {pleo_str}. "
+                f"Mitotic index is {mit_str}."
+            )
+        elif "cap report" in prompt_lower or "synoptic report" in prompt_lower:
+            return json.dumps({
+                "diagnosis_line": "INVASIVE BREAST CARCINOMA OF NO SPECIAL TYPE (IDC-NST)",
+                "microscopic_findings": "Invasive carcinoma showing infiltrating cohesive cords and solid clusters with desmoplastic stroma.",
+                "clinical_correlation": "Correlate with staging parameters and biomarker panel (ER/PR/HER2/Ki-67)."
+            })
+        elif "tubule_percent" in prompt_lower or "tubular" in prompt_lower or "tubule" in prompt_lower:
             return json.dumps({
                 "tubule_percent": t_pct,
                 "tumor_present": True,
                 "confidence": "high"
             })
-        elif "pleomorphism" in prompt_lower:
+        elif "pleomorphism_score" in prompt_lower or "pleomorphism" in prompt_lower:
             return json.dumps({
                 "pleomorphism_score": p_score,
                 "rationale": p_desc,
                 "confidence": "high" if p_score == 3 else "medium"
             })
-        elif "histologic" in prompt_lower:
+        elif "histologic subtype" in prompt_lower or "differential" in prompt_lower or "subtype" in prompt_lower:
             return json.dumps({
                 "type": "IDC-NST",
                 "differential": ["Invasive Lobular Carcinoma", "Metaplastic Carcinoma"],
                 "rationale": "Infiltrating cohesive malignant epithelial sheets and cords with desmoplastic stromal response, diagnostic of Invasive Breast Carcinoma of No Special Type (IDC-NST).",
                 "confidence": "high"
             })
-        elif "narrative" in prompt_lower:
-            return (
-                "Invasive breast carcinoma of no special type (IDC-NST), Nottingham Histological Grade 3 "
-                "(Poorly Differentiated). Tubule formation is minimal (<10%, Score 3) with sheet-like infiltrative architecture. "
-                "Nuclear pleomorphism is marked (Score 3) with prominent chromatin irregularities, marked size variation, "
-                "and macronucleoli. Mitotic index is moderate (Score 2)."
-            )
         elif "mitos" in prompt_lower or "adjudicat" in prompt_lower:
             if image_b64:
                 try:
@@ -473,17 +532,27 @@ class MedGemmaClient:
                 narrative = raw_text.strip()
                 if narrative.startswith('"') and narrative.endswith('"'):
                     narrative = narrative[1:-1]
-                if len(narrative) > 20:
+                # Guard against raw JSON string leakage
+                if narrative.startswith("{") and narrative.endswith("}"):
+                    try:
+                        n_obj = json.loads(narrative)
+                        if "narrative" in n_obj and isinstance(n_obj["narrative"], str):
+                            narrative = n_obj["narrative"]
+                    except Exception:
+                        pass
+                if len(narrative) > 20 and not narrative.strip().startswith("{"):
                     return narrative
             except Exception as e:
                 last_error = e
                 await asyncio.sleep(0.05 * (attempt + 1))
                 
         # Graceful fallback narrative if LLM call fails
-        grade = aggregated_data.get("grade", 2)
-        sum_score = aggregated_data.get("nottingham_sum", 6)
+        agg = aggregated_data.get("aggregate", {})
+        grade = agg.get("grade", aggregated_data.get("grade", 2))
+        sum_score = agg.get("nottingham_sum", aggregated_data.get("nottingham_sum", 6))
         htype = aggregated_data.get("histologic_type", {}).get("type", "IDC-NST") if isinstance(aggregated_data.get("histologic_type"), dict) else "IDC-NST"
-        return f"Invasive breast carcinoma ({htype}), Nottingham Histological Grade {grade} (Total Score {sum_score}/9)."
+        grade_desc = "Well Differentiated" if grade == 1 else ("Moderately Differentiated" if grade == 2 else "Poorly Differentiated")
+        return f"Invasive breast carcinoma ({htype}), Nottingham Histological Grade {grade} ({grade_desc}, Combined Score {sum_score}/9)."
 
     async def generate_cap_report_narrative(
         self,

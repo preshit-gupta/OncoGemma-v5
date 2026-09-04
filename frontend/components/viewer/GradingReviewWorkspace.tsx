@@ -973,6 +973,12 @@ export function GradingReviewWorkspace({
                       #{p.index}
                     </span>
 
+                    {p.hotspot_id && (
+                      <span className="absolute top-1.5 right-1.5 px-1.5 py-0.5 rounded bg-sky-950/90 border border-sky-600/70 text-[9px] font-mono font-bold text-sky-300 shadow">
+                        {p.hotspot_id}
+                      </span>
+                    )}
+
                     {/* Status Badge on Image */}
                     <span className={`absolute bottom-1.5 right-1.5 px-1.5 py-0.5 rounded text-[9px] font-bold flex items-center gap-1 shadow ${
                       isModified
@@ -1000,6 +1006,15 @@ export function GradingReviewWorkspace({
                         Score {currentPleo}
                       </span>
                     </div>
+
+                    {p.tissue_density !== undefined && p.tissue_density !== null && (
+                      <div className="flex justify-between items-center">
+                        <span className="text-slate-500 text-[10px]">Tissue Density:</span>
+                        <span className="font-semibold text-emerald-400 text-[10px]">
+                          {Math.round(p.tissue_density * 100)}%
+                        </span>
+                      </div>
+                    )}
 
                     {p.user_notes && (
                       <p className="text-[10px] text-slate-400 italic bg-slate-900/90 p-1.5 rounded border border-slate-800 truncate">
@@ -1594,6 +1609,24 @@ export function GradingReviewWorkspace({
                   alt={`Patch ${selectedPatch.id}`}
                   className="w-full h-full object-contain"
                 />
+              </div>
+
+              {/* Hotspot & Tissue Density Metadata Strip */}
+              <div className="flex items-center justify-between bg-slate-950 px-3 py-2 rounded-lg border border-slate-800 text-xs">
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] text-slate-400">Hotspot Origin:</span>
+                  <span className="font-mono font-bold text-sky-300 bg-sky-950 px-1.5 py-0.5 rounded border border-sky-800">
+                    {selectedPatch.hotspot_id || "Direct Sampling"}
+                  </span>
+                </div>
+                {selectedPatch.tissue_density !== undefined && selectedPatch.tissue_density !== null && (
+                  <div className="flex items-center gap-2">
+                    <span className="text-[10px] text-slate-400">Tissue Density:</span>
+                    <span className="font-mono font-bold text-emerald-400">
+                      {Math.round(selectedPatch.tissue_density * 100)}%
+                    </span>
+                  </div>
+                )}
               </div>
 
               <div className="grid grid-cols-2 gap-3 text-xs">

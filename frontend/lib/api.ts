@@ -390,6 +390,10 @@ export async function confirmMitosisStage(
 export interface GradingPatch {
   id: string;
   index: number;
+  hotspot_id?: string;
+  tissue_density?: number;
+  source?: string;
+  center_um?: [number, number];
   center_x_px: number;
   center_y_px: number;
   tumor_probability: number;
