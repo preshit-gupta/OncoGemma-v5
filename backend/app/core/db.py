@@ -9,6 +9,25 @@ sqlite_url = f"sqlite:///{local_db_path}"
 
 db_url = settings.DATABASE_URL
 
+# Auto-detect Cloud SQL Unix Socket on Cloud Run
+cloudsql_instances = [
+    "/cloudsql/oncogemma:us-central1:oncogemma-dev-psql"
+]
+if os.path.exists("/cloudsql"):
+    try:
+        for entry in os.listdir("/cloudsql"):
+            full_p = f"/cloudsql/{entry}"
+            if os.path.isdir(full_p) or ":" in entry:
+                cloudsql_instances.append(full_p)
+    except Exception:
+        pass
+
+for sock in cloudsql_instances:
+    if os.path.exists(sock) and ("localhost" in db_url or "127.0.0.1" in db_url):
+        db_url = f"postgresql+psycopg2://oncogemma:oncogemma_dev_password@/oncogemma_db?host={sock}"
+        print(f"[DB Core] Connected to Cloud SQL via unix socket at {sock}")
+        break
+
 if db_url.startswith("sqlite"):
     engine = create_engine(
         sqlite_url,
