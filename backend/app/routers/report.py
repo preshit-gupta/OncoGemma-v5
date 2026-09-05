@@ -299,7 +299,12 @@ def _build_report_response_dict(case_id: str, db: Session) -> Dict[str, Any]:
     grading = db.scalars(select(Grading).where(Grading.case_id == case_uid)).first()
     report = _ensure_report_record(case_uid, db)
     stage_exec = db.scalars(
-        select(StageExecution).where(StageExecution.case_id == case_uid, StageExecution.stage == "report")
+        select(StageExecution)
+        .where(
+            (StageExecution.case_id == case_uid) | (StageExecution.case_id == str(case_id)),
+            StageExecution.stage == "report"
+        )
+        .order_by(StageExecution.attempt.desc())
     ).first()
 
     # Grading details (No fabricated defaults)
@@ -864,7 +869,12 @@ def sign_final_report(
         case.status = "done"
 
     stage_exec = db.scalars(
-        select(StageExecution).where(StageExecution.case_id == case_uid, StageExecution.stage == "report")
+        select(StageExecution)
+        .where(
+            (StageExecution.case_id == case_uid) | (StageExecution.case_id == str(case_id)),
+            StageExecution.stage == "report"
+        )
+        .order_by(StageExecution.attempt.desc())
     ).first()
     if stage_exec:
         stage_exec.status = "confirmed"

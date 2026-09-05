@@ -790,9 +790,15 @@ def confirm_mitosis_stage(payload: MitosisConfirmPayload, db: Session = Depends(
     Finalizes 10 HPFs and Nottingham Mitotic Score, marks Stage 4 as confirmed, and queues Stage 5.
     """
     case_id = payload.case_id
+    case_uid = to_uuid(case_id)
 
     stage_exec = db.scalars(
-        select(StageExecution).where(StageExecution.case_id == case_id, StageExecution.stage == "mitosis")
+        select(StageExecution)
+        .where(
+            (StageExecution.case_id == case_uid) | (StageExecution.case_id == str(case_id)),
+            StageExecution.stage == "mitosis"
+        )
+        .order_by(StageExecution.attempt.desc())
     ).first()
 
     if not stage_exec:
@@ -818,7 +824,6 @@ def confirm_mitosis_stage(payload: MitosisConfirmPayload, db: Session = Depends(
     stage_exec.reviewed_by = payload.reviewed_by
 
     # Queue Stage 5 (grading) - Guarded against overwriting signed reports
-    case_uid = to_uuid(case_id)
     from app.models.report import Report
     try:
         report_status = db.scalar(
@@ -833,7 +838,7 @@ def confirm_mitosis_stage(payload: MitosisConfirmPayload, db: Session = Depends(
         select(StageExecution).where(
             (StageExecution.case_id == case_uid) | (StageExecution.case_id == str(case_id)),
             StageExecution.stage == "grading"
-        )
+        ).order_by(StageExecution.attempt.desc())
     ).first()
 
     if not is_report_signed:

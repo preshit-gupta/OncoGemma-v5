@@ -461,7 +461,9 @@ def get_grading_stage_data(case_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail=f"Case {case_id} not found")
 
     stage_exec = db.scalars(
-        select(StageExecution).where(StageExecution.case_id == case_uid, StageExecution.stage == "grading")
+        select(StageExecution)
+        .where(StageExecution.case_id == case_uid, StageExecution.stage == "grading")
+        .order_by(StageExecution.attempt.desc())
     ).first()
 
     grading_record = db.scalars(
@@ -538,7 +540,9 @@ def review_grading_patches(payload: PatchReviewPayload, db: Session = Depends(ge
     db.refresh(grading_record)
 
     stage_exec = db.scalars(
-        select(StageExecution).where(StageExecution.case_id == case_uid, StageExecution.stage == "grading")
+        select(StageExecution)
+        .where(StageExecution.case_id == case_uid, StageExecution.stage == "grading")
+        .order_by(StageExecution.attempt.desc())
     ).first()
 
     return _build_grading_stage_data_dict(payload.case_id, case, stage_exec, grading_record, db)
@@ -622,7 +626,9 @@ def review_grading_hpfs(payload: HpfReviewPayload, db: Session = Depends(get_db)
     db.refresh(grading_record)
 
     stage_exec = db.scalars(
-        select(StageExecution).where(StageExecution.case_id == case_uid, StageExecution.stage == "grading")
+        select(StageExecution)
+        .where(StageExecution.case_id == case_uid, StageExecution.stage == "grading")
+        .order_by(StageExecution.attempt.desc())
     ).first()
 
     return _build_grading_stage_data_dict(payload.case_id, case, stage_exec, grading_record, db)
@@ -821,7 +827,9 @@ def confirm_histologic_type(
     db.refresh(grading_record)
 
     stage_exec = db.scalars(
-        select(StageExecution).where(StageExecution.case_id == case_uid, StageExecution.stage == "grading")
+        select(StageExecution)
+        .where(StageExecution.case_id == case_uid, StageExecution.stage == "grading")
+        .order_by(StageExecution.attempt.desc())
     ).first()
     return _build_grading_stage_data_dict(payload.case_id, case, stage_exec, grading_record, db)
 
@@ -864,7 +872,9 @@ def confirm_grading_stage(
         raise HTTPException(status_code=404, detail="Grading record for case not found")
 
     stage_exec = db.scalars(
-        select(StageExecution).where(StageExecution.case_id == case_uid, StageExecution.stage == "grading")
+        select(StageExecution)
+        .where(StageExecution.case_id == case_uid, StageExecution.stage == "grading")
+        .order_by(StageExecution.attempt.desc())
     ).first()
     if not stage_exec:
         raise HTTPException(status_code=404, detail="Grading stage execution record not found for case")
@@ -1019,7 +1029,7 @@ def confirm_grading_stage(
         select(StageExecution).where(
             (StageExecution.case_id == case_uid) | (StageExecution.case_id == str(case_id)),
             StageExecution.stage == "report"
-        )
+        ).order_by(StageExecution.attempt.desc())
     ).first()
 
     if not _is_case_report_signed(db, case_uid):
