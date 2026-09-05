@@ -328,7 +328,8 @@ export function OpenSeadragonViewer({
 
     viewer.addHandler("canvas-click", (event: any) => {
       if (!isAddingRoiModeRef.current) return;
-      event.preventUserAction = true;
+      if (!event.quick) return;
+      event.preventDefaultAction = true;
       if (!viewer.viewport) return;
       const vpPoint = viewer.viewport.pointFromPixel(event.position);
       const imgPoint = viewer.viewport.viewportToImageCoordinates(vpPoint);
@@ -674,20 +675,30 @@ export function OpenSeadragonViewer({
             if (!showHotspotMask && !isFocused && !isSelected) return null;
 
             return (
-              <g key={poly.id} className="cursor-pointer pointer-events-auto transition-opacity">
-                {/* Hotspot Boundary Box */}
+              <g 
+                key={poly.id} 
+                className={`transition-opacity ${isAddingRoiMode ? "pointer-events-none" : ""}`}
+              >
+                {/* Hotspot Boundary Box - pointer-events-none so slide pan/zoom is never blocked */}
                 <polygon
                   points={poly.points}
                   fill={isFocused ? "rgba(14, 165, 233, 0.45)" : isSelected ? "rgba(14, 165, 233, 0.35)" : "rgba(245, 158, 11, 0.22)"}
                   stroke={isFocused ? "#38bdf8" : isSelected ? "#38bdf8" : "#f59e0b"}
                   strokeWidth={isFocused ? "4" : isSelected ? "3.5" : "2"}
                   strokeDasharray={poly.id.startsWith("user") ? "6,3" : undefined}
-                  className={`transition-all ${isFocused ? "filter drop-shadow-[0_0_8px_rgba(56,189,248,0.8)]" : "hover:fill-amber-500/40"}`}
-                  onClick={() => onSelectHotspot && onSelectHotspot(poly.id)}
+                  className={`transition-all pointer-events-none ${isFocused ? "filter drop-shadow-[0_0_8px_rgba(56,189,248,0.8)]" : "hover:fill-amber-500/40"}`}
                 />
 
-                {/* Floating Numbered Pin / Badge */}
-                <g transform={`translate(${poly.center.x}, ${poly.center.y})`}>
+                {/* Floating Numbered Pin / Badge - handles hotspot selection without intercepting clicks during pin mode */}
+                <g 
+                  transform={`translate(${poly.center.x}, ${poly.center.y})`}
+                  className={isAddingRoiMode ? "pointer-events-none" : "cursor-pointer pointer-events-auto"}
+                  onClick={(e) => {
+                    if (isAddingRoiMode) return;
+                    e.stopPropagation();
+                    if (onSelectHotspot) onSelectHotspot(poly.id);
+                  }}
+                >
                   <rect
                     x={isFocused ? "-42" : "-32"}
                     y={isFocused ? "-14" : "-12"}

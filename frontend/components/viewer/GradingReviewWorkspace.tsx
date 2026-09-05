@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useMemo } from "react";
+import React, { useState, useEffect, useMemo, useRef } from "react";
 import {
   CheckCircle2,
   AlertTriangle,
@@ -15,6 +15,7 @@ import {
   FileCheck,
   Check,
   X,
+  Loader2,
   ExternalLink,
   ChevronRight,
   Info,
@@ -293,13 +294,68 @@ export function GradingReviewWorkspace({
     }
   };
 
+  // Server-computed Nottingham preview state
+  const [serverGradePreview, setServerGradePreview] = useState<{ nottingham_sum: number; grade: number } | null>(null);
+  const [isGradeRecomputing, setIsGradeRecomputing] = useState<boolean>(false);
+  const recomputeTimerRef = useRef<NodeJS.Timeout | null>(null);
+
   // Live Reactive Nottingham Sum & Grade Synthesis
   const activeTubuleScore = tubuleOverrideScore ?? (data?.current?.tubule_score || 2);
   const activePleoScore = pleoOverrideScore ?? (data?.current?.pleo_score || 2);
   const activeMitoticScore = data?.current?.mitotic_score || data?.mitotic_summary?.mitotic_score || 2;
 
-  const activeSum = activeTubuleScore + activePleoScore + activeMitoticScore;
-  const activeGrade = activeSum <= 5 ? 1 : activeSum <= 7 ? 2 : 3;
+  // Authoritative server preview recalculation on any override or score change
+  useEffect(() => {
+    if (!data) return;
+
+    if (recomputeTimerRef.current) {
+      clearTimeout(recomputeTimerRef.current);
+    }
+
+    setIsGradeRecomputing(true);
+    recomputeTimerRef.current = setTimeout(async () => {
+      try {
+        const preview = await recomputeGradingPreview({
+          case_id: caseId,
+          tubule_score: activeTubuleScore,
+          tubule_percent: tubuleOverridePercent ?? data?.current?.tubule_percent ?? data?.machine?.tubule_percent,
+          pleo_score: activePleoScore,
+          mitotic_score: activeMitoticScore
+        });
+        if (preview) {
+          setServerGradePreview({
+            nottingham_sum: preview.nottingham_sum,
+            grade: preview.grade
+          });
+        }
+      } catch (err) {
+        console.error("Failed to recompute grade preview:", err);
+      } finally {
+        setIsGradeRecomputing(false);
+      }
+    }, 150);
+
+    return () => {
+      if (recomputeTimerRef.current) clearTimeout(recomputeTimerRef.current);
+    };
+  }, [caseId, activeTubuleScore, activePleoScore, activeMitoticScore, tubuleOverridePercent, data]);
+
+  // Derived from authoritative server recompute response (with fallback if awaiting response)
+  const activeSum = serverGradePreview?.nottingham_sum ?? (data?.current?.nottingham_sum || (activeTubuleScore + activePleoScore + activeMitoticScore));
+  const activeGrade = serverGradePreview?.grade ?? (data?.current?.grade || (activeSum <= 5 ? 1 : activeSum <= 7 ? 2 : 3));
+
+  // Keyboard Escape listener to dismiss open modal overlays
+  useEffect(() => {
+    const handleEscape = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        if (editingPatch) setEditingPatch(null);
+        else if (editingHpf) setEditingHpf(null);
+        else if (selectedPatch) setSelectedPatch(null);
+      }
+    };
+    window.addEventListener("keydown", handleEscape);
+    return () => window.removeEventListener("keydown", handleEscape);
+  }, [editingPatch, editingHpf, selectedPatch]);
 
   const isTubuleOverridden = tubuleOverrideScore !== null && tubuleOverrideScore !== data?.machine?.tubule_score;
   const isPleoOverridden = pleoOverrideScore !== null && pleoOverrideScore !== data?.machine?.pleo_score;
@@ -948,14 +1004,16 @@ export function GradingReviewWorkspace({
                     isModified
                       ? "border-purple-500/70 shadow-[0_0_10px_rgba(168,85,247,0.15)]"
                       : isApproved
-                      ? "border-emerald-600/60 bg-emerald-950/10"
+                  ? "border-emerald-600/60 bg-emerald-950/10"
                       : "border-slate-800 hover:border-sky-500/60"
                   }`}
                 >
                   {/* Thumbnail Image */}
-                  <div
+                  <button
+                    type="button"
                     onClick={() => setSelectedPatch(p)}
-                    className="w-full aspect-square bg-slate-900 rounded-lg overflow-hidden relative cursor-pointer group"
+                    aria-label={`Inspect Patch #${p.index} (${p.id})`}
+                    className="w-full aspect-square bg-slate-900 rounded-lg overflow-hidden relative cursor-pointer group block text-left focus:outline-none focus:ring-2 focus:ring-sky-400"
                   >
                     <img
                       src={p.image_url?.startsWith("http") ? p.image_url : `${API_BASE}${p.image_url}`}
@@ -989,7 +1047,7 @@ export function GradingReviewWorkspace({
                     }`}>
                       {isModified ? "Modified" : isApproved ? "Approved" : "Suggested"}
                     </span>
-                  </div>
+                  </button>
 
                   {/* Findings Breakdown */}
                   <div className="mt-3 space-y-1.5 text-xs">
@@ -1270,6 +1328,12 @@ export function GradingReviewWorkspace({
             </div>
 
             <div className="flex items-center gap-3">
+              {isGradeRecomputing && (
+                <div className="flex items-center gap-1.5 text-xs text-sky-400 bg-sky-950/60 px-2.5 py-1 rounded-full border border-sky-800/60">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  <span>Syncing Grade...</span>
+                </div>
+              )}
               <div className="px-4 py-2 bg-slate-950 border border-slate-800 rounded-lg text-right">
                 <div className="text-[10px] text-slate-400">Nottingham Sum (T + P + M)</div>
                 <div className="text-xl font-mono font-bold text-sky-300">{activeSum} / 9</div>
@@ -1370,17 +1434,24 @@ export function GradingReviewWorkspace({
 
       {/* Patch Edit Modal */}
       {editingPatch && (
-        <div className="fixed inset-0 z-50 bg-black/85 backdrop-blur-sm flex items-center justify-center p-6">
+        <div 
+          role="dialog" 
+          aria-modal="true" 
+          aria-labelledby="patch-edit-modal-title"
+          className="fixed inset-0 z-50 bg-black/85 backdrop-blur-sm flex items-center justify-center p-6"
+        >
           <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-lg flex flex-col shadow-2xl overflow-hidden">
             <div className="p-4 bg-slate-950 border-b border-slate-800 flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <Edit3 className="w-4 h-4 text-sky-400" />
-                <h3 className="text-sm font-bold text-white">
+                <h3 id="patch-edit-modal-title" className="text-sm font-bold text-white">
                   Pathologist Review: Patch #{editingPatch.index} ({editingPatch.id})
                 </h3>
               </div>
               <button
+                type="button"
                 onClick={() => setEditingPatch(null)}
+                aria-label="Close dialog"
                 className="p-1 hover:bg-slate-800 text-slate-400 hover:text-white rounded"
               >
                 <X className="w-5 h-5" />
@@ -1504,17 +1575,24 @@ export function GradingReviewWorkspace({
 
       {/* HPF Edit Modal */}
       {editingHpf && (
-        <div className="fixed inset-0 z-50 bg-black/85 backdrop-blur-sm flex items-center justify-center p-6">
+        <div 
+          role="dialog" 
+          aria-modal="true" 
+          aria-labelledby="hpf-edit-modal-title"
+          className="fixed inset-0 z-50 bg-black/85 backdrop-blur-sm flex items-center justify-center p-6"
+        >
           <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-md flex flex-col shadow-2xl overflow-hidden">
             <div className="p-4 bg-slate-950 border-b border-slate-800 flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <Layers className="w-4 h-4 text-emerald-400" />
-                <h3 className="text-sm font-bold text-white">
+                <h3 id="hpf-edit-modal-title" className="text-sm font-bold text-white">
                   Adjust HPF #{editingHpf.seq} Mitotic Count
                 </h3>
               </div>
               <button
+                type="button"
                 onClick={() => setEditingHpf(null)}
+                aria-label="Close dialog"
                 className="p-1 hover:bg-slate-800 text-slate-400 hover:text-white rounded"
               >
                 <X className="w-5 h-5" />
@@ -1585,17 +1663,24 @@ export function GradingReviewWorkspace({
 
       {/* Single Patch Detailed Inspection Modal */}
       {selectedPatch && (
-        <div className="fixed inset-0 z-50 bg-black/85 backdrop-blur-sm flex items-center justify-center p-6">
+        <div 
+          role="dialog" 
+          aria-modal="true" 
+          aria-labelledby="patch-inspect-modal-title"
+          className="fixed inset-0 z-50 bg-black/85 backdrop-blur-sm flex items-center justify-center p-6"
+        >
           <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-xl flex flex-col shadow-2xl overflow-hidden">
             <div className="p-4 bg-slate-950 border-b border-slate-800 flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <Microscope className="w-4 h-4 text-sky-400" />
-                <h3 className="text-sm font-bold text-white">
+                <h3 id="patch-inspect-modal-title" className="text-sm font-bold text-white">
                   Evidence Patch #{selectedPatch.index} ({selectedPatch.id}) • 10× Magnification
                 </h3>
               </div>
               <button
+                type="button"
                 onClick={() => setSelectedPatch(null)}
+                aria-label="Close dialog"
                 className="p-1 hover:bg-slate-800 text-slate-400 hover:text-white rounded"
               >
                 <X className="w-5 h-5" />

@@ -5,27 +5,20 @@ import {
   Microscope, 
   CheckCircle2, 
   XCircle, 
-  Plus, 
   RotateCcw, 
   ArrowRight, 
-  ArrowLeft,
-  Layers, 
-  Sliders, 
   Activity, 
-  ShieldAlert, 
   Crosshair, 
   Loader2, 
   Sparkles,
   Info,
   Check,
   X,
-  RefreshCw,
   Eye,
   EyeOff,
   AlertTriangle,
   ChevronRight,
   ChevronLeft,
-  Maximize2,
   FileCheck2,
   MapPin,
   Compass
@@ -39,7 +32,6 @@ import {
   recomputeMitosis, 
   addPathologistMitosis, 
   bulkRejectUnreviewedMitosis, 
-  replaceMitosisHpfs, 
   confirmMitosisStage,
   API_BASE 
 } from "@/lib/api";
@@ -103,8 +95,9 @@ export function MitosisViewer({
   const [isDragging, setIsDragging] = useState<boolean>(false);
   const dragStartRef = useRef<{ x: number; y: number; panX: number; panY: number }>({ x: 0, y: 0, panX: 0, panY: 0 });
 
-  // Debounce ref for live score recomputation
+  // Debounce ref and loading state for live server score recomputation
   const debounceTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const [isRecomputing, setIsRecomputing] = useState<boolean>(false);
 
   // Fetch initial data
   const loadStageData = async () => {
@@ -158,60 +151,7 @@ export function MitosisViewer({
     }
   }, [caseId, data?.status, selectedCandidateId]);
 
-  // Client-side optimistic Nottingham Score recalculation
-  const computeClientScore = useCallback((currentCandidates: MitosisCandidate[], currentHpfs: VirtualHpfSite[]) => {
-    const mitoses = currentCandidates.filter(c => c.label === "mitosis");
-    let totalInHpfs = 0;
-    const updatedHpfs = currentHpfs.map(hpf => {
-      const cx = hpf.center_um[0];
-      const cy = hpf.center_um[1];
-      const r = hpf.radius_um || 262.0;
-      const count = mitoses.filter(m => {
-        const dx = m.centroid_um[0] - cx;
-        const dy = m.centroid_um[1] - cy;
-        return (dx * dx + dy * dy) <= (r * r);
-      }).length;
-      return { ...hpf, count };
-    });
-
-    // Unique mitoses inside any HPF
-    const uniqueContained = new Set<string>();
-    mitoses.forEach(m => {
-      for (const hpf of currentHpfs) {
-        const dx = m.centroid_um[0] - hpf.center_um[0];
-        const dy = m.centroid_um[1] - hpf.center_um[1];
-        if ((dx * dx + dy * dy) <= (hpf.radius_um * hpf.radius_um)) {
-          uniqueContained.add(m.id);
-          break;
-        }
-      }
-    });
-
-    totalInHpfs = uniqueContained.size;
-    const nHpf = currentHpfs.length || 10;
-    const singleHpfArea = Math.PI * Math.pow(262.0 / 1000.0, 2); // 0.21565 mm2
-    const totalArea = Math.max(0.001, nHpf * singleHpfArea);
-    const density = totalInHpfs / totalArea;
-    const classicEquivalent = density * 2.74;
-
-    let score = 1;
-    if (density >= 7.30) score = 3;
-    else if (density >= 3.65) score = 2;
-
-    return {
-      updatedHpfs,
-      newSummary: {
-        count_total: totalInHpfs,
-        n_hpf: nHpf,
-        area_mm2: Number(totalArea.toFixed(3)),
-        per_mm2: Number(density.toFixed(2)),
-        classic_per_10hpf: Number(classicEquivalent.toFixed(1)),
-        mitotic_score: score
-      }
-    };
-  }, []);
-
-  // Server debounced sync
+  // Server debounced sync (<50ms execution on server; single authoritative scoring source)
   const syncWithServer = useCallback((
     updatedCandidates: MitosisCandidate[], 
     updatedHpfs: VirtualHpfSite[], 
@@ -221,6 +161,7 @@ export function MitosisViewer({
       clearTimeout(debounceTimerRef.current);
     }
 
+    setIsRecomputing(true);
     debounceTimerRef.current = setTimeout(async () => {
       try {
         const labelsMap: Record<string, string> = {};
@@ -237,8 +178,10 @@ export function MitosisViewer({
         }
       } catch (err) {
         console.error("Debounced recompute sync error:", err);
+      } finally {
+        setIsRecomputing(false);
       }
-    }, 300);
+    }, 200);
   }, [caseId]);
 
   // Toggle candidate label
@@ -255,14 +198,8 @@ export function MitosisViewer({
     });
 
     setCandidates(updated);
-
-    // Optimistic UI score update
-    const { updatedHpfs, newSummary } = computeClientScore(updated, hpfs);
-    setHpfs(updatedHpfs);
-    setSummary(newSummary);
-
-    // Sync debounced to server with audit event
-    syncWithServer(updated, updatedHpfs, { id, from: oldLabel, to: newLabel });
+    // Sync debounced to server with audit event; authoritative score returned from server
+    syncWithServer(updated, hpfs, { id, from: oldLabel, to: newLabel });
   };
 
   const handleAddCandidateFromClick = async (x_um: number, y_um: number) => {
@@ -271,10 +208,8 @@ export function MitosisViewer({
       if (res && res.candidate) {
         const updated = [...candidates, res.candidate];
         setCandidates(updated);
-        const { updatedHpfs, newSummary } = computeClientScore(updated, hpfs);
-        setHpfs(updatedHpfs);
-        setSummary(newSummary);
         setIsPinningMode(false);
+        syncWithServer(updated, hpfs);
       }
     } catch (err) {
       console.error("Add candidate error:", err);
@@ -390,10 +325,7 @@ export function MitosisViewer({
         return c;
       });
       setCandidates(currentCandidates);
-      const { updatedHpfs, newSummary } = computeClientScore(currentCandidates, hpfs);
-      setHpfs(updatedHpfs);
-      setSummary(newSummary);
-      syncWithServer(currentCandidates, updatedHpfs);
+      syncWithServer(currentCandidates, hpfs);
     }
 
     setApprovedFields(prev => ({ ...prev, [activeHpfSeq]: true }));
@@ -653,8 +585,12 @@ export function MitosisViewer({
                   : "bg-emerald-950/80 text-emerald-300 border border-emerald-600/70"
               }`}
             >
-              <Activity className="w-3.5 h-3.5" />
-              Nottingham Mitotic Score: {summary.mitotic_score} ({summary.mitotic_score === 3 ? "High ≥20" : summary.mitotic_score === 2 ? "Mod 10-19" : "Low 0-9"})
+              {isRecomputing ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin text-sky-400" />
+              ) : (
+                <Activity className="w-3.5 h-3.5" />
+              )}
+              <span>Nottingham Mitotic Score: {summary.mitotic_score} ({summary.mitotic_score === 3 ? "High ≥20" : summary.mitotic_score === 2 ? "Mod 10-19" : "Low 0-9"})</span>
             </div>
 
             {/* Refresh Data Button */}
@@ -1375,6 +1311,37 @@ export function MitosisViewer({
                 </div>
               </div>
 
+              {/* Unreviewed High-Confidence Candidates Warning & Bulk Action */}
+              {unreviewedHighConf > 0 ? (
+                <div className="bg-amber-950/40 border border-amber-500/40 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-amber-200">
+                  <div className="flex items-start gap-3">
+                    <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
+                    <div>
+                      <h4 className="text-sm font-semibold text-amber-300">
+                        {unreviewedHighConf} High-Confidence Candidate{unreviewedHighConf > 1 ? "s" : ""} Require Resolution
+                      </h4>
+                      <p className="text-xs text-amber-400/80 mt-0.5">
+                        Clinical safety gate requires all detections outside reviewed fields (&ge;50% confidence) to be verified or rejected before advancing to Nottingham Grading.
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleBulkReject}
+                    disabled={loading}
+                    className="px-3.5 py-2 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-lg text-xs transition flex items-center justify-center gap-1.5 shrink-0 shadow-sm"
+                  >
+                    {loading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <XCircle className="w-3.5 h-3.5" />}
+                    <span>Bulk Reject Remaining</span>
+                  </button>
+                </div>
+              ) : (
+                <div className="bg-emerald-950/30 border border-emerald-500/30 rounded-xl px-4 py-3 flex items-center gap-2.5 text-xs text-emerald-300">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                  <span>All high-confidence candidate mitotic figures have been verified or rejected. Safety gate satisfied.</span>
+                </div>
+              )}
+
               {/* Action Buttons */}
               <div className="flex items-center justify-between pt-4 border-t border-slate-800">
                 <div className="flex items-center gap-2">
@@ -1394,8 +1361,9 @@ export function MitosisViewer({
 
                 <button
                   onClick={handleConfirmStage}
-                  disabled={submitting}
-                  className="px-6 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-xl shadow-lg text-sm flex items-center gap-2 transition active:scale-[0.98]"
+                  disabled={submitting || unreviewedHighConf > 0}
+                  title={unreviewedHighConf > 0 ? "Review or bulk reject all high-confidence candidates before confirming" : "Confirm Stage 4 & Proceed"}
+                  className="px-6 py-2.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed text-white font-bold rounded-xl shadow-lg text-sm flex items-center gap-2 transition active:scale-[0.98]"
                 >
                   {submitting ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle2 className="w-4 h-4" />}
                   <span>Confirm Stage 4 & Proceed</span>

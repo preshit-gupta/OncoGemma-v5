@@ -357,9 +357,10 @@ cd backend
 pytest tests/ -v
 ```
 
-### Test Coverage Summary (90/90 Tests Passing Across 17 Suites)
-* `backend/tests/test_api_auth.py` (Authentication, bearer tokens, RBAC roles: admin, pathologist, technician, viewer)
+### Test Coverage Summary (100/100 Tests Passing Across 18 Suites)
+* `backend/tests/test_api_auth.py` (Authentication, bearer tokens, RBAC roles: admin, pathologist, technician, viewer, and `/health` aliases)
 * `backend/tests/test_batch4_state_and_concurrency.py` (Row locking, worker skip_locked, orphan recovery, SQLite foreign keys, case cascade deletes, attempt monotonicity)
+* `backend/tests/test_batch5_stain_and_qc.py` (Fitted Macenko deconvolution, tissue mask sampling, degenerate slide handling, 5-check automated QC suite)
 * `backend/tests/test_cap_reporting.py` (CAP synoptic PDF generation, benign protocols, digital signatures, multi-version immutable amendments)
 * `backend/tests/test_coords.py` (Micron-to-pixel coordinate transforms and geometric scaling)
 * `backend/tests/test_grading.py` (Nottingham grading, MedGemma integration, spatial candidate deduplication across overlapping HPFs)
@@ -370,11 +371,21 @@ pytest tests/ -v
 * `backend/tests/test_mitosis_api.py` (Mitosis review, candidate labeling, HPF synchronization, signed report immutability)
 * `backend/tests/test_morphometrics.py` (Nuclear pleomorphism morphology, nuclear atypia scoring)
 * `backend/tests/test_nms.py` (Non-Maximum Suppression algorithms across optical tiles)
-* `backend/tests/test_qc_checks.py` (Tissue coverage, focus sharpness, and artifact detection)
+* `backend/tests/test_qc_checks.py` (Tissue coverage, focus sharpness, marker pen, tissue folds, and stain sanity checks)
 * `backend/tests/test_scoring.py` (Nottingham histologic scoring tables, Elston-Ellis boundary metrics)
 * `backend/tests/test_stain.py` (Pure NumPy Macenko optical density deconvolution)
 * `backend/tests/test_triage_api.py` (Triage review endpoints, draft edit replay)
 * `backend/tests/test_triage_worker.py` (Path Foundation embeddings, linear probe triage, GCS caching)
+
+---
+
+### 🎨 Frontend UX, Accessibility & API Hygiene (Batch 6)
+* **DOM Nesting & Case Status Semantics (Issue #685)**: Decoupled interactive `<button>` elements from Next.js `<Link>` wrappers in `cases/page.tsx`, eliminating invalid HTML and erratic screen reader behavior. Case status pills now render dedicated semantic badges (`needs_rescan` in rose, `open` in sky, `done` in emerald).
+* **Single Authoritative Scoring Engine (Issue #227)**: Completely dropped client-side `computeClientScore` duplication in `MitosisViewer.tsx`. All mitotic figures, HPF tallies, and Nottingham scores derive strictly from `POST /api/v1/stages/mitosis/recompute`.
+* **High-Confidence Candidate Gating (Issue #667)**: Rendered an interactive warning banner in the 10-HPF completion summary when unreviewed candidates with $\ge 50\%$ confidence remain outside reviewed fields, backed by a one-click "Bulk Reject Remaining" CTA. Cleaned up dead icon and API imports.
+* **Server-Driven Nottingham Synthesis (Issue #483)**: Wired `recomputeGradingPreview` in `GradingReviewWorkspace.tsx` to dynamically query server-computed grades on override modifications, ensuring client calculations remain synchronized with `configs/scoring.yaml`.
+* **OpenSeadragon Pinning Event Integrity (Issues #223 & #656)**: Replaced non-existent `preventUserAction` with OSD's native `preventDefaultAction` and guarded with `!event.quick`, preventing unwanted zoom on pin clicks and phantom annotations on drag releases. Made hotspot polygons non-intercepting to eliminate slide pan/zoom dead zones.
+* **WAI-ARIA & Keyboard Accessibility (Issue #267)**: Standardized modal dialogs across `GradingReviewWorkspace.tsx` and `ReportWorkspace.tsx` with `role="dialog"`, `aria-modal="true"`, `aria-labelledby`, accessible button labels, and global <kbd>Escape</kbd> dismissal. Linked all synoptic form labels to controls via `htmlFor`/`id` and converted patch thumbnails into keyboard-focusable `<button>` elements.
 
 ---
 

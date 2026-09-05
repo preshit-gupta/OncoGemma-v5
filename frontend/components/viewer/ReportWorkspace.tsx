@@ -18,7 +18,8 @@ import {
   Microscope,
   Info,
   Calendar,
-  UserCheck
+  UserCheck,
+  X
 } from "lucide-react";
 import {
   fetchReportData,
@@ -126,6 +127,18 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
   useEffect(() => {
     loadData();
   }, [caseId]);
+
+  // Keyboard Escape listener to dismiss open modal overlays
+  useEffect(() => {
+    const handleEscape = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        if (showSignModal) setShowSignModal(false);
+        else if (showAmendModal) setShowAmendModal(false);
+      }
+    };
+    window.addEventListener("keydown", handleEscape);
+    return () => window.removeEventListener("keydown", handleEscape);
+  }, [showSignModal, showAmendModal]);
 
   const handleUpdate = async (overrides?: Partial<CapReportData>) => {
     try {
@@ -597,10 +610,11 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
               <div className="space-y-3 text-xs">
                 {/* Diagnosis Line */}
                 <div className="space-y-1">
-                  <label className="text-slate-400 font-semibold uppercase text-[10px]">
+                  <label htmlFor="synoptic-diagnosis-line" className="text-slate-400 font-semibold uppercase text-[10px]">
                     Synoptic Diagnosis Line
                   </label>
                   <textarea
+                    id="synoptic-diagnosis-line"
                     rows={2}
                     disabled={isSigned}
                     value={diagnosisLine}
@@ -611,10 +625,11 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
 
                 {/* Microscopic Findings */}
                 <div className="space-y-1">
-                  <label className="text-slate-400 font-semibold uppercase text-[10px]">
+                  <label htmlFor="microscopic-findings" className="text-slate-400 font-semibold uppercase text-[10px]">
                     Microscopic Architectural Findings
                   </label>
                   <textarea
+                    id="microscopic-findings"
                     rows={4}
                     disabled={isSigned}
                     value={microscopicFindings}
@@ -625,10 +640,11 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
 
                 {/* Clinical Correlation */}
                 <div className="space-y-1">
-                  <label className="text-slate-400 font-semibold uppercase text-[10px]">
+                  <label htmlFor="clinical-correlation" className="text-slate-400 font-semibold uppercase text-[10px]">
                     Clinical Correlation & Pathologist Comments
                   </label>
                   <textarea
+                    id="clinical-correlation"
                     rows={3}
                     disabled={isSigned}
                     value={clinicalCorrelation}
@@ -677,26 +693,42 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
 
       {/* Pathologist Sign-Off Modal */}
       {showSignModal && (
-        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+        <div 
+          role="dialog" 
+          aria-modal="true" 
+          aria-labelledby="sign-off-modal-title"
+          className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4"
+        >
           <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-lg w-full p-6 space-y-5 shadow-2xl">
-            <div className="flex items-center space-x-3 border-b border-slate-800 pb-3">
-              <div className="p-2.5 bg-emerald-950/80 border border-emerald-800 rounded-xl text-emerald-400">
-                <ShieldCheck className="w-6 h-6" />
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <div className="flex items-center space-x-3">
+                <div className="p-2.5 bg-emerald-950/80 border border-emerald-800 rounded-xl text-emerald-400">
+                  <ShieldCheck className="w-6 h-6" />
+                </div>
+                <div>
+                  <h3 id="sign-off-modal-title" className="text-base font-bold text-white">
+                    Pathologist Electronic Sign-Off & Attestation
+                  </h3>
+                  <p className="text-xs text-slate-400">
+                    Case #{caseId.substring(0, 8)} • Stage 6 CAP Finalization
+                  </p>
+                </div>
               </div>
-              <div>
-                <h3 className="text-base font-bold text-white">
-                  Pathologist Electronic Sign-Off & Attestation
-                </h3>
-                <p className="text-xs text-slate-400">
-                  Case #{caseId.substring(0, 8)} • Stage 6 CAP Finalization
-                </p>
-              </div>
+              <button
+                type="button"
+                onClick={() => setShowSignModal(false)}
+                aria-label="Close dialog"
+                className="p-1 hover:bg-slate-800 text-slate-400 hover:text-white rounded"
+              >
+                <X className="w-5 h-5" />
+              </button>
             </div>
 
             <div className="space-y-4 text-xs">
               <div className="space-y-1.5">
-                <label className="text-slate-300 font-medium">Pathologist Name & Title</label>
+                <label htmlFor="pathologist-name" className="text-slate-300 font-medium">Pathologist Name & Title</label>
                 <input
+                  id="pathologist-name"
                   type="text"
                   value={signedBy}
                   onChange={(e) => setSignedBy(e.target.value)}
@@ -706,8 +738,9 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
               </div>
 
               <div className="space-y-1.5">
-                <label className="text-slate-300 font-medium">NPI / License Number</label>
+                <label htmlFor="pathologist-npi" className="text-slate-300 font-medium">NPI / License Number</label>
                 <input
+                  id="pathologist-npi"
                   type="text"
                   value={npi}
                   onChange={(e) => setNpi(e.target.value)}
@@ -723,8 +756,9 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
                 <p className="text-[11px] text-slate-400 leading-relaxed italic">
                   "I electronically attest that I have reviewed the Whole-Slide Image (WSI), AI-generated hotspot triage regions, mitotic figure annotations across 10 high-power fields, and Nottingham histological parameters, and I verify that the diagnostic findings, CAP synoptic elements, and AJCC staging in this report are clinically accurate."
                 </p>
-                <label className="flex items-start space-x-2.5 pt-1 cursor-pointer">
+                <label htmlFor="attestation-checkbox" className="flex items-start space-x-2.5 pt-1 cursor-pointer">
                   <input
+                    id="attestation-checkbox"
                     type="checkbox"
                     checked={attestationAgreed}
                     onChange={(e) => setAttestationAgreed(e.target.checked)}
@@ -739,6 +773,7 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
 
             <div className="flex items-center justify-end space-x-3 pt-2">
               <button
+                type="button"
                 onClick={() => setShowSignModal(false)}
                 disabled={signLoading}
                 className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-semibold transition"
@@ -746,6 +781,7 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
                 Cancel
               </button>
               <button
+                type="button"
                 onClick={handleSign}
                 disabled={signLoading || !attestationAgreed}
                 className="px-5 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white rounded-lg text-xs font-bold transition shadow-lg shadow-emerald-950/50 flex items-center space-x-1.5"
@@ -760,26 +796,42 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
 
       {/* Amendment Modal */}
       {showAmendModal && (
-        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+        <div 
+          role="dialog" 
+          aria-modal="true" 
+          aria-labelledby="amendment-modal-title"
+          className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4"
+        >
           <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-lg w-full p-6 space-y-5 shadow-2xl">
-            <div className="flex items-center space-x-3 border-b border-slate-800 pb-3">
-              <div className="p-2.5 bg-purple-950/80 border border-purple-800 rounded-xl text-purple-400">
-                <Edit3 className="w-6 h-6" />
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <div className="flex items-center space-x-3">
+                <div className="p-2.5 bg-purple-950/80 border border-purple-800 rounded-xl text-purple-400">
+                  <Edit3 className="w-6 h-6" />
+                </div>
+                <div>
+                  <h3 id="amendment-modal-title" className="text-base font-bold text-white">
+                    Create Formal Synoptic Amendment
+                  </h3>
+                  <p className="text-xs text-slate-400">
+                    Versioned Clinical Addendum (v1.{((data?.amendments?.length || 0) + 1)})
+                  </p>
+                </div>
               </div>
-              <div>
-                <h3 className="text-base font-bold text-white">
-                  Create Formal Synoptic Amendment
-                </h3>
-                <p className="text-xs text-slate-400">
-                  Versioned Clinical Addendum (v1.{((data?.amendments?.length || 0) + 1)})
-                </p>
-              </div>
+              <button
+                type="button"
+                onClick={() => setShowAmendModal(false)}
+                aria-label="Close dialog"
+                className="p-1 hover:bg-slate-800 text-slate-400 hover:text-white rounded"
+              >
+                <X className="w-5 h-5" />
+              </button>
             </div>
 
             <div className="space-y-4 text-xs">
               <div className="space-y-1.5">
-                <label className="text-slate-300 font-medium">Amendment Rationale & Justification</label>
+                <label htmlFor="amendment-reason" className="text-slate-300 font-medium">Amendment Rationale & Justification</label>
                 <textarea
+                  id="amendment-reason"
                   rows={4}
                   value={amendReason}
                   onChange={(e) => setAmendReason(e.target.value)}
@@ -791,6 +843,7 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
 
             <div className="flex items-center justify-end space-x-3 pt-2">
               <button
+                type="button"
                 onClick={() => setShowAmendModal(false)}
                 disabled={amendLoading}
                 className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-semibold transition"
@@ -798,6 +851,7 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
                 Cancel
               </button>
               <button
+                type="button"
                 onClick={handleAmend}
                 disabled={amendLoading || amendReason.trim().length < 10}
                 className="px-5 py-2 bg-purple-700 hover:bg-purple-600 disabled:opacity-50 text-white rounded-lg text-xs font-bold transition shadow flex items-center space-x-1.5"
