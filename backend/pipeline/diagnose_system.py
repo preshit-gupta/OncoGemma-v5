@@ -241,9 +241,9 @@ class DiagnosticRunner:
 
             client = TestClient(app)
 
-            # 1. Healthz
-            r_health = client.get("/healthz")
-            assert r_health.status_code == 200, f"Healthz failed: {r_health.status_code}"
+            # 1. Health check
+            r_health = client.get("/health")
+            assert r_health.status_code == 200, f"Health check failed: {r_health.status_code}"
 
             # 2. Cases list
             r_cases = client.get("/api/v1/cases", headers={"X-User-Role": "pathologist"})
@@ -251,7 +251,7 @@ class DiagnosticRunner:
             cases = r_cases.json()
 
             target_case_id = cases[0]["id"] if cases else None
-            details_list = [f"GET /healthz -> HTTP 200 ({r_health.json()['status']})", f"GET /api/v1/cases -> HTTP 200 ({len(cases)} cases)"]
+            details_list = [f"GET /health -> HTTP 200 ({r_health.json()['status']})", f"GET /api/v1/cases -> HTTP 200 ({len(cases)} cases)"]
 
             if target_case_id:
                 # 3. Triage data

@@ -85,12 +85,13 @@ def run_qc(stage_execution: StageExecution, session: Session) -> tuple[str, dict
             mpp_y=mpp_y
         )
 
-        # Execute simplified QC check suite
+        # Execute 5-check QC check suite (PRD 02 §3.1)
         qc_result = run_all_qc_checks(
             slide,
             tissue_mask_1bit=tissue_mask_1bit,
             mpp_x=mpp_x,
             mpp_y=mpp_y,
+            stain_params=stain_params,
             config_path="configs/qc.yaml"
         )
 

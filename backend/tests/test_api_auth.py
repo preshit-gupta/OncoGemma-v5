@@ -36,11 +36,12 @@ def setup_auth_test_db():
 client = TestClient(app)
 
 def test_healthz_endpoint():
-    response = client.get("/healthz")
-    assert response.status_code == 200
-    data = response.json()
-    assert data["status"] == "healthy"
-    assert "version" in data
+    for endpoint in ["/health", "/api/health", "/healthz"]:
+        response = client.get(endpoint)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "healthy"
+        assert "version" in data
 
 def test_mock_auth_headers():
     # Valid default header

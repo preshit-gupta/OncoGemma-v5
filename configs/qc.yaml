@@ -1,22 +1,16 @@
-# OncoGemma QC Configuration & Calibration Metadata
-#
-# Archive Calibration Set IDs:
-#   - Known-bad slides (n=20): [ARCHIVE-BAD-001 through ARCHIVE-BAD-020] (focus blur, heavy pen marks, folded tissue, faded stain)
-#   - Known-good slides (n=50): [ARCHIVE-GOOD-001 through ARCHIVE-GOOD-050] (TCGA & Nottingham validated benchmark slides)
-# Calibration Performance Metrics:
-#   - Hard-fail sensitivity: >= 90%
-#   - False-fail rate on clean slides: <= 2.0%
+# OncoGemma Automated Slide Quality Control (QC) Configuration
+# PRD 02-stage-v4.1-preprocess-qc §3.1 Automated Pre-Flight Checks
 
 tissue_coverage:
   fail_threshold: 0.02  # < 2% tissue coverage triggers hard fail
   warn_threshold: 0.05  # < 5% tissue coverage triggers warning
 
 focus:
-  vol_threshold: 5.0    # Variance of Laplacian (VoL) threshold below which a 512x512 tile is considered blurry
+  vol_threshold: 45.0   # Variance of Laplacian (VoL) threshold below which a 512x512 tile is considered blurry (PRD §3.1)
   tile_size_px: 512
   sample_max_tiles: 400
-  fail_blurry_ratio: 0.70  # > 70% blurry tissue tiles triggers hard fail
-  warn_blurry_ratio: 0.30  # > 30% blurry tissue tiles triggers warning
+  fail_blurry_ratio: 0.30  # > 30% blurry tissue tiles triggers hard fail (PRD §3.1)
+  warn_blurry_ratio: 0.10  # > 10% blurry tissue tiles triggers warning (PRD §3.1)
 
 pen_marks:
   min_component_area_mm2: 1.0  # Connected components > 1.0 mm² trigger warning

@@ -131,57 +131,75 @@ class PureNumpyMacenkoNormalizer:
     def transform(self, source_rgb: np.ndarray, beta: float = 0.12) -> np.ndarray:
         """
         Calibrated clinical H&E stain normalization for digital pathology:
-        1. Deconvolves optical density into Hematoxylin and Eosin stain channels.
+        1. Deconvolves optical density into Hematoxylin and Eosin stain channels using fitted source matrix if available.
         2. Normalizes concentrations to standard reference bounds.
-        3. Re-projects onto standard clinical H&E absorption vectors (deep purple nuclei, vibrant pink cytoplasm).
+        3. Re-projects onto target clinical H&E absorption vectors (deep purple nuclei, vibrant pink cytoplasm).
         4. Preserves clear glass background stroma.
         """
         rgb = np.maximum(source_rgb.astype(np.float64), 1.0)
         od = -np.log10(rgb / 255.0)
         orig_shape = source_rgb.shape
 
-        # Standard reference H&E absorption vectors (WHO / tiatoolbox clinical profile)
-        W_target = np.array([
-            [0.644, 0.717, 0.267],   # Hematoxylin (deep royal violet/purple)
-            [0.093, 0.954, 0.283]    # Eosin (rich vibrant pink/magenta)
-        ], dtype=np.float64)
+        # Reference target absorption vectors and max concentrations
+        if self.stain_matrix_target is not None:
+            W_target = np.array(self.stain_matrix_target, dtype=np.float64)
+        else:
+            # Standard reference H&E absorption vectors (WHO / tiatoolbox clinical profile)
+            W_target = np.array([
+                [0.644, 0.717, 0.267],   # Hematoxylin (deep royal violet/purple)
+                [0.093, 0.954, 0.283]    # Eosin (rich vibrant pink/magenta)
+            ], dtype=np.float64)
         W_target = W_target / (np.linalg.norm(W_target, axis=1, keepdims=True) + 1e-8)
 
+        if self.max_conc_target is not None:
+            maxC_target = np.array(self.max_conc_target, dtype=np.float64)
+        else:
+            maxC_target = np.array([1.85, 1.05], dtype=np.float64)
+
         od_flat = od.reshape(-1, 3)
-        od_tissue = od_flat[np.any(od_flat > beta, axis=1)]
-        if len(od_tissue) < 50:
-            od_tissue = od_flat
 
-        _, _, V = np.linalg.svd(od_tissue, full_matrices=False)
-        V = V[:2]
-        That = np.dot(od_tissue, V.T)
-        phi = np.arctan2(That[:, 1], That[:, 0])
-
-        min_phi = np.percentile(phi, 1.0)
-        max_phi = np.percentile(phi, 99.0)
-
-        v1 = np.dot(V.T, np.array([np.cos(min_phi), np.sin(min_phi)]))
-        v2 = np.dot(V.T, np.array([np.cos(max_phi), np.sin(max_phi)]))
-
-        if np.abs(max_phi - min_phi) < 0.25 or np.dot(v1, v2) > 0.95:
-            W_src = np.array([[0.65, 0.70, 0.29], [0.07, 0.99, 0.11]], dtype=np.float64)
+        # Deconvolution: use fitted slide source matrix if available, else fall back to tile SVD
+        if self.stain_matrix_src is not None and self.max_conc_src is not None:
+            W_src = np.array(self.stain_matrix_src, dtype=np.float64)
+            W_src = W_src / (np.linalg.norm(W_src, axis=1, keepdims=True) + 1e-8)
+            maxC_src = np.array(self.max_conc_src, dtype=np.float64)
+            maxC_src = np.maximum(maxC_src, 0.15)
+            C = np.linalg.lstsq(W_src.T, od_flat.T, rcond=None)[0]
+            C = np.maximum(C, 0.0)
         else:
-            if v1[0] > v2[0]:
-                W_src = np.array([v1, v2], dtype=np.float64)
+            od_tissue = od_flat[np.any(od_flat > beta, axis=1)]
+            if len(od_tissue) < 50:
+                od_tissue = od_flat
+
+            _, _, V = np.linalg.svd(od_tissue, full_matrices=False)
+            V = V[:2]
+            That = np.dot(od_tissue, V.T)
+            phi = np.arctan2(That[:, 1], That[:, 0])
+
+            min_phi = np.percentile(phi, 1.0)
+            max_phi = np.percentile(phi, 99.0)
+
+            v1 = np.dot(V.T, np.array([np.cos(min_phi), np.sin(min_phi)]))
+            v2 = np.dot(V.T, np.array([np.cos(max_phi), np.sin(max_phi)]))
+
+            if np.abs(max_phi - min_phi) < 0.25 or np.dot(v1, v2) > 0.95:
+                W_src = np.array([[0.65, 0.70, 0.29], [0.07, 0.99, 0.11]], dtype=np.float64)
             else:
-                W_src = np.array([v2, v1], dtype=np.float64)
+                if v1[0] > v2[0]:
+                    W_src = np.array([v1, v2], dtype=np.float64)
+                else:
+                    W_src = np.array([v2, v1], dtype=np.float64)
 
-        W_src = W_src / (np.linalg.norm(W_src, axis=1, keepdims=True) + 1e-8)
+            W_src = W_src / (np.linalg.norm(W_src, axis=1, keepdims=True) + 1e-8)
 
-        C = np.linalg.lstsq(W_src.T, od_flat.T, rcond=None)[0]
-        C = np.maximum(C, 0.0)
+            C = np.linalg.lstsq(W_src.T, od_flat.T, rcond=None)[0]
+            C = np.maximum(C, 0.0)
 
-        maxC_target = np.array([1.85, 1.05], dtype=np.float64)
-        if np.any(od_flat > beta):
-            maxC_src = np.percentile(C[:, np.any(od_flat > beta, axis=1)], 99.0, axis=1)
-        else:
-            maxC_src = np.array([1.0, 1.0], dtype=np.float64)
-        maxC_src = np.maximum(maxC_src, 0.15)
+            if np.any(od_flat > beta):
+                maxC_src = np.percentile(C[:, np.any(od_flat > beta, axis=1)], 99.0, axis=1)
+            else:
+                maxC_src = np.array([1.0, 1.0], dtype=np.float64)
+            maxC_src = np.maximum(maxC_src, 0.15)
 
         scale = np.clip(maxC_target[:, None] / maxC_src[:, None], 0.75, 1.35)
         C_norm = C * scale
@@ -286,8 +304,18 @@ def fit_macenko_stain(
     max_x_um = max(patch_size_um, thumb_w_um - patch_size_um)
     max_y_um = max(patch_size_um, thumb_h_um - patch_size_um)
 
-    candidate_xs = rng.uniform(0, max_x_um, size=100)
-    candidate_ys = rng.uniform(0, max_y_um, size=100)
+    tissue_coords = np.argwhere(tissue_mask_1bit)  # [row, col] -> [y, x]
+    mask_h, mask_w = tissue_mask_1bit.shape
+
+    if len(tissue_coords) > 0:
+        sample_size = min(150, len(tissue_coords))
+        chosen_indices = rng.choice(len(tissue_coords), size=sample_size, replace=(len(tissue_coords) < sample_size))
+        chosen_coords = tissue_coords[chosen_indices]
+        candidate_xs = np.clip((chosen_coords[:, 1] / float(mask_w)) * thumb_w_um - patch_size_um / 2.0, 0, max_x_um)
+        candidate_ys = np.clip((chosen_coords[:, 0] / float(mask_h)) * thumb_h_um - patch_size_um / 2.0, 0, max_y_um)
+    else:
+        candidate_xs = rng.uniform(0, max_x_um, size=100)
+        candidate_ys = rng.uniform(0, max_y_um, size=100)
 
     for x_um, y_um in zip(candidate_xs, candidate_ys):
         if len(valid_patches) >= 50:
@@ -301,19 +329,28 @@ def fit_macenko_stain(
         if np.mean(sat_channel) >= 0.05:
             valid_patches.append(patch_rgb)
 
+    fit_status = "fitted"
     if not valid_patches:
+        fit_status = "degenerate"
         valid_patches.append(thumb_arr)
+    elif len(valid_patches) < 5:
+        fit_status = "sparse"
 
     mosaic = np.concatenate(valid_patches, axis=0)
     
-    try:
-        if hasattr(normalizer, "fit"):
+    fit_success = False
+    if hasattr(normalizer, "fit"):
+        try:
+            normalizer.fit(ref_arr, mosaic)
+            fit_success = True
+        except Exception as fit_err:
+            import logging
+            logging.warning(f"[Stain Normalizer Warning] Stain fit on mosaic failed ({fit_err}); retrying on target reference only.")
             try:
-                normalizer.fit(ref_arr, mosaic)
-            except Exception:
                 normalizer.fit(ref_arr)
-    except Exception:
-        pass
+                fit_success = True
+            except Exception as ref_err:
+                logging.warning(f"[Stain Normalizer Warning] Target reference fit failed ({ref_err}); using default clinical vectors.")
 
     stain_mat = getattr(normalizer, "stain_matrix", None)
     if stain_mat is None:
@@ -323,12 +360,19 @@ def fit_macenko_stain(
     if max_conc is None:
         max_conc = np.array([1.95, 1.10])
 
+    stain_mat_src = getattr(normalizer, "stain_matrix_src", None)
+    max_conc_src = getattr(normalizer, "max_conc_src", None)
+
     stain_params_dict = {
         "stain_matrix": np.array(stain_mat).tolist(),
         "max_concentrations": np.array(max_conc).tolist(),
+        "stain_matrix_src": np.array(stain_mat_src).tolist() if stain_mat_src is not None else None,
+        "max_conc_src": np.array(max_conc_src).tolist() if max_conc_src is not None else None,
         "ref_image_path": ref_image_path,
         "patches_sampled": len(valid_patches),
-        "seed_int": seed_int
+        "seed_int": seed_int,
+        "fit_status": fit_status,
+        "fit_success": fit_success
     }
 
     return normalizer, stain_params_dict, tissue_mask_1bit

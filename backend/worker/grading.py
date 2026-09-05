@@ -96,7 +96,8 @@ def select_max_density_hotspot_patches(
     n_patches: int = 24,
     patch_size_um: float = 512.0,
     min_dist_um: float = 384.0,
-    min_density: float = 0.50
+    min_density: float = 0.50,
+    checksum_sha256: Optional[str] = None
 ) -> List[Dict[str, Any]]:
     """
     Selects n_patches (24) 10x evidence patches ensuring:
@@ -104,9 +105,13 @@ def select_max_density_hotspot_patches(
     2. The patch with maximum tissue density within each hotspot is chosen first (preventing lumina/empty voids).
     3. Additional non-overlapping high-density sites inside hotspots or on invasive tumor margins are selected
        until exactly n_patches are obtained.
+    4. Deterministic sampling is seeded by slide checksum (Issue #145).
     """
     from scipy.ndimage import uniform_filter
     from shapely.geometry import Polygon, Point
+
+    seed_int = int(checksum_sha256[:8], 16) if checksum_sha256 and checksum_sha256 != "default_checksum" else 42
+    rng = np.random.default_rng(seed_int)
 
     H_m, W_m = tissue_mask.shape
     s_x = W_m / max(slide_dims_um[0], 1.0)
@@ -402,7 +407,8 @@ def run_grading(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str,
             base_mpp=base_mpp,
             case_id=case_id,
             n_patches=n_patches,
-            patch_size_um=patch_size_um
+            patch_size_um=patch_size_um,
+            checksum_sha256=getattr(slide, "checksum_sha256", None)
         )
 
         normalizer = MacenkoNormalizer()
@@ -478,6 +484,7 @@ def run_grading(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str,
 
         # 5. Async Dispatch to MedGemma 1.5 with Concurrency Limiter (<= 4)
         medgemma = MedGemmaClient()
+        schema_failed_patches = []
 
         async def execute_medgemma_pipeline():
             sem = asyncio.Semaphore(4)
@@ -487,20 +494,18 @@ def run_grading(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str,
                     try:
                         return await medgemma.evaluate_tubule(img_bytes, tubule_prompt)
                     except SchemaRetryExhaustedError as e:
-                        if not settings.USE_MOCK_VERTEX_AI:
-                            raise
-                        print(f"[Worker Grading Warning] Tubule patch {p_id} schema error: {e}")
-                        return TubuleResponse(tubule_percent=20, tumor_present=True, confidence="low")
+                        print(f"[Worker Grading Warning] Tubule patch {p_id} schema retry exhausted: {e}")
+                        schema_failed_patches.append(f"tubule:{p_id}")
+                        return TubuleResponse(tubule_percent=0, tumor_present=False, confidence="unassessed_schema_error")
 
             async def evaluate_single_pleo(img_bytes: bytes, p_id: str):
                 async with sem:
                     try:
                         return await medgemma.evaluate_pleomorphism(img_bytes, pleo_prompt)
                     except SchemaRetryExhaustedError as e:
-                        if not settings.USE_MOCK_VERTEX_AI:
-                            raise
-                        print(f"[Worker Grading Warning] Pleo patch {p_id} schema error: {e}")
-                        return PleoResponse(pleomorphism_score=2, rationale="Moderate variation (fallback)", confidence="low")
+                        print(f"[Worker Grading Warning] Pleo patch {p_id} schema retry exhausted: {e}")
+                        schema_failed_patches.append(f"pleo:{p_id}")
+                        return PleoResponse(pleomorphism_score=1, rationale="VLM schema retry exhausted; flagged for pathologist review", confidence="unassessed_schema_error")
 
             tubule_tasks = [evaluate_single_tubule(b, p["id"]) for b, p in zip(patch_images_bytes, extracted_patches)]
             pleo_tasks = [evaluate_single_pleo(b, p["id"]) for b, p in zip(patch_images_bytes, extracted_patches)]
@@ -513,6 +518,15 @@ def run_grading(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str,
             pleo_res = await asyncio.gather(*pleo_tasks)
             try:
                 type_res = await type_task
+            except SchemaRetryExhaustedError as e:
+                print(f"[Worker Grading Warning] Histologic type schema error: {e}")
+                schema_failed_patches.append("histologic_type")
+                type_res = HistologicTypeResponse(
+                    type="Unclassified Carcinoma",
+                    differential=["IDC-NST", "ILC"],
+                    rationale="VLM schema retry exhausted; unconfirmed, flagged for pathologist review.",
+                    confidence="unassessed_schema_error"
+                )
             except Exception as e:
                 if not settings.USE_MOCK_VERTEX_AI:
                     raise
@@ -527,12 +541,14 @@ def run_grading(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str,
             return tubule_res, pleo_res, type_res
 
         tubule_responses, pleo_responses, type_response = asyncio.run(execute_medgemma_pipeline())
+        needs_human_flag = len(schema_failed_patches) > 0
 
         # Map patch-level results
         patches_output = []
         for idx, p in enumerate(extracted_patches):
             t_res = tubule_responses[idx]
             p_res = pleo_responses[idx]
+            rev_status = "needs_review" if (t_res.confidence == "unassessed_schema_error" or p_res.confidence == "unassessed_schema_error") else "suggested"
             patches_output.append({
                 "id": p["id"],
                 "index": p["index"],
@@ -554,7 +570,7 @@ def run_grading(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str,
                     "rationale": p_res.rationale,
                     "confidence": p_res.confidence
                 },
-                "review_status": "suggested"
+                "review_status": rev_status
             })
 
         # Format HPF sites for Stage 5 dual-level review
@@ -603,6 +619,8 @@ def run_grading(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str,
             "histologic_type": type_response.model_dump(),
             "narrative": narrative_text,
             "model_versions": model_versions,
+            "needs_human": needs_human_flag,
+            "schema_failed_patches": schema_failed_patches,
             "generated_at": datetime.now(timezone.utc).isoformat()
         }
 
@@ -629,6 +647,9 @@ def run_grading(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str,
             existing_grading.grade = aggregate_res["grade"]
             existing_grading.histologic_type = type_response.type
             existing_grading.machine = output_payload
+            # Issue #143: Re-running grading must clear stale overrides and unconfirm type
+            existing_grading.overrides = {}
+            existing_grading.type_confirmed_by = "unconfirmed"
         else:
             new_grading = Grading(
                 case_id=stage_exec.case_id,
@@ -658,13 +679,17 @@ def run_grading(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str,
                 "pleo_score": aggregate_res["pleo_score"],
                 "mitotic_score": aggregate_res["mitotic_score"],
                 "histologic_type": type_response.type,
-                "flags": aggregate_res["flags"]
+                "flags": aggregate_res["flags"],
+                "needs_human": needs_human_flag,
+                "schema_failed_patches": schema_failed_patches
             }
         )
         db.add(audit_evt)
         db.commit()
 
         stage_exec.status = "awaiting_review"
+        if needs_human_flag:
+            stage_exec.error = f"Flagged for pathologist review: schema parsing errors on {len(schema_failed_patches)} patches"
         print(f"[Worker Stage 5: Grading] Completed successfully for case {case_id}. Nottingham Grade {aggregate_res['grade']} (Sum {aggregate_res['nottingham_sum']}/9). Status: awaiting_review.")
 
         return output_uri, model_versions

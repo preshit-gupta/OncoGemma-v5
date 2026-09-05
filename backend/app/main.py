@@ -146,6 +146,8 @@ app.include_router(report_router)
 app.include_router(worker_webhook_router)
 app.include_router(admin_router)
 
+@app.get("/health")
+@app.get("/api/health")
 @app.get("/healthz")
 def health_check():
     try:

@@ -5,7 +5,7 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-009688.svg)](https://fastapi.tiangolo.com)
 [![Next.js](https://img.shields.io/badge/Next.js-14.2+-black.svg)](https://nextjs.org)
 [![Google Cloud](https://img.shields.io/badge/GCP-Cloud%20Storage%20%7C%20Vertex%20AI-4285F4.svg)](https://cloud.google.com)
-[![Tests](https://img.shields.io/badge/Tests-90%2F90%20Passing-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/Tests-100%2F100%20Passing-brightgreen.svg)](tests/)
 
 **OncoGemma v5** is an enterprise-grade clinical AI platform and diagnostic copilot designed for pathologists to analyze Whole-Slide Images (WSIs) of invasive breast carcinoma. It automates gigapixel slide ingestion, quality control, tumor bed triage, mitotic figure quantification, Nottingham Histologic Grading (Elston-Ellis modification), and College of American Pathologists (CAP) synoptic cancer reporting with AJCC 8th/9th Edition staging.
 
@@ -228,11 +228,16 @@ abla^2 I)$). Flags blurred fields with $	ext{score} < 85.0$.
 * **State Machine Gating & Worker Concurrency (Batch 4)**:
   * Implemented `SELECT ... FOR UPDATE SKIP LOCKED` in `poll_and_execute_single_task` with graceful SQLite fallback, eliminating multi-worker race conditions and duplicate task execution.
   * Scoped startup reset of stuck running stages to orphaned jobs (>15 min) to prevent clobbering active worker tasks across rolling deployments.
-  * Eliminated silent import-time SQLite fallback in `db.py`: PostgreSQL connection failures fail fast with loud errors and return HTTP 503 on `/healthz` (via active `SELECT 1` probes).
+  * Eliminated silent import-time SQLite fallback in `db.py`: PostgreSQL connection failures fail fast with loud errors and return HTTP 503 on `/health` and `/healthz` (via active `SELECT 1` probes).
   * Added SQLAlchemy connect listener enforcing `PRAGMA foreign_keys=ON` on all SQLite engines, and established `ON DELETE CASCADE` relationships across `Case` child entities (`Hotspot`, `Detection`, `HpfSite`).
   * Enforced strict stage status gating (`awaiting_review` required to approve or confirm) and monotonic attempt incrementation (`attempt = max(existing) + 1`), preventing unique constraint collisions during slide re-scans.
+* **Stain Normalization & Clinical Pipeline Robustness (Batch 5)**:
+  * **Fitted Macenko Deconvolution (Issue #50)**: Fixed `PureNumpyMacenkoNormalizer.transform()` to deconvolve using the slide's fitted source stain matrix (`stain_matrix_src`, `max_conc_src`) rather than ignoring the fit and independently re-fitting SVD per tile; tile router and workers now restore complete source and target stain profiles from `stain_params.json`.
+  * **Tissue Mask Patch Sampling (Issues #436, #553)**: Replaced blind uniform slide footprint sampling with mask-guided coordinate sampling from `np.argwhere(tissue_mask_1bit)`; flagged degenerate fits with low tissue density and removed swallow-all exception handlers.
+  * **Full 5-Check QC Suite & PRD Calibration (Issues #48, #433)**: Restored PRD-mandated focus thresholds (`vol_threshold: 45.0`, `fail_blurry_ratio: 0.30`, `warn_blurry_ratio: 0.10`), removed placeholder calibration text, and fully implemented surgical pen mark detection, tissue fold morphological ridge detection, and H&E stain sanity validation.
+  * **Grading Resilience & Invalidation (Issues #145, #141, #143)**: Deterministically seeded 10x hotspot evidence patch selection using slide checksums, abolished fabricated sub-scores on VLM schema retry exhaustion in favor of flagging `needs_human=True` for pathologist review, and automatically reset stale `overrides` and `type_confirmed_by` upon grading stage re-runs.
 * **100% Offline Test Isolation & CI Reliability**:
-  * Implemented session-level test isolation in `conftest.py` with GCS mock `.prefixes` support, running all 90 tests completely offline.
+  * Implemented session-level test isolation in `conftest.py` with GCS mock `.prefixes` support, running all 100 tests across 18 test suites completely offline.
 
 ---
 

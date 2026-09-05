@@ -99,6 +99,10 @@ def generate_tile_on_the_fly(
                 norm_obj = PureNumpyMacenkoNormalizer()
                 norm_obj.stain_matrix_target = np.array(stain_params["stain_matrix"])
                 norm_obj.max_conc_target = np.array(stain_params["max_concentrations"])
+                if stain_params.get("stain_matrix_src") is not None:
+                    norm_obj.stain_matrix_src = np.array(stain_params["stain_matrix_src"])
+                if stain_params.get("max_conc_src") is not None:
+                    norm_obj.max_conc_src = np.array(stain_params["max_conc_src"])
                 tile_arr = norm_obj.transform(tile_arr)
             except Exception as norm_err:
                 print(f"[Tile Router Warning] On-the-fly norm transform note: {norm_err}")

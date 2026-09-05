@@ -221,7 +221,7 @@ def run_preprocess(stage_execution: StageExecution, session: Session) -> tuple[s
             "thumbnail_uri": thumbnail_uri,
             "tissue_mask_uri": tissue_mask_uri,
             "tissue_area_mm2": round(tissue_area_mm2, 2),
-            "model_versions": {"tiatoolbox": "1.6.0"}
+            "model_versions": {"stain_normalizer": normalizer.__class__.__name__}
         }
 
         output_ref = f"gs://{settings.GCS_ARTIFACTS_BUCKET}/cases/{case_id}/preprocess/output.json"
