@@ -644,6 +644,8 @@ export default function CaseWorkspacePage({ params }: { params: { id: string } }
               </div>
             </div>
           </div>
+        )}
+
         {/* QC Failure Clinical Override Modal */}
         {overrideModalOpen && (
           <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50 p-4">
