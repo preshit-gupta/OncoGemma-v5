@@ -31,6 +31,9 @@ from app.core.db import Base, get_db
 from app.models.case import Case
 from app.models.slide import Slide
 from app.models.grading import Grading
+from app.models.hotspot import Hotspot
+from app.models.detection import Detection
+from app.models.hpf_site import HpfSite
 from app.models.stage_execution import StageExecution
 from app.models.report import Report
 from app.models.audit import AuditEvent
@@ -248,6 +251,51 @@ def test_run_grading_worker_fails_fast_on_zero_hotspots():
 
     with pytest.raises(ValueError, match="No confirmed tumor hotspots"):
         run_grading(stage_exec, db)
+    db.close()
+
+
+def test_run_grading_worker_queries_detections_without_name_error():
+    """run_grading must query Detection and HpfSite without raising NameError."""
+    db = TestingSessionLocal()
+    case_uid = uuid.uuid4()
+    slide_uid = uuid.uuid4()
+
+    case = Case(id=case_uid, status="in_progress", created_by="test_user")
+    slide = Slide(id=slide_uid, case_id=case_uid, gcs_uri_original="gs://test/test.svs", mpp_x=0.25, mpp_y=0.25)
+    stage_exec_uid = uuid.uuid4()
+    stage_exec = StageExecution(id=stage_exec_uid, case_id=case_uid, stage="grading", attempt=1, status="in_progress")
+    hotspot = Hotspot(
+        id="hs_01",
+        case_id=case_uid,
+        stage_execution_id=stage_exec_uid,
+        polygon_um=[[1000.0, 1000.0], [2000.0, 1000.0], [2000.0, 2000.0], [1000.0, 2000.0]],
+        prob_mean=0.9
+    )
+    det = Detection(
+        id="m_001",
+        case_id=case_uid,
+        hotspot_id="hs_01",
+        centroid_um=[1500.0, 1500.0],
+        label="mitosis",
+        label_source="model"
+    )
+    hpf = HpfSite(
+        seq=1,
+        case_id=case_uid,
+        center_um=[1500.0, 1500.0],
+        radius_um=262.0,
+        mitotic_count=1
+    )
+    db.add_all([case, slide, stage_exec, hotspot, det, hpf])
+    db.commit()
+
+    with mock.patch("worker.grading.download_blob_to_filename"), \
+         mock.patch("os.path.exists", return_value=True), \
+         mock.patch("openslide.OpenSlide") as mock_os:
+        # Halt execution right after the Stage 4 mitotic score retrieval step
+        mock_os.side_effect = RuntimeError("OpenSlide stopped after detection query")
+        with pytest.raises(RuntimeError, match="OpenSlide stopped after detection query"):
+            run_grading(stage_exec, db)
     db.close()
 
 
