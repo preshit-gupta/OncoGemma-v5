@@ -133,18 +133,16 @@ def select_max_density_hotspot_patches(
     hs_data = []
     all_internal_cands = []
 
+    if not hotspots:
+        raise ValueError(f"No confirmed tumor hotspots provided for patch selection in case {case_id}.")
+
     for hs in hotspots:
         poly_raw = getattr(hs, "polygon_um", None) or (hs.get("polygon_um") if isinstance(hs, dict) else None)
-        poly_arr = np.array(poly_raw) if poly_raw else np.array([[5000, 5000]])
+        if not poly_raw:
+            continue
+        poly_arr = np.array(poly_raw)
         if len(poly_arr) < 3:
-            cx = float(poly_arr[:, 0].mean())
-            cy = float(poly_arr[:, 1].mean())
-            poly_arr = np.array([
-                [cx - 200, cy - 200],
-                [cx + 200, cy - 200],
-                [cx + 200, cy + 200],
-                [cx - 200, cy + 200]
-            ])
+            continue
             
         poly_geom = Polygon(poly_arr).buffer(0)
         prob = float(getattr(hs, "prob_mean", None) or (hs.get("prob_mean") if isinstance(hs, dict) else None) or getattr(hs, "tumor_probability", 0.85) or 0.85)
@@ -265,20 +263,8 @@ def select_max_density_hotspot_patches(
                 })
                 selected_coords.append((x, y))
 
-    # Fallback if still under n_patches
-    while len(selected) < n_patches:
-        idx = len(selected)
-        cx_um = 5000.0 + (idx % 5) * 1500.0
-        cy_um = 5000.0 + (idx // 5) * 1500.0
-        selected.append({
-            "hotspot_id": f"hs_{(idx % len(hs_data)) + 1:02d}" if hs_data else "hs_01",
-            "center_um": [round(float(cx_um), 2), round(float(cy_um), 2)],
-            "center_x_px": int(round(cx_um / base_mpp)),
-            "center_y_px": int(round(cy_um / base_mpp)),
-            "tissue_density": 0.85,
-            "tumor_probability": 0.80,
-            "source": "grid_fallback"
-        })
+    if not selected:
+        raise ValueError(f"No valid tumor tissue patches could be sampled from confirmed hotspots for case {case_id}.")
 
     for idx, p in enumerate(selected[:n_patches]):
         p["id"] = f"p_{idx+1:03d}"
@@ -308,6 +294,23 @@ def run_grading(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str,
         raise ValueError(f"Slide for case {case_id} is missing valid MPP (status='needs_mpp'). Cannot execute grading stage.")
     base_mpp = float(slide.mpp_x)
 
+    # 1. Fetch Stage 3 Hotspots (Fail fast before downloading large slide file)
+    stmt_hotspots = select(Hotspot).where(Hotspot.case_id == case.id).order_by(Hotspot.prob_mean.desc())
+    db_hotspots = list(db.scalars(stmt_hotspots).all())
+    hotspots = [h for h in db_hotspots if not getattr(h, "excluded", False)]
+
+    # Fallback to triage output.json if no DB hotspots found
+    if not hotspots:
+        try:
+            t_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/triage/output.json")
+            t_data = json.loads(t_bytes.decode("utf-8"))
+            hotspots = [h for h in t_data.get("hotspots", []) if not h.get("excluded", False)]
+        except Exception:
+            pass
+
+    if not hotspots:
+        raise ValueError(f"No confirmed tumor hotspots available for case {case_id}. Cannot execute Nottingham grading stage.")
+
     scratch_dir = tempfile.mkdtemp(prefix="og_grading_")
 
     try:
@@ -319,20 +322,6 @@ def run_grading(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str,
         download_blob_to_filename(raw_bucket_name, blob_name, local_slide_path)
         if not os.path.exists(local_slide_path):
             raise FileNotFoundError(f"Whole slide image file for case {case_id} not found in GCS.")
-
-        # 1. Fetch Stage 3 Hotspots & Stage 4 Mitotic Score
-        stmt_hotspots = select(Hotspot).where(Hotspot.case_id == case.id).order_by(Hotspot.prob_mean.desc())
-        db_hotspots = list(db.scalars(stmt_hotspots).all())
-        hotspots = [h for h in db_hotspots if not getattr(h, "excluded", False)]
-
-        # Fallback to triage output.json if no DB hotspots found
-        if not hotspots:
-            try:
-                t_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/triage/output.json")
-                t_data = json.loads(t_bytes.decode("utf-8"))
-                hotspots = [h for h in t_data.get("hotspots", []) if not h.get("excluded", False)]
-            except Exception:
-                pass
 
         # Retrieve confirmed Mitotic Score from Stage 4 (no double-counting across overlapping HPFs)
         stmt_hpfs = select(HpfSite).where(HpfSite.case_id == case.id).order_by(HpfSite.seq.asc())
@@ -522,7 +511,7 @@ def run_grading(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str,
                 print(f"[Worker Grading Warning] Histologic type schema error: {e}")
                 schema_failed_patches.append("histologic_type")
                 type_res = HistologicTypeResponse(
-                    type="Unclassified Carcinoma",
+                    type="other",
                     differential=["IDC-NST", "ILC"],
                     rationale="VLM schema retry exhausted; unconfirmed, flagged for pathologist review.",
                     confidence="unassessed_schema_error"

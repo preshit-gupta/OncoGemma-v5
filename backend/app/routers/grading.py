@@ -17,11 +17,13 @@ from typing import Any, Dict, List, Optional, Literal
 import numpy as np
 from PIL import Image
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.auth import get_current_user, CurrentUser
+from app.core.openslide_lock import OPENSLIDE_GLOBAL_LOCK
 from app.core.gcs import (
     get_gcs_client,
     parse_gcs_uri,
@@ -36,6 +38,8 @@ from app.models.stage_execution import StageExecution
 from app.models.hpf_site import HpfSite
 from app.models.detection import Detection
 from app.models.grading import Grading
+from app.models.hotspot import Hotspot
+from app.models.report import Report
 from app.models.audit import AuditEvent
 from pipeline.grading import (
     calculate_nottingham_grade,
@@ -53,6 +57,28 @@ router = APIRouter(prefix="/api/v1/stages/grading", tags=["grading"])
 # ---------------------------------------------------------------------------
 # Pydantic Request / Response Schemas
 # ---------------------------------------------------------------------------
+
+VALID_OVERRIDE_COMPONENTS = {"tubule", "pleo", "mitotic", "patches", "hpfs"}
+VALID_HISTOLOGIC_TYPES = {
+    "IDC-NST", "ILC", "mucinous", "tubular", "papillary", "metaplastic", "other"
+}
+
+class ScoreOverrideItem(BaseModel):
+    score: Optional[int] = Field(None, ge=1, le=3)
+    percent: Optional[float] = Field(None, ge=0.0, le=100.0)
+    justification: Optional[str] = None
+    original_score: Optional[int] = None
+    overridden_at: Optional[str] = None
+
+
+class ConfirmHistologicTypePayload(BaseModel):
+    case_id: str
+    histologic_type: Literal[
+        "IDC-NST", "ILC", "mucinous", "tubular", "papillary", "metaplastic", "other"
+    ]
+    justification: Optional[str] = None
+    reviewed_by: Optional[str] = "user_pathologist_001"
+
 
 class SinglePatchReview(BaseModel):
     patch_id: str
@@ -104,6 +130,20 @@ class ConfirmGradingPayload(BaseModel):
     mitotic_score: int = Field(ge=1, le=3)
     nottingham_sum: int = Field(ge=3, le=9)
     grade: int = Field(ge=1, le=3)
+
+    @field_validator("overrides")
+    @classmethod
+    def validate_overrides_dict(cls, v: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(v, dict):
+            raise ValueError("Overrides must be a dictionary.")
+        for k, item in v.items():
+            if k not in VALID_OVERRIDE_COMPONENTS:
+                raise ValueError(f"Unknown override component '{k}'. Must be one of {sorted(VALID_OVERRIDE_COMPONENTS)}.")
+            if k in ("tubule", "pleo", "mitotic"):
+                if not isinstance(item, dict):
+                    raise ValueError(f"Override for '{k}' must be a dictionary.")
+                ScoreOverrideItem.model_validate(item)
+        return v
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +197,7 @@ def _build_grading_stage_data_dict(
         return {
             "case_id": str(case_id),
             "status": stage_exec.status if stage_exec else "not_started",
+            "can_confirm": False,
             "mitotic_summary": {
                 "total_mitoses": total_mitoses,
                 "mitotic_score": m_score,
@@ -230,18 +271,7 @@ def _build_grading_stage_data_dict(
                 for h in sorted(db_hpfs, key=lambda x: getattr(x, "seq", 0))
             ]
         else:
-            raw_hpfs = [
-                {
-                    "seq": i,
-                    "center_um": [0, 0],
-                    "radius_um": 262.0,
-                    "mitotic_count": 0,
-                    "density_mm2": 0.0,
-                    "review_status": "suggested"
-                }
-                for i in range(1, 11)
-            ]
-
+            raw_hpfs = []
 
     merged_hpfs = []
     for h in raw_hpfs:
@@ -267,11 +297,15 @@ def _build_grading_stage_data_dict(
     all_hpfs_reviewed = (approved_hpfs == total_hpfs and total_hpfs > 0)
 
     # 3. Dynamic Zero-LLM Aggregation from Reviewed Dataset
-    hpf_counts = [
-        h["user_mitotic_count"] if h.get("user_mitotic_count") is not None else h.get("mitotic_count", 0)
-        for h in merged_hpfs
-    ]
-    tot_mitoses, calc_mitotic_score = calculate_mitotic_score_from_hpfs(hpf_counts, scoring_cfg)
+    if merged_hpfs:
+        hpf_counts = [
+            h["user_mitotic_count"] if h.get("user_mitotic_count") is not None else h.get("mitotic_count", 0)
+            for h in merged_hpfs
+        ]
+        tot_mitoses, calc_mitotic_score = calculate_mitotic_score_from_hpfs(hpf_counts, scoring_cfg)
+    else:
+        tot_mitoses = 0
+        calc_mitotic_score = grading_record.mitotic_score if grading_record else 1
 
     tubule_dicts = [
         {
@@ -296,21 +330,57 @@ def _build_grading_stage_data_dict(
         cfg=scoring_cfg
     )
 
-    # 4. Top-level overrides (if manually set)
-    eff_tubule_score = overrides.get("tubule", {}).get("score", dyn_agg["tubule_score"])
-    eff_tubule_percent = overrides.get("tubule", {}).get("percent", dyn_agg["tubule_percent"])
-    eff_pleo_score = overrides.get("pleo", {}).get("score", dyn_agg["pleo_score"])
-    eff_mitotic_score = overrides.get("mitotic", {}).get("score", calc_mitotic_score)
+    # 4. Top-level overrides (if manually set) - Safely typed parsing
+    def _safe_override_score(comp: str, default: int) -> int:
+        ovr = overrides.get(comp)
+        if isinstance(ovr, dict):
+            val = ovr.get("score")
+            if val in (1, 2, 3, "1", "2", "3"):
+                try:
+                    return int(val)
+                except Exception:
+                    pass
+        return default
+
+    def _safe_override_percent(comp: str, default: Optional[float]) -> Optional[float]:
+        ovr = overrides.get(comp)
+        if isinstance(ovr, dict):
+            val = ovr.get("percent")
+            if val is not None:
+                try:
+                    pct = float(val)
+                    if 0.0 <= pct <= 100.0:
+                        return pct
+                except Exception:
+                    pass
+        return default
+
+    eff_tubule_score = _safe_override_score("tubule", dyn_agg["tubule_score"])
+    eff_tubule_percent = _safe_override_percent("tubule", dyn_agg["tubule_percent"])
+    eff_pleo_score = _safe_override_score("pleo", dyn_agg["pleo_score"])
+    eff_mitotic_score = _safe_override_score("mitotic", calc_mitotic_score)
 
     eff_sum, eff_grade = calculate_nottingham_grade(eff_tubule_score, eff_pleo_score, eff_mitotic_score, scoring_cfg)
 
+    existing_report = db.scalars(select(Report).where(Report.case_id == case_uid)).first()
+    is_signed = existing_report.status in ("signed", "amended") if existing_report else False
+
     is_type_confirmed = grading_record.type_confirmed_by != "unconfirmed"
-    can_confirm = all_patches_reviewed and all_hpfs_reviewed and is_type_confirmed
+    can_confirm = (
+        all_patches_reviewed
+        and all_hpfs_reviewed
+        and is_type_confirmed
+        and not is_signed
+        and (stage_exec is None or stage_exec.status != "confirmed")
+    )
 
     return {
         "case_id": str(case_id),
         "slide_id": str(case.slides[0].id) if case.slides else None,
         "status": stage_exec.status if stage_exec else "awaiting_review",
+        "is_signed": is_signed,
+        "can_confirm": can_confirm,
+        "report_status": existing_report.status if existing_report else None,
         "patches": merged_patches,
         "hpfs": merged_hpfs,
         "review_summary": {
@@ -484,7 +554,13 @@ def review_grading_hpfs(payload: HpfReviewPayload, db: Session = Depends(get_db)
         if db_hpfs:
             machine_hpfs = [{"seq": h.seq} for h in db_hpfs]
         else:
-            machine_hpfs = [{"seq": i} for i in range(1, 11)]
+            machine_hpfs = []
+
+    if not machine_hpfs:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot review HPFs: No HPF sites found for this case. Stage 4 Mitosis must be completed first."
+        )
 
 
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -587,6 +663,7 @@ def get_patch_image(case_id: str, patch_id: str, db: Session = Depends(get_db)):
                     raise HTTPException(status_code=400, detail="Slide is missing valid MPP (status='needs_mpp'). Cannot extract grading patch.")
                 mpp_x = float(slide.mpp_x)
 
+                hotspots = list(db.scalars(select(Hotspot).where(Hotspot.case_id == case_uid).order_by(Hotspot.prob_mean.desc())).all())
                 if hotspots and p_idx < len(hotspots):
                     hs = hotspots[p_idx]
                     poly = hs.polygon_um
@@ -636,38 +713,10 @@ def get_patch_image(case_id: str, patch_id: str, db: Session = Depends(get_db)):
     finally:
         shutil.rmtree(scratch_dir, ignore_errors=True)
 
-    # Fallback to high-definition histological synthetic patch
-    rng = np.random.RandomState(hash(f"{case_id}_{patch_id}") % (2**32))
-    base_color = np.array([235, 215, 230], dtype=np.float32)
-    patch_arr = np.ones((512, 512, 3), dtype=np.uint8) * base_color.astype(np.uint8)
-    noise = rng.normal(0, 8, (512, 512, 3)).astype(np.float32)
-    patch_arr = np.clip(patch_arr.astype(np.float32) + noise, 0, 255).astype(np.uint8)
-
-    from PIL import ImageDraw
-    pil_p = Image.fromarray(patch_arr)
-    draw = ImageDraw.Draw(pil_p)
-
-    n_glands = rng.randint(3, 8)
-    for _ in range(n_glands):
-        gx = rng.randint(60, 450)
-        gy = rng.randint(60, 450)
-        gr = rng.randint(25, 65)
-        draw.ellipse([gx - gr, gy - gr, gx + gr, gy + gr], fill=(250, 245, 248), outline=(90, 40, 110), width=3)
-        for angle in np.linspace(0, 2 * np.pi, 16):
-            nx = int(gx + (gr + 6) * np.cos(angle))
-            ny = int(gy + (gr + 6) * np.sin(angle))
-            draw.ellipse([nx - 4, ny - 4, nx + 4, ny + 4], fill=(70, 30, 95))
-
-    for _ in range(120):
-        nx = rng.randint(10, 500)
-        ny = rng.randint(10, 500)
-        nr = rng.randint(3, 7)
-        n_color = (rng.randint(50, 90), rng.randint(20, 50), rng.randint(80, 120))
-        draw.ellipse([nx - nr, ny - nr, nx + nr, ny + nr], fill=n_color)
-
-    buf = io.BytesIO()
-    pil_p.save(buf, format="PNG")
-    return Response(content=buf.getvalue(), media_type="image/png")
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail=f"Grading patch image '{patch_id}' not found for case {case_id}."
+    )
 
 
 
@@ -701,39 +750,161 @@ def recompute_grade_preview(payload: RecomputeGradePayload, db: Session = Depend
     }
 
 
+@router.post("/type/confirm")
+@router.post("/{case_id}/type/confirm")
+def confirm_histologic_type(
+    payload: ConfirmHistologicTypePayload,
+    current_user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Dedicated server-side histologic subtype confirmation action.
+    Validates against approved CAP subtype ontology and stamps the pathologist actor.
+    """
+    if current_user.role not in ("pathologist", "admin"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: Only pathologists or administrators can confirm histologic subtype."
+        )
+
+    if payload.histologic_type not in VALID_HISTOLOGIC_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid histologic type '{payload.histologic_type}'. Must be one of {sorted(VALID_HISTOLOGIC_TYPES)}."
+        )
+
+    case_uid = to_uuid(payload.case_id)
+    grading_record = db.scalars(select(Grading).where(Grading.case_id == case_uid)).first()
+    if not grading_record:
+        raise HTTPException(status_code=404, detail=f"Grading record for case {payload.case_id} not found")
+
+    case = db.scalars(select(Case).where(Case.id == case_uid)).first()
+    if not case:
+        raise HTTPException(status_code=404, detail=f"Case {payload.case_id} not found")
+
+    existing_report = db.scalars(select(Report).where(Report.case_id == case_uid)).first()
+    if existing_report and existing_report.status in ("signed", "amended"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cannot modify histologic subtype for a signed or amended case report."
+        )
+
+    actor = current_user.id or payload.reviewed_by or "user_pathologist_001"
+    grading_record.histologic_type = payload.histologic_type
+    grading_record.type_confirmed_by = actor
+
+    audit_ev = AuditEvent(
+        case_id=str(payload.case_id),
+        actor=actor,
+        event_type="histologic_type_confirmed",
+        stage="grading",
+        payload={
+            "histologic_type": payload.histologic_type,
+            "justification": payload.justification
+        }
+    )
+    db.add(audit_ev)
+    db.commit()
+    db.refresh(grading_record)
+
+    stage_exec = db.scalars(
+        select(StageExecution).where(StageExecution.case_id == case_uid, StageExecution.stage == "grading")
+    ).first()
+    return _build_grading_stage_data_dict(payload.case_id, case, stage_exec, grading_record, db)
+
+
 @router.post("/confirm")
-def confirm_grading_stage(payload: ConfirmGradingPayload, db: Session = Depends(get_db)):
+def confirm_grading_stage(
+    payload: ConfirmGradingPayload,
+    current_user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     """
     Clinical Confirmation Gate for Stage 5 (Nottingham Grading).
     Strictly enforces:
-    1. Mandatory Histologic Type confirmation gate.
-    2. Mandatory Patch-Level Review Gate (all patches reviewed & approved).
-    3. Mandatory HPF-Level Review Gate (all 10 HPFs reviewed & approved).
-    4. Mandatory >=10 char override justification for top-level score overrides.
-    5. Pure code mathematical invariants validation.
+    1. Role authorization (pathologist or admin).
+    2. Stage execution state gating & report non-signed state.
+    3. Mandatory Histologic Type server-side confirmation gate.
+    4. Mandatory Patch-Level Review Gate (all patches reviewed & approved).
+    5. Mandatory HPF-Level Review Gate (all HPFs reviewed & approved).
+    6. Mandatory >=10 char override justification for any subscore diverging from server review.
+    7. Server-side authoritative recomputation of Nottingham Sum & Grade.
+    8. Pure code mathematical invariants validation.
     Persists final state to DB and queues Stage 6 (Report).
     """
+    if current_user.role not in ("pathologist", "admin"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: Only pathologists or administrators can confirm Nottingham grading."
+        )
+
+    actor = payload.reviewed_by or current_user.id or "user_pathologist_001"
     case_id = payload.case_id
     case_uid = to_uuid(case_id)
 
-    # 1. Mandatory Histologic Type Confirmation Gate
-    if not payload.type_confirmed:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Clinical Confirmation Gate: Histologic Type must be explicitly confirmed by the pathologist before proceeding to Report Generation."
-        )
+    case = db.scalars(select(Case).where(Case.id == case_uid)).first()
+    if not case:
+        raise HTTPException(status_code=404, detail=f"Case {case_id} not found")
 
-    # Fetch Database Grading Record
     grading_record = db.scalars(select(Grading).where(Grading.case_id == case_uid)).first()
     if not grading_record:
         raise HTTPException(status_code=404, detail="Grading record for case not found")
 
-    case = db.scalars(select(Case).where(Case.id == case_uid)).first()
     stage_exec = db.scalars(
         select(StageExecution).where(StageExecution.case_id == case_uid, StageExecution.stage == "grading")
     ).first()
+    if not stage_exec:
+        raise HTTPException(status_code=404, detail="Grading stage execution record not found for case")
 
-    # Build current review state to verify all gates
+    if stage_exec.status in ("running", "failed"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot confirm grading stage while status is '{stage_exec.status}'."
+        )
+
+    if stage_exec.status == "confirmed":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Grading stage is already confirmed."
+        )
+
+    existing_report = db.scalars(select(Report).where(Report.case_id == case_uid)).first()
+    if existing_report and existing_report.status in ("signed", "amended"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cannot modify or confirm grading for a signed or amended case report."
+        )
+
+    # 1. Mandatory Histologic Type Confirmation Gate
+    if payload.histologic_type not in VALID_HISTOLOGIC_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid histologic type '{payload.histologic_type}'. Must be one of {sorted(VALID_HISTOLOGIC_TYPES)}."
+        )
+
+    if grading_record.type_confirmed_by == "unconfirmed":
+        if payload.type_confirmed:
+            grading_record.histologic_type = payload.histologic_type
+            grading_record.type_confirmed_by = actor
+            audit_htype = AuditEvent(
+                case_id=str(case_id),
+                actor=actor,
+                event_type="histologic_type_confirmed",
+                stage="grading",
+                payload={"histologic_type": payload.histologic_type, "confirmed_via": "grading_confirmation"}
+            )
+            db.add(audit_htype)
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Clinical Confirmation Gate: Histologic Type must be explicitly confirmed by the pathologist before proceeding to Report Generation."
+            )
+    else:
+        if payload.histologic_type != grading_record.histologic_type:
+            grading_record.histologic_type = payload.histologic_type
+            grading_record.type_confirmed_by = actor
+
+    # Build current review state to verify review gates and server-derived subscores
     current_data = _build_grading_stage_data_dict(case_id, case, stage_exec, grading_record, db)
     rev_summary = current_data["review_summary"]
 
@@ -751,25 +922,61 @@ def confirm_grading_stage(payload: ConfirmGradingPayload, db: Session = Depends(
             detail=f"Clinical Confirmation Gate: All {rev_summary['total_hpfs']} High-Power Fields (HPFs) must be explicitly reviewed and approved at the HPF level before proceeding to Report Generation (currently {rev_summary['approved_hpfs']}/{rev_summary['total_hpfs']} approved)."
         )
 
-    # 4. Validate Override Justifications (min 10 chars)
+    # 4. Mandatory Justification for Divergent Subscores & Overrides (min 10 chars)
+    srv_current = current_data["current"]
+    required_overrides_to_audit = []
+
+    for comp_name, payload_score, srv_score in [
+        ("tubule", payload.tubule_score, srv_current["tubule_score"]),
+        ("pleo", payload.pleo_score, srv_current["pleo_score"]),
+        ("mitotic", payload.mitotic_score, srv_current["mitotic_score"]),
+    ]:
+        if payload_score != srv_score:
+            comp_ovr = payload.overrides.get(comp_name, {})
+            justification = comp_ovr.get("justification", "").strip() if isinstance(comp_ovr, dict) else ""
+            if len(justification) < 10:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Clinical Safety Requirement: Score override for '{comp_name}' (from {srv_score} to {payload_score}) requires a minimum 10-character justification (got {len(justification)} characters)."
+                )
+            required_overrides_to_audit.append({
+                "component": comp_name,
+                "from_score": srv_score,
+                "to_score": payload_score,
+                "justification": justification
+            })
+
+    # Validate justifications on any other override items provided
     for comp_name, override_info in payload.overrides.items():
         if comp_name in ("patches", "hpfs"):
             continue
-        justification = override_info.get("justification", "").strip()
+        justification = override_info.get("justification", "").strip() if isinstance(override_info, dict) else ""
         if len(justification) < 10:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Clinical Safety Requirement: Score override for '{comp_name}' requires a minimum 10-character justification (got {len(justification)} characters)."
             )
+        if not any(item["component"] == comp_name for item in required_overrides_to_audit):
+            required_overrides_to_audit.append({
+                "component": comp_name,
+                "from_score": override_info.get("original_score"),
+                "to_score": override_info.get("score"),
+                "justification": justification
+            })
 
-    # 5. Pure Code Invariant Check
+    # 5. Authoritative Server-Side Recompute & Pure Code Invariant Check
+    scoring_cfg = load_scoring_config()
+    computed_sum, computed_grade = calculate_nottingham_grade(
+        payload.tubule_score, payload.pleo_score, payload.mitotic_score, scoring_cfg
+    )
+
     try:
         validate_grading_invariants(
             tubule_score=payload.tubule_score,
             pleo_score=payload.pleo_score,
             mitotic_score=payload.mitotic_score,
-            nottingham_sum=payload.nottingham_sum,
-            grade=payload.grade
+            nottingham_sum=computed_sum,
+            grade=computed_grade
         )
     except ValueError as ve:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
@@ -780,10 +987,10 @@ def confirm_grading_stage(payload: ConfirmGradingPayload, db: Session = Depends(
         grading_record.tubule_percent = payload.tubule_percent
     grading_record.pleo_score = payload.pleo_score
     grading_record.mitotic_score = payload.mitotic_score
-    grading_record.nottingham_sum = payload.nottingham_sum
-    grading_record.grade = payload.grade
+    grading_record.nottingham_sum = computed_sum
+    grading_record.grade = computed_grade
     grading_record.histologic_type = payload.histologic_type
-    grading_record.type_confirmed_by = payload.reviewed_by
+    grading_record.type_confirmed_by = actor
     
     # Merge overrides ensuring patch and HPF reviews are preserved
     merged_overrides = dict(grading_record.overrides or {})
@@ -791,10 +998,9 @@ def confirm_grading_stage(payload: ConfirmGradingPayload, db: Session = Depends(
     grading_record.overrides = merged_overrides
 
     # 7. Mark Stage 5 as Confirmed
-    if stage_exec:
-        stage_exec.status = "confirmed"
-        stage_exec.reviewed_at = datetime.now(timezone.utc)
-        stage_exec.reviewed_by = payload.reviewed_by
+    stage_exec.status = "confirmed"
+    stage_exec.reviewed_at = datetime.now(timezone.utc)
+    stage_exec.reviewed_by = actor
 
     # 8. Queue Stage 6 (Report Generation) - Guarded against overwriting signed reports
     next_exec = db.scalars(
@@ -803,11 +1009,6 @@ def confirm_grading_stage(payload: ConfirmGradingPayload, db: Session = Depends(
             StageExecution.stage == "report"
         )
     ).first()
-    from app.models.report import Report
-    existing_report = db.scalars(
-        select(Report).where(Report.case_id == case_uid)
-    ).first()
-
 
     if not (existing_report and existing_report.status in ("signed", "amended")):
         if not next_exec:
@@ -824,16 +1025,15 @@ def confirm_grading_stage(payload: ConfirmGradingPayload, db: Session = Depends(
             next_exec.completed_at = None
             next_exec.error = None
 
-
     # 9. Record Audit Events
     audit_confirm = AuditEvent(
         case_id=str(case_id),
-        actor=payload.reviewed_by,
+        actor=actor,
         event_type="stage_5_grading_confirmed",
         stage="grading",
         payload={
-            "nottingham_sum": payload.nottingham_sum,
-            "grade": payload.grade,
+            "nottingham_sum": computed_sum,
+            "grade": computed_grade,
             "histologic_type": payload.histologic_type,
             "approved_patches_count": rev_summary["approved_patches"],
             "approved_hpfs_count": rev_summary["approved_hpfs"],
@@ -842,42 +1042,41 @@ def confirm_grading_stage(payload: ConfirmGradingPayload, db: Session = Depends(
     )
     db.add(audit_confirm)
 
-    for comp, o_info in payload.overrides.items():
-        if comp in ("patches", "hpfs"):
-            continue
+    for o_info in required_overrides_to_audit:
         audit_ovr = AuditEvent(
             case_id=str(case_id),
-            actor=payload.reviewed_by,
+            actor=actor,
             event_type="score_override",
             stage="grading",
             payload={
-                "component": comp,
-                "from_score": o_info.get("original_score"),
-                "to_score": o_info.get("score"),
-                "justification": o_info.get("justification")
+                "component": o_info["component"],
+                "from_score": o_info["from_score"],
+                "to_score": o_info["to_score"],
+                "justification": o_info["justification"]
             }
         )
         db.add(audit_ovr)
 
     db.commit()
 
-    try:
-        from app.core.cloud_tasks import dispatch_stage_task
-        dispatch_stage_task(
-            case_id=str(case_id),
-            stage="report",
-            stage_exec_id=str(next_exec.id)
-        )
-    except Exception as e:
-        print(f"[CloudTasks Warning] Failed to dispatch next stage report: {e}")
+    if next_exec:
+        try:
+            from app.core.cloud_tasks import dispatch_stage_task
+            dispatch_stage_task(
+                case_id=str(case_id),
+                stage="report",
+                stage_exec_id=str(next_exec.id)
+            )
+        except Exception as e:
+            print(f"[CloudTasks Warning] Failed to dispatch next stage report: {e}")
 
     return {
         "status": "success",
         "case_id": case_id,
         "stage": "grading",
         "next_stage": "report",
-        "grade": payload.grade,
-        "nottingham_sum": payload.nottingham_sum,
+        "grade": computed_grade,
+        "nottingham_sum": computed_sum,
         "histologic_type": payload.histologic_type
     }
 

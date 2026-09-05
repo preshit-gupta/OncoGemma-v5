@@ -11,6 +11,7 @@ from app.models.case import Case
 from app.models.slide import Slide
 from app.models.stage_execution import StageExecution
 from app.models.grading import Grading
+from app.models.hpf_site import HpfSite
 
 # Shared in-memory test database
 SQLALCHEMY_DATABASE_URL = "sqlite:///:memory:"
@@ -103,6 +104,15 @@ def test_grading_api_full_workflow():
     db.add(slide)
     db.add(stage_exec)
     db.add(grading)
+    for i in range(10):
+        db.add(HpfSite(
+            case_id=case_id,
+            seq=i + 1,
+            center_um=[1000.0 * (i + 1), 1000.0 * (i + 1)],
+            mitotic_count=2,
+            radius_um=262.0,
+            source="model"
+        ))
     db.commit()
     db.close()
 

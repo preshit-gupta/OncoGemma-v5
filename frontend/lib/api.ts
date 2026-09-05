@@ -579,6 +579,27 @@ export async function recomputeGradingPreview(payload: {
   return res.json();
 }
 
+export async function confirmHistologicType(payload: {
+  case_id: string;
+  histologic_type: string;
+  justification?: string;
+  reviewed_by?: string;
+}): Promise<any> {
+  const res = await fetch(`${API_BASE}/api/v1/stages/grading/type/confirm`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-User-Role": "pathologist"
+    },
+    body: JSON.stringify(payload)
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.detail || "Failed to confirm histologic subtype");
+  }
+  return res.json();
+}
+
 export async function confirmGradingStage(payload: {
   case_id: string;
   reviewed_by?: string;

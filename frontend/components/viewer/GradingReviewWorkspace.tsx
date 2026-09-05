@@ -26,7 +26,8 @@ import {
   Filter,
   Plus,
   Minus,
-  MessageSquare
+  MessageSquare,
+  Lock
 } from "lucide-react";
 import {
   GradingStageData,
@@ -36,6 +37,7 @@ import {
   reviewGradingPatches,
   reviewGradingHpfs,
   recomputeGradingPreview,
+  confirmHistologicType,
   confirmGradingStage,
   API_BASE
 } from "@/lib/api";
@@ -357,6 +359,9 @@ export function GradingReviewWorkspace({
     return () => window.removeEventListener("keydown", handleEscape);
   }, [editingPatch, editingHpf, selectedPatch]);
 
+  // Read-only state when stage is confirmed or case report is signed
+  const isConfirmed = data?.status === "confirmed" || Boolean((data as any)?.is_signed);
+
   const isTubuleOverridden = tubuleOverrideScore !== null && tubuleOverrideScore !== data?.machine?.tubule_score;
   const isPleoOverridden = pleoOverrideScore !== null && pleoOverrideScore !== data?.machine?.pleo_score;
 
@@ -368,6 +373,7 @@ export function GradingReviewWorkspace({
   const allHpfsApproved = revSummary?.all_hpfs_reviewed || false;
 
   const canConfirmStage =
+    !isConfirmed &&
     allPatchesApproved &&
     allHpfsApproved &&
     isTypeConfirmed &&
@@ -376,11 +382,13 @@ export function GradingReviewWorkspace({
     !isSubmitting;
 
   const handleApplyTubuleOverride = (score: number) => {
+    if (isConfirmed) return;
     setTubuleOverrideScore(score);
     setIsTubuleEditing(false);
   };
 
   const handleResetTubule = () => {
+    if (isConfirmed) return;
     setTubuleOverrideScore(null);
     setTubuleOverridePercent(null);
     setTubuleJustification("");
@@ -388,18 +396,39 @@ export function GradingReviewWorkspace({
   };
 
   const handleApplyPleoOverride = (score: number) => {
+    if (isConfirmed) return;
     setPleoOverrideScore(score);
     setIsPleoEditing(false);
   };
 
   const handleResetPleo = () => {
+    if (isConfirmed) return;
     setPleoOverrideScore(null);
     setPleoJustification("");
     setIsPleoEditing(false);
   };
 
+  const handleConfirmHistologicType = async () => {
+    if (isConfirmed) return;
+    try {
+      setActionLoading(true);
+      const res = await confirmHistologicType({
+        case_id: caseId,
+        histologic_type: selectedHistologicType,
+        reviewed_by: "user_pathologist_001"
+      });
+      setData(res);
+      setIsTypeConfirmed(true);
+    } catch (err: any) {
+      console.error(err);
+      alert(err.message || "Failed to confirm histologic subtype");
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
   const handleConfirmFinalStage = async () => {
-    if (!canConfirmStage) return;
+    if (!canConfirmStage || isConfirmed) return;
     setIsSubmitting(true);
     setSubmitError(null);
 
@@ -514,6 +543,26 @@ export function GradingReviewWorkspace({
         </div>
       </header>
 
+      {/* Read-Only Status Banner when Confirmed */}
+      {isConfirmed && (
+        <div className="mx-6 mt-4 p-3 bg-emerald-950/40 border border-emerald-500/50 rounded-lg flex items-center justify-between gap-3 text-emerald-200 text-xs">
+          <div className="flex items-center gap-2">
+            <ShieldCheck className="w-5 h-5 text-emerald-400 shrink-0" />
+            <div>
+              <span className="font-bold">Stage 5 Nottingham Grading Confirmed:</span> Pathologist review is complete and grade scores are permanently locked.
+            </div>
+          </div>
+          {onAdvanceToReport && (
+            <button
+              onClick={onAdvanceToReport}
+              className="px-3 py-1 bg-emerald-600 hover:bg-emerald-500 text-white rounded text-xs font-semibold flex items-center gap-1 transition"
+            >
+              View CAP Report <ArrowRight className="w-3.5 h-3.5" />
+            </button>
+          )}
+        </div>
+      )}
+
       {/* Review Gate Status Banner */}
       <div className="mx-6 mt-4 p-4 bg-slate-900 border border-slate-800 rounded-xl shadow-lg">
         <div className="flex flex-wrap items-center justify-between gap-4 pb-3 border-b border-slate-800/80">
@@ -553,7 +602,7 @@ export function GradingReviewWorkspace({
               </p>
             </div>
             <div className="mt-3">
-              {!allPatchesApproved && (
+              {!allPatchesApproved && !isConfirmed && (
                 <button
                   onClick={handleApproveAllPatches}
                   disabled={actionLoading}
@@ -589,7 +638,7 @@ export function GradingReviewWorkspace({
               </p>
             </div>
             <div className="mt-3">
-              {!allHpfsApproved && (
+              {!allHpfsApproved && !isConfirmed && (
                 <button
                   onClick={handleApproveAllHpfs}
                   disabled={actionLoading}
@@ -627,19 +676,20 @@ export function GradingReviewWorkspace({
             <div className="mt-3">
               {!isTypeConfirmed ? (
                 <button
-                  onClick={() => setIsTypeConfirmed(true)}
-                  className="w-full py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded text-xs font-bold flex items-center justify-center gap-1.5 shadow transition"
+                  onClick={handleConfirmHistologicType}
+                  disabled={isConfirmed || actionLoading}
+                  className="w-full py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded text-xs font-bold flex items-center justify-center gap-1.5 shadow transition disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   <ShieldCheck className="w-3.5 h-3.5" /> Confirm Histologic Subtype
                 </button>
-              ) : (
+              ) : !isConfirmed ? (
                 <button
                   onClick={() => setIsTypeConfirmed(false)}
                   className="w-full py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 rounded text-xs font-medium transition"
                 >
                   Change Subtype Selection
                 </button>
-              )}
+              ) : null}
             </div>
           </div>
         </div>
@@ -707,8 +757,9 @@ export function GradingReviewWorkspace({
             </div>
 
             {/* Override Controls */}
-            <div className="mt-4 pt-3 border-t border-slate-800">
-              {!isTubuleEditing && !isTubuleOverridden ? (
+            {!isConfirmed && (
+              <div className="mt-4 pt-3 border-t border-slate-800">
+                {!isTubuleEditing && !isTubuleOverridden ? (
                 <button
                   onClick={() => setIsTubuleEditing(true)}
                   className="w-full py-1.5 px-3 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded text-xs font-semibold flex items-center justify-center gap-1.5 transition"
@@ -769,6 +820,7 @@ export function GradingReviewWorkspace({
                 </div>
               )}
             </div>
+            )}
           </div>
 
           {/* 2. Nuclear Pleomorphism Card */}
@@ -818,68 +870,70 @@ export function GradingReviewWorkspace({
             </div>
 
             {/* Override Controls */}
-            <div className="mt-4 pt-3 border-t border-slate-800">
-              {!isPleoEditing && !isPleoOverridden ? (
-                <button
-                  onClick={() => setIsPleoEditing(true)}
-                  className="w-full py-1.5 px-3 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded text-xs font-semibold flex items-center justify-center gap-1.5 transition"
-                >
-                  <Edit3 className="w-3.5 h-3.5 text-purple-400" /> Manual Override Pleo Score
-                </button>
-              ) : (
-                <div className="space-y-2.5">
-                  <div className="flex items-center gap-1.5">
-                    {[1, 2, 3].map((s) => (
-                      <button
-                        key={s}
-                        onClick={() => handleApplyPleoOverride(s)}
-                        className={`flex-1 py-1 text-xs font-bold rounded border transition ${
-                          activePleoScore === s
-                            ? "bg-purple-600 border-purple-400 text-white"
-                            : "bg-slate-800 border-slate-700 text-slate-400 hover:text-slate-200"
-                        }`}
-                      >
-                        Score {s}
-                      </button>
-                    ))}
-                  </div>
-
-                  {isPleoOverridden && (
-                    <div>
-                      <label className="text-[10px] text-slate-400 block mb-1">
-                        Clinical Justification (min 10 chars):
-                      </label>
-                      <textarea
-                        value={pleoJustification}
-                        onChange={(e) => setPleoJustification(e.target.value)}
-                        placeholder="State clinical reason for overriding nuclear pleomorphism score..."
-                        rows={2}
-                        className={`w-full bg-slate-950 border rounded p-2 text-xs text-slate-200 focus:outline-none ${
-                          pleoJustification.trim().length >= 10
-                            ? "border-emerald-600 focus:border-emerald-500"
-                            : "border-amber-600 focus:border-amber-500"
-                        }`}
-                      />
-                      <div className="flex justify-between items-center mt-1">
-                        <span
-                          className={`text-[10px] ${
-                            pleoJustification.trim().length >= 10 ? "text-emerald-400" : "text-amber-400"
+            {!isConfirmed && (
+              <div className="mt-4 pt-3 border-t border-slate-800">
+                {!isPleoEditing && !isPleoOverridden ? (
+                  <button
+                    onClick={() => setIsPleoEditing(true)}
+                    className="w-full py-1.5 px-3 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded text-xs font-semibold flex items-center justify-center gap-1.5 transition"
+                  >
+                    <Edit3 className="w-3.5 h-3.5 text-purple-400" /> Manual Override Pleo Score
+                  </button>
+                ) : (
+                  <div className="space-y-2.5">
+                    <div className="flex items-center gap-1.5">
+                      {[1, 2, 3].map((s) => (
+                        <button
+                          key={s}
+                          onClick={() => handleApplyPleoOverride(s)}
+                          className={`flex-1 py-1 text-xs font-bold rounded border transition ${
+                            activePleoScore === s
+                              ? "bg-purple-600 border-purple-400 text-white"
+                              : "bg-slate-800 border-slate-700 text-slate-400 hover:text-slate-200"
                           }`}
                         >
-                          {pleoJustification.trim().length}/10 characters
-                        </span>
-                        <button
-                          onClick={handleResetPleo}
-                          className="text-[10px] text-slate-400 hover:text-rose-400 underline"
-                        >
-                          Reset to Patch Mode
+                          Score {s}
                         </button>
-                      </div>
+                      ))}
                     </div>
-                  )}
-                </div>
-              )}
-            </div>
+
+                    {isPleoOverridden && (
+                      <div>
+                        <label className="text-[10px] text-slate-400 block mb-1">
+                          Clinical Justification (min 10 chars):
+                        </label>
+                        <textarea
+                          value={pleoJustification}
+                          onChange={(e) => setPleoJustification(e.target.value)}
+                          placeholder="State clinical reason for overriding nuclear pleomorphism score..."
+                          rows={2}
+                          className={`w-full bg-slate-950 border rounded p-2 text-xs text-slate-200 focus:outline-none ${
+                            pleoJustification.trim().length >= 10
+                              ? "border-emerald-600 focus:border-emerald-500"
+                              : "border-amber-600 focus:border-amber-500"
+                          }`}
+                        />
+                        <div className="flex justify-between items-center mt-1">
+                          <span
+                            className={`text-[10px] ${
+                              pleoJustification.trim().length >= 10 ? "text-emerald-400" : "text-amber-400"
+                            }`}
+                          >
+                            {pleoJustification.trim().length}/10 characters
+                          </span>
+                          <button
+                            onClick={handleResetPleo}
+                            className="text-[10px] text-slate-400 hover:text-rose-400 underline"
+                          >
+                            Reset to Patch Mode
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
 
           {/* 3. Mitotic Score Card */}
@@ -976,7 +1030,7 @@ export function GradingReviewWorkspace({
                 ))}
               </div>
 
-              {!allPatchesApproved && (
+              {!allPatchesApproved && !isConfirmed && (
                 <button
                   onClick={handleApproveAllPatches}
                   disabled={actionLoading}
@@ -1083,7 +1137,7 @@ export function GradingReviewWorkspace({
 
                   {/* Patch Action Buttons */}
                   <div className="mt-3 pt-2.5 border-t border-slate-800/80 flex items-center gap-1.5">
-                    {!isApproved && !isModified ? (
+                    {!isApproved && !isModified && !isConfirmed ? (
                       <button
                         onClick={() => handleApprovePatch(p)}
                         disabled={actionLoading}
@@ -1094,18 +1148,20 @@ export function GradingReviewWorkspace({
                       </button>
                     ) : (
                       <span className="flex-1 py-1 text-center text-[11px] font-semibold text-emerald-400 flex items-center justify-center gap-1">
-                        <CheckCircle2 className="w-3.5 h-3.5" /> Reviewed
+                        <CheckCircle2 className="w-3.5 h-3.5" /> {isConfirmed ? "Locked" : "Reviewed"}
                       </span>
                     )}
 
-                    <button
-                      onClick={() => handleOpenEditPatch(p)}
-                      disabled={actionLoading}
-                      className="p-1 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white rounded border border-slate-700 transition"
-                      title="Edit patch tubule or pleomorphism score"
-                    >
-                      <Edit3 className="w-3.5 h-3.5 text-sky-400" />
-                    </button>
+                    {!isConfirmed && (
+                      <button
+                        onClick={() => handleOpenEditPatch(p)}
+                        disabled={actionLoading}
+                        className="p-1 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white rounded border border-slate-700 transition"
+                        title="Edit patch tubule or pleomorphism score"
+                      >
+                        <Edit3 className="w-3.5 h-3.5 text-sky-400" />
+                      </button>
+                    )}
 
                     <button
                       onClick={() => setSelectedPatch(p)}
@@ -1136,7 +1192,7 @@ export function GradingReviewWorkspace({
               </p>
             </div>
 
-            {!allHpfsApproved && (
+            {!allHpfsApproved && !isConfirmed && (
               <button
                 onClick={handleApproveAllHpfs}
                 disabled={actionLoading}
@@ -1186,7 +1242,7 @@ export function GradingReviewWorkspace({
                   </div>
 
                   <div className="mt-2 pt-2 border-t border-slate-800/80 flex items-center gap-1.5">
-                    {!isApproved ? (
+                    {!isApproved && !isConfirmed ? (
                       <button
                         onClick={() => handleApproveHpf(h)}
                         disabled={actionLoading}
@@ -1196,17 +1252,19 @@ export function GradingReviewWorkspace({
                       </button>
                     ) : (
                       <span className="flex-1 py-1 text-center text-[10px] font-semibold text-emerald-400 flex items-center justify-center gap-1">
-                        <CheckCircle2 className="w-3 h-3" /> Verified
+                        <CheckCircle2 className="w-3 h-3" /> {isConfirmed ? "Locked" : "Verified"}
                       </span>
                     )}
-                    <button
-                      onClick={() => handleOpenEditHpf(h)}
-                      disabled={actionLoading}
-                      className="p-1 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white rounded border border-slate-700 transition"
-                      title="Adjust mitotic count"
-                    >
-                      <Edit3 className="w-3.5 h-3.5 text-sky-400" />
-                    </button>
+                    {!isConfirmed && (
+                      <button
+                        onClick={() => handleOpenEditHpf(h)}
+                        disabled={actionLoading}
+                        className="p-1 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white rounded border border-slate-700 transition"
+                        title="Adjust mitotic count"
+                      >
+                        <Edit3 className="w-3.5 h-3.5 text-sky-400" />
+                      </button>
+                    )}
                   </div>
                 </div>
               );
@@ -1238,19 +1296,20 @@ export function GradingReviewWorkspace({
             <div>
               {!isTypeConfirmed ? (
                 <button
-                  onClick={() => setIsTypeConfirmed(true)}
-                  className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-bold flex items-center gap-2 shadow-lg shadow-emerald-950 transition"
+                  onClick={handleConfirmHistologicType}
+                  disabled={isConfirmed || actionLoading}
+                  className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-bold flex items-center gap-2 shadow-lg shadow-emerald-950 transition disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   <ShieldCheck className="w-4 h-4" /> Confirm Histologic Subtype
                 </button>
-              ) : (
+              ) : !isConfirmed ? (
                 <button
                   onClick={() => setIsTypeConfirmed(false)}
                   className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 rounded text-xs font-medium transition"
                 >
                   Edit Subtype Selection
                 </button>
-              )}
+              ) : null}
             </div>
           </div>
 
@@ -1265,7 +1324,7 @@ export function GradingReviewWorkspace({
                   setSelectedHistologicType(e.target.value);
                   setIsTypeConfirmed(false);
                 }}
-                disabled={isTypeConfirmed}
+                disabled={isTypeConfirmed || isConfirmed}
                 className={`w-full bg-slate-950 border rounded-lg p-2.5 text-xs text-white focus:outline-none ${
                   isTypeConfirmed
                     ? "border-emerald-600/70 bg-emerald-950/20"
@@ -1379,7 +1438,11 @@ export function GradingReviewWorkspace({
           {/* Final Confirmation Bar */}
           <div className="mt-6 pt-4 border-t border-slate-800 flex flex-wrap items-center justify-between gap-4">
             <div className="text-xs text-slate-400">
-              {!allPatchesApproved ? (
+              {isConfirmed ? (
+                <span className="text-emerald-400 flex items-center gap-1.5 font-bold">
+                  <CheckCircle2 className="w-4 h-4" /> Stage 5 Nottingham Grading Confirmed & Locked (Read-Only).
+                </span>
+              ) : !allPatchesApproved ? (
                 <span className="text-amber-400 flex items-center gap-1.5">
                   <AlertCircle className="w-4 h-4" /> Please approve all 24 image patches above (Gate 1).
                 </span>
@@ -1402,26 +1465,35 @@ export function GradingReviewWorkspace({
               )}
             </div>
 
-            <button
-              onClick={handleConfirmFinalStage}
-              disabled={!canConfirmStage}
-              className={`px-6 py-3 rounded-lg text-xs font-bold flex items-center gap-2 shadow-lg transition ${
-                canConfirmStage
-                  ? "bg-sky-600 hover:bg-sky-500 text-white shadow-sky-950 cursor-pointer"
-                  : "bg-slate-800 text-slate-500 border border-slate-700 cursor-not-allowed"
-              }`}
-            >
-              {isSubmitting ? (
-                <>
-                  <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                  Finalizing Nottingham Grade...
-                </>
-              ) : (
-                <>
-                  Confirm Nottingham Grade & Advance to CAP Report (Stage 6) <ArrowRight className="w-4 h-4" />
-                </>
-              )}
-            </button>
+            {isConfirmed ? (
+              <button
+                onClick={onAdvanceToReport}
+                className="px-6 py-3 rounded-lg text-xs font-bold flex items-center gap-2 shadow-lg transition bg-emerald-600 hover:bg-emerald-500 text-white shadow-emerald-950 cursor-pointer"
+              >
+                View CAP Report (Stage 6) <ArrowRight className="w-4 h-4" />
+              </button>
+            ) : (
+              <button
+                onClick={handleConfirmFinalStage}
+                disabled={!canConfirmStage}
+                className={`px-6 py-3 rounded-lg text-xs font-bold flex items-center gap-2 shadow-lg transition ${
+                  canConfirmStage
+                    ? "bg-sky-600 hover:bg-sky-500 text-white shadow-sky-950 cursor-pointer"
+                    : "bg-slate-800 text-slate-500 border border-slate-700 cursor-not-allowed"
+                }`}
+              >
+                {isSubmitting ? (
+                  <>
+                    <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                    Finalizing Nottingham Grade...
+                  </>
+                ) : (
+                  <>
+                    Confirm Nottingham Grade & Advance to CAP Report (Stage 6) <ArrowRight className="w-4 h-4" />
+                  </>
+                )}
+              </button>
+            )}
           </div>
 
           {submitError && (
@@ -1742,17 +1814,19 @@ export function GradingReviewWorkspace({
               </div>
 
               <div className="flex items-center justify-between pt-2 border-t border-slate-800">
-                <button
-                  onClick={() => {
-                    handleOpenEditPatch(selectedPatch);
-                    setSelectedPatch(null);
-                  }}
-                  className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-sky-300 rounded text-xs font-semibold flex items-center gap-1.5 transition"
-                >
-                  <Edit3 className="w-3.5 h-3.5" /> Modify Findings
-                </button>
+                {!isConfirmed && (
+                  <button
+                    onClick={() => {
+                      handleOpenEditPatch(selectedPatch);
+                      setSelectedPatch(null);
+                    }}
+                    className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-sky-300 rounded text-xs font-semibold flex items-center gap-1.5 transition"
+                  >
+                    <Edit3 className="w-3.5 h-3.5" /> Modify Findings
+                  </button>
+                )}
 
-                {selectedPatch.review_status === "suggested" ? (
+                {selectedPatch.review_status === "suggested" && !isConfirmed ? (
                   <button
                     onClick={() => {
                       handleApprovePatch(selectedPatch);
@@ -1764,7 +1838,7 @@ export function GradingReviewWorkspace({
                   </button>
                 ) : (
                   <span className="text-xs font-bold text-emerald-400 flex items-center gap-1">
-                    <CheckCircle2 className="w-4 h-4" /> Pathologist Approved
+                    <CheckCircle2 className="w-4 h-4" /> {isConfirmed ? "Stage Confirmed (Locked)" : "Pathologist Approved"}
                   </span>
                 )}
               </div>

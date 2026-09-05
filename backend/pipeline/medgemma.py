@@ -23,22 +23,24 @@ from app.core.config import settings
 class TubuleResponse(BaseModel):
     tubule_percent: int = Field(ge=0, le=100, description="Percentage of tumor area forming glands/tubules")
     tumor_present: bool = Field(default=True, description="Whether invasive tumor tissue is present in patch")
-    confidence: Literal["low", "medium", "high"] = Field(default="medium")
+    confidence: Literal["low", "medium", "high", "unassessed_schema_error"] = Field(default="medium")
 
 
 class PleoResponse(BaseModel):
     pleomorphism_score: Literal[1, 2, 3] = Field(description="Nottingham nuclear pleomorphism score (1, 2, 3)")
     rationale: str = Field(default="", max_length=300, description="Brief clinical rationale")
-    confidence: Literal["low", "medium", "high"] = Field(default="medium")
+    confidence: Literal["low", "medium", "high", "unassessed_schema_error"] = Field(default="medium")
 
 
 class HistologicTypeResponse(BaseModel):
     type: Literal["IDC-NST", "ILC", "mucinous", "tubular", "papillary", "metaplastic", "other"] = Field(
-        default="IDC-NST", description="Primary CAP histologic subtype"
+        description="Primary CAP histologic subtype"
     )
     differential: List[str] = Field(default_factory=list, description="Differential diagnoses")
     rationale: str = Field(default="", max_length=500, description="Clinical rationale")
-    confidence: Literal["low", "medium", "high"] = Field(default="medium")
+    confidence: Literal["low", "medium", "high", "unassessed_schema_error"] = Field(
+        description="Model confidence level"
+    )
 
 
 class MitosisConfirmationResponse(BaseModel):
@@ -126,14 +128,14 @@ class MedGemmaClient:
             cleaned_fixed = re.sub(r",\s*([\]}])", r"\1", cleaned)
             return json.loads(cleaned_fixed)
 
-    async def _call_vertex_endpoint(self, prompt: str, image_b64_list: List[str]) -> str:
+    async def _call_vertex_endpoint(self, prompt: str, image_b64_list: List[str], task: Optional[str] = None) -> str:
         """
         Execute prediction call against Google Cloud Vertex AI endpoint,
         with automated quantitative computer-vision histomorphometry fallback.
         """
         img_b64 = image_b64_list[0] if image_b64_list else None
         if settings.USE_MOCK_VERTEX_AI:
-            return self._mock_fallback_response(prompt, img_b64)
+            return self._mock_fallback_response(prompt, img_b64, task=task)
             
         try:
             from google.cloud import aiplatform
@@ -178,10 +180,10 @@ class MedGemmaClient:
             if settings.USE_MOCK_VERTEX_AI:
                 # Fallback to quantitative image morphometrics with clear log
                 print(f"[MedGemma Vertex AI Note] Live endpoint call note ({e}). Using quantitative image morphometrics.")
-                return self._mock_fallback_response(prompt, img_b64)
+                return self._mock_fallback_response(prompt, img_b64, task=task)
             raise e
 
-    def _mock_fallback_response(self, prompt: str, image_b64: Optional[str] = None) -> str:
+    def _mock_fallback_response(self, prompt: str, image_b64: Optional[str] = None, task: Optional[str] = None) -> str:
         """
         Quantitative histomorphometric analysis directly from patch image pixels:
         - Evaluates glandular lumen formation (%) for Tubule Formation.
@@ -248,8 +250,8 @@ class MedGemmaClient:
             except Exception as me:
                 print(f"[Morphometrics Analysis Note] {me}")
 
-        # Check tasks strictly: narrative & reports first, then subtype, then individual patch subscores
-        if "findings narrative" in prompt_lower or ("narrative" in prompt_lower and "findings" in prompt_lower) or "write a clear, concise diagnostic findings narrative" in prompt_lower:
+        # Task-based dispatch or unambiguous prompt keyword match
+        if task == "findings_narrative" or (not task and ("findings narrative" in prompt_lower or "findings narrative synthesis" in prompt_lower)):
             htype = "Invasive Breast Carcinoma of No Special Type (IDC-NST)"
             grade = 2
             sum_score = 6
@@ -263,8 +265,8 @@ class MedGemmaClient:
                     j_end = prompt.rfind("}")
                     pj = json.loads(prompt[j_start:j_end+1])
                     agg = pj.get("aggregate", {})
-                    grade = agg.get("grade", grade)
-                    sum_score = agg.get("nottingham_sum", sum_score)
+                    grade = agg.get("grade") if agg.get("grade") is not None else pj.get("grade", grade)
+                    sum_score = agg.get("nottingham_sum") if agg.get("nottingham_sum") is not None else pj.get("nottingham_sum", sum_score)
                     ht = pj.get("histologic_type", {}).get("type", "IDC-NST") if isinstance(pj.get("histologic_type"), dict) else "IDC-NST"
                     if ht == "IDC-NST":
                         htype = "Invasive Breast Carcinoma of No Special Type (IDC-NST)"
@@ -303,32 +305,60 @@ class MedGemmaClient:
                 f"Nuclear pleomorphism is {pleo_str}. "
                 f"Mitotic index is {mit_str}."
             )
-        elif "cap report" in prompt_lower or "synoptic report" in prompt_lower:
+        elif task == "cap_report" or (not task and ("cap synoptic pathology report" in prompt_lower or "cap report" in prompt_lower or "diagnosis_line" in prompt_lower)):
+            lat = "RIGHT"
+            proc = "CORE NEEDLE BIOPSY"
+            htype = "IDC-NST"
+            grade = 2
+            try:
+                if "### INPUT STRUCTURED JSON:" in prompt:
+                    block = prompt.split("### INPUT STRUCTURED JSON:", 1)[1]
+                    if "```json" in block:
+                        json_str = block.split("```json", 1)[1].split("```", 1)[0].strip()
+                    elif "```" in block:
+                        json_str = block.split("```", 1)[1].split("```", 1)[0].strip()
+                    else:
+                        j_start = block.find("{")
+                        j_end = block.rfind("}")
+                        json_str = block[j_start:j_end+1]
+                    pj = json.loads(json_str)
+                elif "{" in prompt and "}" in prompt:
+                    j_start = prompt.find("{")
+                    j_end = prompt.rfind("}")
+                    pj = json.loads(prompt[j_start:j_end+1])
+                else:
+                    pj = {}
+                lat = str(pj.get("laterality", "Right")).upper()
+                proc = str(pj.get("procedure", "Core Needle Biopsy")).upper()
+                htype = str(pj.get("histologic_type", "IDC-NST"))
+                grade = pj.get("nottingham_grade", {}).get("grade", 2)
+            except Exception as e:
+                pass
             return json.dumps({
-                "diagnosis_line": "INVASIVE BREAST CARCINOMA OF NO SPECIAL TYPE (IDC-NST)",
+                "diagnosis_line": f"{lat} BREAST, {proc}: INVASIVE BREAST CARCINOMA OF {htype.upper()}, NOTTINGHAM HISTOLOGIC GRADE {grade}.",
                 "microscopic_findings": "Invasive carcinoma showing infiltrating cohesive cords and solid clusters with desmoplastic stroma.",
                 "clinical_correlation": "Correlate with staging parameters and biomarker panel (ER/PR/HER2/Ki-67)."
             })
-        elif "tubule_percent" in prompt_lower or "tubular" in prompt_lower or "tubule" in prompt_lower:
-            return json.dumps({
-                "tubule_percent": t_pct,
-                "tumor_present": True,
-                "confidence": "high"
-            })
-        elif "pleomorphism_score" in prompt_lower or "pleomorphism" in prompt_lower:
-            return json.dumps({
-                "pleomorphism_score": p_score,
-                "rationale": p_desc,
-                "confidence": "high" if p_score == 3 else "medium"
-            })
-        elif "histologic subtype" in prompt_lower or "differential" in prompt_lower or "subtype" in prompt_lower:
+        elif task == "histologic_type" or (not task and ("histologic type" in prompt_lower or "primary histologic subtype" in prompt_lower or "cap histologic subtype" in prompt_lower)):
             return json.dumps({
                 "type": "IDC-NST",
                 "differential": ["Invasive Lobular Carcinoma", "Metaplastic Carcinoma"],
                 "rationale": "Infiltrating cohesive malignant epithelial sheets and cords with desmoplastic stromal response, diagnostic of Invasive Breast Carcinoma of No Special Type (IDC-NST).",
                 "confidence": "high"
             })
-        elif "mitos" in prompt_lower or "adjudicat" in prompt_lower:
+        elif task == "pleomorphism" or (not task and ("pleomorphism_score" in prompt_lower or "nuclear pleomorphism" in prompt_lower)):
+            return json.dumps({
+                "pleomorphism_score": p_score,
+                "rationale": p_desc,
+                "confidence": "high" if p_score == 3 else "medium"
+            })
+        elif task == "tubule" or (not task and ("tubule assessment prompt" in prompt_lower or "tubule_percent" in prompt_lower)):
+            return json.dumps({
+                "tubule_percent": t_pct,
+                "tumor_present": True,
+                "confidence": "high"
+            })
+        elif task == "mitosis_confirmation" or (not task and ("mitosis confirmation" in prompt_lower or "adjudicate candidate mitotic figure" in prompt_lower or "mitos" in prompt_lower)):
             if image_b64:
                 try:
                     crop_raw = base64.b64decode(image_b64)
@@ -358,7 +388,7 @@ class MedGemmaClient:
         last_error = None
         for attempt in range(self.max_retries + 1):
             try:
-                raw_text = await self._call_vertex_endpoint(prompt_tpl, [b64_img])
+                raw_text = await self._call_vertex_endpoint(prompt_tpl, [b64_img], task="tubule")
                 parsed = self._extract_json_from_text(raw_text)
                 return TubuleResponse.model_validate(parsed)
             except (json.JSONDecodeError, ValidationError, Exception) as e:
@@ -374,7 +404,7 @@ class MedGemmaClient:
         last_error = None
         for attempt in range(self.max_retries + 1):
             try:
-                raw_text = await self._call_vertex_endpoint(prompt_tpl, [b64_img])
+                raw_text = await self._call_vertex_endpoint(prompt_tpl, [b64_img], task="pleomorphism")
                 parsed = self._extract_json_from_text(raw_text)
                 return PleoResponse.model_validate(parsed)
             except (json.JSONDecodeError, ValidationError, Exception) as e:
@@ -390,7 +420,7 @@ class MedGemmaClient:
         last_error = None
         for attempt in range(self.max_retries + 1):
             try:
-                raw_text = await self._call_vertex_endpoint(prompt_tpl, b64_list)
+                raw_text = await self._call_vertex_endpoint(prompt_tpl, b64_list, task="histologic_type")
                 parsed = self._extract_json_from_text(raw_text)
                 return HistologicTypeResponse.model_validate(parsed)
             except (json.JSONDecodeError, ValidationError, Exception) as e:
@@ -421,7 +451,7 @@ class MedGemmaClient:
         last_error = None
         for attempt in range(self.max_retries + 1):
             try:
-                raw_text = await self._call_vertex_endpoint(prompt_tpl, images)
+                raw_text = await self._call_vertex_endpoint(prompt_tpl, images, task="mitosis_confirmation")
                 parsed = self._extract_json_from_text(raw_text)
                 return MitosisConfirmationResponse.model_validate(parsed)
             except Exception as e:
@@ -530,7 +560,7 @@ class MedGemmaClient:
         last_error = None
         for attempt in range(self.max_retries + 1):
             try:
-                raw_text = await self._call_vertex_endpoint(full_prompt, [])
+                raw_text = await self._call_vertex_endpoint(full_prompt, [], task="findings_narrative")
                 narrative = raw_text.strip()
                 if narrative.startswith('"') and narrative.endswith('"'):
                     narrative = narrative[1:-1]
@@ -550,8 +580,8 @@ class MedGemmaClient:
                 
         # Graceful fallback narrative if LLM call fails
         agg = aggregated_data.get("aggregate", {})
-        grade = agg.get("grade", aggregated_data.get("grade", 2))
-        sum_score = agg.get("nottingham_sum", aggregated_data.get("nottingham_sum", 6))
+        grade = agg.get("grade") if agg.get("grade") is not None else aggregated_data.get("grade", 2)
+        sum_score = agg.get("nottingham_sum") if agg.get("nottingham_sum") is not None else aggregated_data.get("nottingham_sum", 6)
         htype = aggregated_data.get("histologic_type", {}).get("type", "IDC-NST") if isinstance(aggregated_data.get("histologic_type"), dict) else "IDC-NST"
         grade_desc = "Well Differentiated" if grade == 1 else ("Moderately Differentiated" if grade == 2 else "Poorly Differentiated")
         return f"Invasive breast carcinoma ({htype}), Nottingham Histological Grade {grade} ({grade_desc}, Combined Score {sum_score}/9)."
@@ -578,7 +608,7 @@ class MedGemmaClient:
 
         for attempt in range(self.max_retries + 1):
             try:
-                raw_text = await self._call_vertex_endpoint(full_prompt, [])
+                raw_text = await self._call_vertex_endpoint(full_prompt, [], task="cap_report")
                 parsed = self._extract_json_from_text(raw_text)
                 validated = CapReportNarrativeResponse.model_validate(parsed)
                 return validated.model_dump()
@@ -598,12 +628,30 @@ class MedGemmaClient:
         pn = case_data.get("staging", {}).get("pn_stage", "pNX")
         stage_grp = case_data.get("staging", {}).get("stage_group", "Unknown")
 
+        # Ground pleomorphism description in verified p_score
+        if p_score == 1:
+            pleo_desc = "mild nuclear pleomorphism with uniform, regular nuclei (pleomorphism score 1)"
+        elif p_score == 3:
+            pleo_desc = "marked nuclear pleomorphism with prominent variation in nuclear size and vesicular chromatin (pleomorphism score 3)"
+        else:
+            pleo_desc = "moderate nuclear pleomorphism with perceptible variation in nuclear contours (pleomorphism score 2)"
+
+        # Ground LVI in actual case data
+        lvi_val = str(case_data.get("lvi_status", "")).lower()
+        if lvi_val == "present":
+            lvi_desc = "Lymphovascular invasion is identified."
+        elif lvi_val == "absent":
+            lvi_desc = "Lymphovascular invasion is not identified."
+        elif lvi_val == "indeterminate":
+            lvi_desc = "Lymphovascular invasion is indeterminate / cannot be assessed."
+        else:
+            lvi_desc = "Lymphovascular invasion status is not documented."
+
         return {
             "diagnosis_line": f"{lat} BREAST, {proc}: INVASIVE BREAST CARCINOMA OF {htype.upper()}, NOTTINGHAM HISTOLOGIC GRADE {grade}.",
             "microscopic_findings": (
                 f"Sections show invasive carcinoma exhibiting {tubule_pct:.1f}% glandular/tubular differentiation (tubule score {t_score}), "
-                f"moderate nuclear pleomorphism with vesicular chromatin (pleomorphism score {p_score}), and mitotic activity consistent with "
-                f"mitotic score {m_score}. Lymphovascular invasion is not identified."
+                f"{pleo_desc}, and mitotic activity consistent with mitotic score {m_score}. {lvi_desc}"
             ),
             "clinical_correlation": (
                 f"Findings are consistent with Pathologic Stage {stage_grp} ({pt} {pn}) invasive mammary carcinoma. "
