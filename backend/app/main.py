@@ -63,11 +63,48 @@ def ensure_schema_up_to_date():
                 conn.execute(text("ALTER TABLE detections ADD COLUMN IF NOT EXISTS medgemma_confidence VARCHAR;"))
                 conn.execute(text("ALTER TABLE detections ALTER COLUMN medgemma_confidence TYPE VARCHAR USING medgemma_confidence::VARCHAR;"))
                 conn.execute(text("ALTER TABLE slides ADD COLUMN IF NOT EXISTS status VARCHAR DEFAULT 'ready';"))
+                conn.execute(text("ALTER TABLE slides ADD COLUMN IF NOT EXISTS gcs_uri_pyramid_norm VARCHAR;"))
+                conn.execute(text("ALTER TABLE reports ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 1;"))
+                conn.execute(text("ALTER TABLE reports ADD COLUMN IF NOT EXISTS pdf_sha256 VARCHAR;"))
+                conn.execute(text("ALTER TABLE reports ADD COLUMN IF NOT EXISTS narrative_edited BOOLEAN NOT NULL DEFAULT FALSE;"))
+                conn.execute(text("ALTER TABLE gradings ADD COLUMN IF NOT EXISTS type_confirmed_by VARCHAR DEFAULT 'unconfirmed';"))
+                try:
+                    conn.execute(text("""
+                        DO $$
+                        BEGIN
+                            IF EXISTS (
+                                SELECT 1 FROM information_schema.table_constraints 
+                                WHERE constraint_name = 'reports_pkey' AND table_name = 'reports'
+                            ) THEN
+                                IF NOT EXISTS (
+                                    SELECT 1 FROM information_schema.key_column_usage 
+                                    WHERE table_name = 'reports' AND column_name = 'version'
+                                ) THEN
+                                    ALTER TABLE reports DROP CONSTRAINT reports_pkey;
+                                    ALTER TABLE reports ADD PRIMARY KEY (case_id, version);
+                                END IF;
+                            END IF;
+                        END $$;
+                    """))
+                except Exception as pk_err:
+                    logger.warning(f"[Schema PK Update Note] {pk_err}")
             elif conn.dialect.name == "sqlite":
                 cols = [c[1] for c in conn.execute(text("PRAGMA table_info(slides);")).fetchall()]
                 if cols and "status" not in cols:
                     conn.execute(text("ALTER TABLE slides ADD COLUMN status VARCHAR DEFAULT 'ready';"))
-            logger.info("[Database Schema] Verified all columns exist on 'detections' and 'slides' tables.")
+                if cols and "gcs_uri_pyramid_norm" not in cols:
+                    conn.execute(text("ALTER TABLE slides ADD COLUMN gcs_uri_pyramid_norm VARCHAR;"))
+                rep_cols = [c[1] for c in conn.execute(text("PRAGMA table_info(reports);")).fetchall()]
+                if rep_cols and "version" not in rep_cols:
+                    conn.execute(text("ALTER TABLE reports ADD COLUMN version INTEGER DEFAULT 1;"))
+                if rep_cols and "pdf_sha256" not in rep_cols:
+                    conn.execute(text("ALTER TABLE reports ADD COLUMN pdf_sha256 VARCHAR;"))
+                if rep_cols and "narrative_edited" not in rep_cols:
+                    conn.execute(text("ALTER TABLE reports ADD COLUMN narrative_edited BOOLEAN DEFAULT 0;"))
+                grad_cols = [c[1] for c in conn.execute(text("PRAGMA table_info(gradings);")).fetchall()]
+                if grad_cols and "type_confirmed_by" not in grad_cols:
+                    conn.execute(text("ALTER TABLE gradings ADD COLUMN type_confirmed_by VARCHAR DEFAULT 'unconfirmed';"))
+            logger.info("[Database Schema] Verified all columns exist on tables.")
 
             # On PostgreSQL: ensure foreign key constraints on child tables have ON DELETE CASCADE
             if conn.dialect.name == "postgresql":

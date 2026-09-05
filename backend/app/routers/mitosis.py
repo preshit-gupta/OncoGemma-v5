@@ -820,9 +820,14 @@ def confirm_mitosis_stage(payload: MitosisConfirmPayload, db: Session = Depends(
     # Queue Stage 5 (grading) - Guarded against overwriting signed reports
     case_uid = to_uuid(case_id)
     from app.models.report import Report
-    existing_report = db.scalars(
-        select(Report).where(Report.case_id == case_uid)
-    ).first()
+    try:
+        report_status = db.scalar(
+            select(Report.status).where(Report.case_id == case_uid)
+        )
+        is_report_signed = report_status in ("signed", "amended") if report_status else False
+    except Exception:
+        db.rollback()
+        is_report_signed = False
 
     next_exec = db.scalars(
         select(StageExecution).where(
@@ -831,7 +836,7 @@ def confirm_mitosis_stage(payload: MitosisConfirmPayload, db: Session = Depends(
         )
     ).first()
 
-    if not (existing_report and existing_report.status in ("signed", "amended")):
+    if not is_report_signed:
         if not next_exec:
             next_exec = StageExecution(
                 case_id=case_uid,

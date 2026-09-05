@@ -159,6 +159,20 @@ def to_uuid(val: Any) -> uuid.UUID:
         return val
 
 
+def _get_case_report_status(db: Session, case_uid: uuid.UUID) -> Optional[str]:
+    try:
+        return db.scalar(select(Report.status).where(Report.case_id == case_uid))
+    except Exception:
+        db.rollback()
+        return None
+
+
+def _is_case_report_signed(db: Session, case_uid: uuid.UUID) -> bool:
+    status_val = _get_case_report_status(db, case_uid)
+    return status_val in ("signed", "amended") if status_val else False
+
+
+
 def _build_grading_stage_data_dict(
     case_id: str,
     case: Case,
@@ -362,8 +376,8 @@ def _build_grading_stage_data_dict(
 
     eff_sum, eff_grade = calculate_nottingham_grade(eff_tubule_score, eff_pleo_score, eff_mitotic_score, scoring_cfg)
 
-    existing_report = db.scalars(select(Report).where(Report.case_id == case_uid)).first()
-    is_signed = existing_report.status in ("signed", "amended") if existing_report else False
+    report_status = _get_case_report_status(db, case_uid)
+    is_signed = report_status in ("signed", "amended") if report_status else False
 
     is_type_confirmed = grading_record.type_confirmed_by != "unconfirmed"
     can_confirm = (
@@ -380,7 +394,7 @@ def _build_grading_stage_data_dict(
         "status": stage_exec.status if stage_exec else "awaiting_review",
         "is_signed": is_signed,
         "can_confirm": can_confirm,
-        "report_status": existing_report.status if existing_report else None,
+        "report_status": report_status,
         "patches": merged_patches,
         "hpfs": merged_hpfs,
         "review_summary": {
@@ -782,8 +796,7 @@ def confirm_histologic_type(
     if not case:
         raise HTTPException(status_code=404, detail=f"Case {payload.case_id} not found")
 
-    existing_report = db.scalars(select(Report).where(Report.case_id == case_uid)).first()
-    if existing_report and existing_report.status in ("signed", "amended"):
+    if _is_case_report_signed(db, case_uid):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Cannot modify histologic subtype for a signed or amended case report."
@@ -868,8 +881,7 @@ def confirm_grading_stage(
             detail="Grading stage is already confirmed."
         )
 
-    existing_report = db.scalars(select(Report).where(Report.case_id == case_uid)).first()
-    if existing_report and existing_report.status in ("signed", "amended"):
+    if _is_case_report_signed(db, case_uid):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Cannot modify or confirm grading for a signed or amended case report."
@@ -1010,7 +1022,7 @@ def confirm_grading_stage(
         )
     ).first()
 
-    if not (existing_report and existing_report.status in ("signed", "amended")):
+    if not _is_case_report_signed(db, case_uid):
         if not next_exec:
             next_exec = StageExecution(
                 case_id=case_uid,
