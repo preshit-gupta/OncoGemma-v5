@@ -29,10 +29,12 @@ from pipeline.staging import (
     calculate_ajcc_pt_stage,
     calculate_ajcc_pn_stage,
     calculate_ajcc_stage_group,
-    validate_staging_invariants
+    validate_staging_invariants,
+    validate_narrative_consistency
 )
 from pipeline.medgemma import MedGemmaClient, load_prompt_template
 from pipeline.report_pdf import generate_clinical_cap_pdf
+import hashlib
 
 
 def run_report(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str, str]]:
@@ -49,6 +51,17 @@ def run_report(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str, 
     
     print(f"[Stage 6 Worker] Generating CAP-compliant report for Case {case_id}...")
 
+    # Guard: Do not overwrite or recalculate signed or amended reports (#170)
+    existing_report = db.scalars(
+        select(Report).where(Report.case_id == case_uid).order_by(Report.version.desc())
+    ).first()
+    if existing_report and existing_report.status in ("signed", "amended"):
+        print(f"[Stage 6 Worker] Case {case_id} report is already {existing_report.status}. Skipping regeneration.")
+        stage_exec.status = "awaiting_review"
+        stage_exec.output_ref = existing_report.pdf_path
+        db.commit()
+        return existing_report.pdf_path or "", {"status": f"skipped_already_{existing_report.status}"}
+
     case = db.scalars(select(Case).where(Case.id == case_uid)).first()
     slide = db.scalars(select(Slide).where(Slide.case_id == case_uid)).first()
     grading = db.scalars(select(Grading).where(Grading.case_id == case_uid)).first()
@@ -59,7 +72,7 @@ def run_report(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str, 
     input_ref = stage_exec.input_ref or {}
     is_benign = bool(input_ref.get("benign_flag", False))
 
-    # Extract verified Stage 4 & 5 values
+    # Extract verified Stage 4 & 5 values (no fabricated defaults, #532)
     if is_benign:
         histologic_type = "Benign / No invasive carcinoma identified"
         grade_val = None
@@ -73,18 +86,20 @@ def run_report(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str, 
         pn_stage = "N/A"
         stage_grp = "Benign"
     else:
-        grade_val = grading.grade if grading and grading.grade else 2
-        tubule_score = grading.tubule_score if grading and grading.tubule_score else 2
-        tubule_pct = grading.tubule_percent if grading and grading.tubule_percent is not None else 45.0
-        pleo_score = grading.pleo_score if grading and grading.pleo_score else 2
-        mitotic_score = grading.mitotic_score if grading and grading.mitotic_score else 2
-        nottingham_sum = grading.nottingham_sum if grading and grading.nottingham_sum else (tubule_score + pleo_score + mitotic_score)
-        histologic_type = grading.histologic_type if grading and grading.histologic_type else "IDC-NST"
+        grade_val = grading.grade if grading and grading.grade else None
+        tubule_score = grading.tubule_score if grading and grading.tubule_score is not None else None
+        tubule_pct = grading.tubule_percent if grading and grading.tubule_percent is not None else None
+        pleo_score = grading.pleo_score if grading and grading.pleo_score is not None else None
+        mitotic_score = grading.mitotic_score if grading and grading.mitotic_score is not None else None
+        nottingham_sum = grading.nottingham_sum if grading and grading.nottingham_sum is not None else (
+            (tubule_score + pleo_score + mitotic_score)
+            if (tubule_score is not None and pleo_score is not None and mitotic_score is not None)
+            else None
+        )
+        histologic_type = grading.histologic_type if grading and grading.histologic_type else "Invasive Carcinoma of No Special Type (NST)"
 
     # 2. Check existing report record or initialize default
-    report_record = db.scalars(
-        select(Report).where(Report.case_id == case_uid).order_by(Report.version.desc())
-    ).first()
+    report_record = existing_report
     if not report_record:
         report_record = Report(
             case_id=case_uid,
@@ -175,14 +190,18 @@ def run_report(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str, 
         narrative_dict = loop.run_until_complete(
             medgemma_client.generate_cap_report_narrative(case_summary_payload, prompt_tpl)
         )
+        # Check narrative consistency against structured parameters (#176)
+        consistency_warnings = validate_narrative_consistency(narrative_dict, case_summary_payload)
+        if consistency_warnings:
+            print(f"[Stage 6 Worker] Narrative consistency warnings for Case {case_id}: {consistency_warnings}")
     report_record.narrative = narrative_dict
-
 
     # 5. Generate Clinical PDF via temporary scratch directory
     scratch_dir = tempfile.mkdtemp(prefix="og_report_")
 
     try:
-        pdf_filename = f"CAP_Report_{case_id[:8]}.pdf"
+        version_num = report_record.version or 1
+        pdf_filename = f"CAP_Report_{case_id[:8]}_v{version_num}.pdf"
         pdf_out_path = os.path.join(scratch_dir, pdf_filename)
         
         # Download evidence files if available in GCS
@@ -245,15 +264,26 @@ def run_report(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str, 
         with open(pdf_out_path, "rb") as pdf_file:
             pdf_content = pdf_file.read()
 
-        gcs_pdf_path = f"cases/{case_id}/report/{pdf_filename}"
+        # Upload versioned PDF
+        versioned_path = f"cases/{case_id}/report/v{version_num}/{pdf_filename}"
         upload_blob_from_bytes(
             settings.GCS_ARTIFACTS_BUCKET,
-            gcs_pdf_path,
+            versioned_path,
             pdf_content,
             "application/pdf"
         )
 
-        gcs_pdf_uri = f"gs://{settings.GCS_ARTIFACTS_BUCKET}/{gcs_pdf_path}"
+        # Upload unversioned latest pointer
+        latest_path = f"cases/{case_id}/report/CAP_Report_{case_id[:8]}.pdf"
+        upload_blob_from_bytes(
+            settings.GCS_ARTIFACTS_BUCKET,
+            latest_path,
+            pdf_content,
+            "application/pdf"
+        )
+
+        report_record.pdf_sha256 = hashlib.sha256(pdf_content).hexdigest()
+        gcs_pdf_uri = f"gs://{settings.GCS_ARTIFACTS_BUCKET}/{versioned_path}"
         report_record.pdf_path = gcs_pdf_uri
         stage_exec.status = "awaiting_review"
         stage_exec.output_ref = gcs_pdf_uri

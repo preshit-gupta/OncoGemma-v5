@@ -32,6 +32,20 @@ import {
 } from "@/lib/api";
 import { formatISTDateTime } from "@/lib/utils";
 
+function computeAllredScore(percent: number | null | undefined, intensity: number = 3): number {
+  if (percent === null || percent === undefined || percent <= 0) return 0;
+  let prop = 1;
+  if (percent < 1) prop = 1;
+  else if (percent <= 10) prop = 2;
+  else if (percent <= 33) prop = 3;
+  else if (percent <= 66) prop = 4;
+  else prop = 5;
+  return Math.min(8, prop + intensity);
+}
+
+const ATTESTATION_TEXT =
+  "I electronically attest that I have reviewed the Whole-Slide Image (WSI), AI-generated hotspot triage regions, mitotic figure annotations across 10 high-power fields, and Nottingham histological parameters, and I verify that the diagnostic findings, CAP synoptic elements, and AJCC staging in this report are clinically accurate.";
+
 interface ReportWorkspaceProps {
   caseId: string;
   onRefreshCase?: () => void;
@@ -43,28 +57,28 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
   const [saving, setSaving] = useState<boolean>(false);
   const [generatingNarrative, setGeneratingNarrative] = useState<boolean>(false);
 
-  // Form State
+  // Form State (no fabricated defaults, #182, #270)
   const [procedure, setProcedure] = useState<string>("Core Needle Biopsy");
   const [laterality, setLaterality] = useState<string>("right");
   const [tumorSite, setTumorSite] = useState<string>("upper_outer_quadrant");
-  const [tumorSizeMm, setTumorSizeMm] = useState<number>(18.0);
+  const [tumorSizeMm, setTumorSizeMm] = useState<number | null>(null);
   const [lviStatus, setLviStatus] = useState<"absent" | "present" | "indeterminate">("absent");
   const [dcisPresent, setDcisPresent] = useState<boolean>(false);
 
-  const [marginStatus, setMarginStatus] = useState<"negative" | "positive" | "cannot_be_assessed">("negative");
-  const [closestMarginMm, setClosestMarginMm] = useState<number>(5.0);
+  const [marginStatus, setMarginStatus] = useState<"negative" | "positive" | "cannot_be_assessed">("cannot_be_assessed");
+  const [closestMarginMm, setClosestMarginMm] = useState<number | null>(null);
   const [closestMarginName, setClosestMarginName] = useState<string>("posterior");
 
   const [nodesExamined, setNodesExamined] = useState<number>(0);
   const [nodesPositive, setNodesPositive] = useState<number>(0);
   const [extranodalExt, setExtranodalExt] = useState<boolean>(false);
 
-  // Biomarkers
-  const [erPercent, setErPercent] = useState<number>(95);
-  const [prPercent, setPrPercent] = useState<number>(80);
+  // Biomarkers (nullable if not assessed)
+  const [erPercent, setErPercent] = useState<number | null>(null);
+  const [prPercent, setPrPercent] = useState<number | null>(null);
   const [her2Score, setHer2Score] = useState<string>("1+");
   const [her2Result, setHer2Result] = useState<string>("negative");
-  const [ki67Percent, setKi67Percent] = useState<number>(18);
+  const [ki67Percent, setKi67Percent] = useState<number | null>(null);
 
   // Narrative
   const [diagnosisLine, setDiagnosisLine] = useState<string>("");
@@ -73,8 +87,10 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
 
   // Sign-off Modal
   const [showSignModal, setShowSignModal] = useState<boolean>(false);
-  const [signedBy, setSignedBy] = useState<string>("Dr. Jane Doe, MD, FCAP");
-  const [npi, setNpi] = useState<string>("NPI-1982347102");
+  const [signedBy, setSignedBy] = useState<string>("");
+  const [npi, setNpi] = useState<string>("");
+  const [pin, setPin] = useState<string>("");
+  const [signErrors, setSignErrors] = useState<string[]>([]);
   const [attestationAgreed, setAttestationAgreed] = useState<boolean>(false);
   const [signLoading, setSignLoading] = useState<boolean>(false);
 
@@ -92,27 +108,31 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
       setProcedure(res.procedure || "Core Needle Biopsy");
       setLaterality(res.laterality || "right");
       setTumorSite(res.tumor_site || "upper_outer_quadrant");
-      setTumorSizeMm(res.tumor_size_mm || 18.0);
+      setTumorSizeMm(res.tumor_size_mm ?? null);
       setLviStatus(res.lvi_status || "absent");
-      setDcisPresent(res.dcis_present || false);
+      setDcisPresent(res.dcis_present ?? false);
 
-      setMarginStatus(res.margins?.status || "negative");
-      setClosestMarginMm(res.margins?.closest_margin_mm ?? 5.0);
+      setMarginStatus(res.margins?.status || "cannot_be_assessed");
+      setClosestMarginMm(res.margins?.closest_margin_mm ?? null);
       setClosestMarginName(res.margins?.closest_margin_name || "posterior");
 
-      setNodesExamined(res.lymph_nodes?.examined_count || 0);
-      setNodesPositive(res.lymph_nodes?.positive_count || 0);
-      setExtranodalExt(res.lymph_nodes?.extranodal_extension || false);
+      setNodesExamined(res.lymph_nodes?.examined_count ?? 0);
+      setNodesPositive(res.lymph_nodes?.positive_count ?? 0);
+      setExtranodalExt(res.lymph_nodes?.extranodal_extension ?? false);
 
-      setErPercent(res.biomarkers?.er?.percent ?? 95);
-      setPrPercent(res.biomarkers?.pr?.percent ?? 80);
+      setErPercent(res.biomarkers?.er?.percent ?? null);
+      setPrPercent(res.biomarkers?.pr?.percent ?? null);
       setHer2Score(res.biomarkers?.her2?.ihc_score || "1+");
       setHer2Result(res.biomarkers?.her2?.result || "negative");
-      setKi67Percent(res.biomarkers?.ki67?.percent ?? 18);
+      setKi67Percent(res.biomarkers?.ki67?.percent ?? null);
 
-      const defaultDiag = `BREAST, CORE NEEDLE BIOPSY: INVASIVE BREAST CARCINOMA OF NO SPECIAL TYPE (DUCTAL), NOTTINGHAM HISTOLOGIC GRADE ${res.nottingham_grade?.grade || 3} (SCORE ${res.nottingham_grade?.nottingham_sum || 8}/9: TUBULE ${res.nottingham_grade?.tubule_score || 3}, PLEOMORPHISM ${res.nottingham_grade?.pleo_score || 3}, MITOSIS ${res.nottingham_grade?.mitotic_score || 2}).`;
-      const defaultMicro = `Histologic sections demonstrate infiltrating cohesive cords and solid sheets of malignant epithelial cells dissecting fibrous stroma. Glandular lumen formation is minimal (<10%, Score 3). Nuclei exhibit marked pleomorphism with prominent variation in size and contour, open vesicular chromatin, and identifiable macronucleoli (Score 3). Mitotic activity reveals 12 mitotic figures across 10 standardized high-power fields (5.56 mitoses/mm², Score 2).`;
-      const defaultCorr = `Nottingham Combined Histological Grade 3 (Poorly Differentiated). Routine immunohistochemical reflex evaluation for ER, PR, HER2, and Ki-67 proliferation index is recommended on diagnostic tissue.`;
+      setSignedBy(res.signed_by || "Dr. Jane Doe, MD, FCAP");
+      setNpi(res.npi || "");
+
+      const gradeStr = res.nottingham_grade?.grade ? `GRADE ${res.nottingham_grade.grade}` : "PENDING EVALUATION";
+      const defaultDiag = `BREAST, ${res.procedure?.toUpperCase() || "CORE NEEDLE BIOPSY"}: ${res.histologic_type?.toUpperCase() || "INVASIVE BREAST CARCINOMA"}, NOTTINGHAM HISTOLOGIC ${gradeStr}.`;
+      const defaultMicro = `Histologic sections demonstrate infiltrating tumor tissue. Evaluated across standardized high-power fields.`;
+      const defaultCorr = `Routine immunohistochemical reflex evaluation for ER, PR, HER2, and Ki-67 proliferation index is recommended on diagnostic tissue.`;
 
       setDiagnosisLine(res.narrative?.diagnosis_line || defaultDiag);
       setMicroscopicFindings(res.narrative?.microscopic_findings || defaultMicro);
@@ -141,14 +161,37 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
   }, [showSignModal, showAmendModal]);
 
   const handleUpdate = async (overrides?: Partial<CapReportData>) => {
+    if (nodesExamined < nodesPositive) {
+      alert("Lymph nodes examined count cannot be less than positive count.");
+      return;
+    }
     try {
       setSaving(true);
+      const biomarkersPayload = (erPercent !== null || prPercent !== null || ki67Percent !== null) ? {
+        er: erPercent !== null ? {
+          status: erPercent >= 1 ? "positive" : "negative",
+          percent: erPercent,
+          allred_score: computeAllredScore(erPercent)
+        } : undefined,
+        pr: prPercent !== null ? {
+          status: prPercent >= 1 ? "positive" : "negative",
+          percent: prPercent,
+          allred_score: computeAllredScore(prPercent)
+        } : undefined,
+        her2: {
+          ihc_score: her2Score,
+          fish_status: "not_performed",
+          result: her2Result
+        },
+        ki67: ki67Percent !== null ? { percent: ki67Percent } : undefined
+      } : (data?.biomarkers || undefined);
+
       const payload = {
         case_id: caseId,
         procedure,
         laterality,
         tumor_site: tumorSite,
-        tumor_size_mm: tumorSizeMm,
+        tumor_size_mm: tumorSizeMm !== null ? tumorSizeMm : undefined,
         lvi_status: lviStatus,
         dcis_present: dcisPresent,
         margins: {
@@ -163,12 +206,7 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
           extranodal_extension: extranodalExt,
           largest_metastasis_mm: 0.0
         },
-        biomarkers: {
-          er: { status: erPercent > 1 ? "positive" : "negative", percent: erPercent, allred_score: 8 },
-          pr: { status: prPercent > 1 ? "positive" : "negative", percent: prPercent, allred_score: 7 },
-          her2: { ihc_score: her2Score, fish_status: "not_performed", result: her2Result },
-          ki67: { percent: ki67Percent }
-        },
+        biomarkers: biomarkersPayload,
         narrative: {
           diagnosis_line: diagnosisLine,
           microscopic_findings: microscopicFindings,
@@ -179,9 +217,10 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
       const res = await updateReportData(payload);
       setData(res);
       if (onRefreshCase) onRefreshCase();
-    } catch (err) {
+    } catch (err: any) {
       console.error(err);
-      alert("Failed to update report");
+      alert(err.message || "Failed to update report");
+      throw err;
     } finally {
       setSaving(false);
     }
@@ -210,16 +249,33 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
       alert("Please agree to the pathologist attestation statement before signing.");
       return;
     }
+    if (!npi || npi.trim().length === 0) {
+      alert("Please provide your Pathologist NPI / License number.");
+      return;
+    }
+    if (!pin || pin.trim().length < 4) {
+      alert("Please enter a valid PIN or password (at least 4 characters).");
+      return;
+    }
     try {
       setSignLoading(true);
+      // Persist any uncommitted form changes before signing (#250)
+      try {
+        await handleUpdate();
+      } catch (saveErr) {
+        console.warn("Pre-sign update encountered an issue, proceeding to validation:", saveErr);
+      }
+
       const res = await signReport({
         case_id: caseId,
-        signed_by: signedBy,
-        npi,
-        attestation_statement: "I electronically attest that I have reviewed the whole slide image, triage hotspots, mitotic counts, and Nottingham histologic grading parameters, and I verify that the diagnostic findings, CAP synoptic elements, and AJCC staging in this report are accurate."
+        signed_by: signedBy.trim() || "Dr. Pathologist, MD",
+        npi: npi.trim(),
+        password_or_pin: pin.trim(),
+        attestation_statement: ATTESTATION_TEXT
       });
       setData(res);
       setShowSignModal(false);
+      setSignErrors([]);
       if (onRefreshCase) onRefreshCase();
     } catch (err: any) {
       console.error(err);
@@ -227,6 +283,8 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
         await loadData();
         setShowSignModal(false);
         if (onRefreshCase) onRefreshCase();
+      } else if (err.detail?.missing_items) {
+        setSignErrors(err.detail.missing_items);
       } else {
         alert(err.message || "Failed to sign report");
       }
@@ -439,6 +497,268 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
                   </div>
                   <div className="text-[10px] text-slate-400">
                     Finalized & Attested
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* CAP Synoptic & AJCC Staging Card */}
+            <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-5 space-y-4 shadow-sm">
+              <div className="flex items-center justify-between border-b border-slate-800/80 pb-3">
+                <h3 className="text-xs font-bold text-sky-400 uppercase tracking-wider flex items-center space-x-2">
+                  <Activity className="w-4 h-4" />
+                  <span>AJCC Staging & CAP Synoptic Elements</span>
+                </h3>
+                <span className="text-[10px] font-mono bg-sky-950 border border-sky-800 text-sky-300 px-2 py-0.5 rounded">
+                  AJCC 8th/9th Ed.
+                </span>
+              </div>
+
+              {/* AJCC Staging Badges */}
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+                <div className="p-2.5 bg-slate-950/80 border border-slate-800 rounded-lg">
+                  <div className="text-[10px] text-slate-400 font-semibold uppercase">Primary Tumor (pT)</div>
+                  <div className="text-sm font-bold text-sky-300 mt-0.5">
+                    {data?.staging?.pt_stage || "Pending"}
+                  </div>
+                  <div className="text-[10px] text-slate-500">
+                    {tumorSizeMm !== null ? `${tumorSizeMm} mm` : "Size not entered"}
+                  </div>
+                </div>
+
+                <div className="p-2.5 bg-slate-950/80 border border-slate-800 rounded-lg">
+                  <div className="text-[10px] text-slate-400 font-semibold uppercase">Regional Nodes (pN)</div>
+                  <div className="text-sm font-bold text-sky-300 mt-0.5">
+                    {data?.staging?.pn_stage || "Pending"}
+                  </div>
+                  <div className="text-[10px] text-slate-500">
+                    {nodesPositive}/{nodesExamined} nodes pos.
+                  </div>
+                </div>
+
+                <div className="p-2.5 bg-slate-950/80 border border-slate-800 rounded-lg">
+                  <div className="text-[10px] text-slate-400 font-semibold uppercase">Distant Metastasis</div>
+                  <div className="text-sm font-bold text-slate-300 mt-0.5">
+                    {data?.staging?.pm_stage || "cM0"}
+                  </div>
+                  <div className="text-[10px] text-slate-500">Clinical staging</div>
+                </div>
+
+                <div className="p-2.5 bg-slate-950/80 border border-emerald-800/40 rounded-lg bg-emerald-950/10">
+                  <div className="text-[10px] text-emerald-400 font-semibold uppercase">AJCC Stage Group</div>
+                  <div className="text-sm font-bold text-emerald-300 mt-0.5">
+                    Stage {data?.staging?.stage_group || "Pending"}
+                  </div>
+                  <div className="text-[10px] text-slate-500">CAP protocol group</div>
+                </div>
+              </div>
+
+              {/* Synoptic Parameters Form Inputs */}
+              <div className="space-y-3 pt-1 text-xs">
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                  {/* Tumor Size */}
+                  <div className="space-y-1">
+                    <label htmlFor="tumor-size-input" className="text-slate-400 text-[10px] font-semibold uppercase">
+                      Invasive Tumor Size (mm)
+                    </label>
+                    <input
+                      id="tumor-size-input"
+                      type="number"
+                      step="0.1"
+                      min="0"
+                      disabled={isSigned}
+                      value={tumorSizeMm !== null ? tumorSizeMm : ""}
+                      onChange={(e) => setTumorSizeMm(e.target.value === "" ? null : parseFloat(e.target.value))}
+                      placeholder="e.g. 18.0"
+                      className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-slate-200 focus:outline-none focus:border-sky-500 text-xs"
+                    />
+                  </div>
+
+                  {/* LVI Status */}
+                  <div className="space-y-1">
+                    <label htmlFor="lvi-status-select" className="text-slate-400 text-[10px] font-semibold uppercase">
+                      Lymph-Vascular Invasion (LVI)
+                    </label>
+                    <select
+                      id="lvi-status-select"
+                      disabled={isSigned}
+                      value={lviStatus}
+                      onChange={(e) => setLviStatus(e.target.value as any)}
+                      className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-slate-200 focus:outline-none focus:border-sky-500 text-xs"
+                    >
+                      <option value="absent">Absent</option>
+                      <option value="present">Present</option>
+                      <option value="indeterminate">Indeterminate</option>
+                    </select>
+                  </div>
+
+                  {/* DCIS */}
+                  <div className="space-y-1 flex flex-col justify-end">
+                    <label htmlFor="dcis-checkbox" className="flex items-center space-x-2 py-2 cursor-pointer">
+                      <input
+                        id="dcis-checkbox"
+                        type="checkbox"
+                        disabled={isSigned}
+                        checked={dcisPresent}
+                        onChange={(e) => setDcisPresent(e.target.checked)}
+                        className="mt-0.5 rounded border-slate-700 text-sky-600 focus:ring-0 bg-slate-900 w-4 h-4"
+                      />
+                      <span className="text-slate-300 font-medium text-xs">DCIS Associated</span>
+                    </label>
+                  </div>
+                </div>
+
+                {/* Lymph Nodes & Margins */}
+                <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+                  <div className="space-y-1">
+                    <label htmlFor="nodes-examined-input" className="text-slate-400 text-[10px] font-semibold uppercase">
+                      Nodes Examined
+                    </label>
+                    <input
+                      id="nodes-examined-input"
+                      type="number"
+                      min="0"
+                      disabled={isSigned}
+                      value={nodesExamined}
+                      onChange={(e) => setNodesExamined(parseInt(e.target.value) || 0)}
+                      className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-slate-200 focus:outline-none focus:border-sky-500 text-xs"
+                    />
+                  </div>
+
+                  <div className="space-y-1">
+                    <label htmlFor="nodes-positive-input" className="text-slate-400 text-[10px] font-semibold uppercase">
+                      Nodes Positive
+                    </label>
+                    <input
+                      id="nodes-positive-input"
+                      type="number"
+                      min="0"
+                      disabled={isSigned}
+                      value={nodesPositive}
+                      onChange={(e) => setNodesPositive(parseInt(e.target.value) || 0)}
+                      className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-slate-200 focus:outline-none focus:border-sky-500 text-xs"
+                    />
+                  </div>
+
+                  <div className="space-y-1">
+                    <label htmlFor="margin-status-select" className="text-slate-400 text-[10px] font-semibold uppercase">
+                      Margin Status
+                    </label>
+                    <select
+                      id="margin-status-select"
+                      disabled={isSigned}
+                      value={marginStatus}
+                      onChange={(e) => setMarginStatus(e.target.value as any)}
+                      className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-slate-200 focus:outline-none focus:border-sky-500 text-xs"
+                    >
+                      <option value="negative">Negative</option>
+                      <option value="positive">Positive</option>
+                      <option value="cannot_be_assessed">Cannot be assessed</option>
+                    </select>
+                  </div>
+
+                  <div className="space-y-1">
+                    <label htmlFor="closest-margin-input" className="text-slate-400 text-[10px] font-semibold uppercase">
+                      Closest Margin (mm)
+                    </label>
+                    <input
+                      id="closest-margin-input"
+                      type="number"
+                      step="0.1"
+                      min="0"
+                      disabled={isSigned}
+                      value={closestMarginMm !== null ? closestMarginMm : ""}
+                      onChange={(e) => setClosestMarginMm(e.target.value === "" ? null : parseFloat(e.target.value))}
+                      placeholder="e.g. 5.0"
+                      className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-slate-200 focus:outline-none focus:border-sky-500 text-xs"
+                    />
+                  </div>
+                </div>
+
+                {/* Biomarker Inputs */}
+                <div className="pt-2 border-t border-slate-800/80">
+                  <div className="text-[10px] text-slate-400 font-semibold uppercase pb-2">
+                    Immunohistochemical (IHC) Biomarkers (Optional / Reflex)
+                  </div>
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                    <div className="space-y-1">
+                      <div className="flex items-center justify-between">
+                        <label htmlFor="er-percent-input" className="text-slate-400 text-[10px] font-semibold">ER (% Positive)</label>
+                        {erPercent !== null && (
+                          <span className={`text-[10px] font-bold ${erPercent >= 1 ? "text-emerald-400" : "text-slate-400"}`}>
+                            {erPercent >= 1 ? "Positive" : "Negative"} (Allred {computeAllredScore(erPercent)})
+                          </span>
+                        )}
+                      </div>
+                      <input
+                        id="er-percent-input"
+                        type="number"
+                        min="0"
+                        max="100"
+                        disabled={isSigned}
+                        value={erPercent !== null ? erPercent : ""}
+                        onChange={(e) => setErPercent(e.target.value === "" ? null : parseInt(e.target.value))}
+                        placeholder="e.g. 95"
+                        className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-slate-200 focus:outline-none focus:border-sky-500 text-xs"
+                      />
+                    </div>
+
+                    <div className="space-y-1">
+                      <div className="flex items-center justify-between">
+                        <label htmlFor="pr-percent-input" className="text-slate-400 text-[10px] font-semibold">PR (% Positive)</label>
+                        {prPercent !== null && (
+                          <span className={`text-[10px] font-bold ${prPercent >= 1 ? "text-emerald-400" : "text-slate-400"}`}>
+                            {prPercent >= 1 ? "Positive" : "Negative"} (Allred {computeAllredScore(prPercent)})
+                          </span>
+                        )}
+                      </div>
+                      <input
+                        id="pr-percent-input"
+                        type="number"
+                        min="0"
+                        max="100"
+                        disabled={isSigned}
+                        value={prPercent !== null ? prPercent : ""}
+                        onChange={(e) => setPrPercent(e.target.value === "" ? null : parseInt(e.target.value))}
+                        placeholder="e.g. 80"
+                        className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-slate-200 focus:outline-none focus:border-sky-500 text-xs"
+                      />
+                    </div>
+
+                    <div className="space-y-1">
+                      <label htmlFor="her2-score-select" className="text-slate-400 text-[10px] font-semibold">HER2 IHC Score</label>
+                      <select
+                        id="her2-score-select"
+                        disabled={isSigned}
+                        value={her2Score}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          setHer2Score(val);
+                          setHer2Result(val === "3+" ? "positive" : val === "2+" ? "equivocal" : "negative");
+                        }}
+                        className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-slate-200 focus:outline-none focus:border-sky-500 text-xs"
+                      >
+                        <option value="0">0 (Negative)</option>
+                        <option value="1+">1+ (Negative)</option>
+                        <option value="2+">2+ (Equivocal)</option>
+                        <option value="3+">3+ (Positive)</option>
+                      </select>
+                    </div>
+
+                    <div className="space-y-1">
+                      <label htmlFor="ki67-percent-input" className="text-slate-400 text-[10px] font-semibold">Ki-67 Index (%)</label>
+                      <input
+                        id="ki67-percent-input"
+                        type="number"
+                        min="0"
+                        max="100"
+                        disabled={isSigned}
+                        value={ki67Percent !== null ? ki67Percent : ""}
+                        onChange={(e) => setKi67Percent(e.target.value === "" ? null : parseInt(e.target.value))}
+                        placeholder="e.g. 18"
+                        className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-slate-200 focus:outline-none focus:border-sky-500 text-xs"
+                      />
+                    </div>
                   </div>
                 </div>
               </div>
@@ -725,6 +1045,20 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
             </div>
 
             <div className="space-y-4 text-xs">
+              {signErrors.length > 0 && (
+                <div className="p-3 bg-red-950/60 border border-red-800 rounded-lg space-y-1">
+                  <div className="text-xs font-bold text-red-400 flex items-center space-x-1.5">
+                    <AlertTriangle className="w-4 h-4 text-red-400" />
+                    <span>Preconditions Required Before Signing:</span>
+                  </div>
+                  <ul className="text-[11px] text-red-300 list-disc list-inside space-y-0.5">
+                    {signErrors.map((err, i) => (
+                      <li key={i}>{err}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
               <div className="space-y-1.5">
                 <label htmlFor="pathologist-name" className="text-slate-300 font-medium">Pathologist Name & Title</label>
                 <input
@@ -738,14 +1072,26 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
               </div>
 
               <div className="space-y-1.5">
-                <label htmlFor="pathologist-npi" className="text-slate-300 font-medium">NPI / License Number</label>
+                <label htmlFor="pathologist-npi" className="text-slate-300 font-medium">NPI / License Number (Required)</label>
                 <input
                   id="pathologist-npi"
                   type="text"
                   value={npi}
                   onChange={(e) => setNpi(e.target.value)}
-                  placeholder="e.g. NPI-1982347102"
+                  placeholder="e.g. 1982347102"
                   className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-200 focus:outline-none focus:border-sky-500 font-mono"
+                />
+              </div>
+
+              <div className="space-y-1.5">
+                <label htmlFor="pathologist-pin" className="text-slate-300 font-medium">Pathologist PIN / Password (Required)</label>
+                <input
+                  id="pathologist-pin"
+                  type="password"
+                  value={pin}
+                  onChange={(e) => setPin(e.target.value)}
+                  placeholder="Enter 4-digit PIN or password"
+                  className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-200 focus:outline-none focus:border-sky-500 font-mono tracking-widest"
                 />
               </div>
 
@@ -754,7 +1100,7 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
                   Legal Attestation Statement:
                 </div>
                 <p className="text-[11px] text-slate-400 leading-relaxed italic">
-                  "I electronically attest that I have reviewed the Whole-Slide Image (WSI), AI-generated hotspot triage regions, mitotic figure annotations across 10 high-power fields, and Nottingham histological parameters, and I verify that the diagnostic findings, CAP synoptic elements, and AJCC staging in this report are clinically accurate."
+                  "{ATTESTATION_TEXT}"
                 </p>
                 <label htmlFor="attestation-checkbox" className="flex items-start space-x-2.5 pt-1 cursor-pointer">
                   <input

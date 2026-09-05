@@ -256,18 +256,18 @@ def generate_clinical_cap_pdf(
     if is_benign:
         default_diag = "BREAST, CORE NEEDLE BIOPSY: BENIGN BREAST TISSUE, NEGATIVE FOR INVASIVE CARCINOMA."
     else:
-        g_display = grade_val if grade_val is not None else 2
-        t_disp = t_score if t_score is not None else 2
-        p_disp = p_score if p_score is not None else 2
-        m_disp = m_score if m_score is not None else 2
-        s_disp = n_sum if n_sum is not None else (t_disp + p_disp + m_disp)
+        if grade_val is not None:
+            g_display = str(grade_val)
+            t_disp = str(t_score) if t_score is not None else "Pending"
+            p_disp = str(p_score) if p_score is not None else "Pending"
+            m_disp = str(m_score) if m_score is not None else "Pending"
+            s_disp = f"{n_sum}/9" if n_sum is not None else "Pending"
+            nottingham_str = f"NOTTINGHAM HISTOLOGIC GRADE {g_display} (SCORE {s_disp}: TUBULE {t_disp}, PLEOMORPHISM {p_disp}, MITOSIS {m_disp})"
+        else:
+            nottingham_str = "NOTTINGHAM HISTOLOGIC GRADE: Pending / Not Assessed"
         default_diag = (
             f"BREAST, CORE NEEDLE BIOPSY: INVASIVE BREAST CARCINOMA OF NO SPECIAL TYPE (DUCTAL), "
-            f"NOTTINGHAM HISTOLOGIC GRADE {g_display} "
-            f"(SCORE {s_disp}/9: "
-            f"TUBULE {t_disp}, "
-            f"PLEOMORPHISM {p_disp}, "
-            f"MITOSIS {m_disp})."
+            f"{nottingham_str}."
         )
     diag_text = narrative.get("diagnosis_line") or default_diag
     diag_table = Table([
@@ -306,12 +306,19 @@ def generate_clinical_cap_pdf(
             [Paragraph("Total Evaluated Biopsy Area", bold_body_style), Paragraph("3.60 mm² mapped across core tissue fragments", body_style)],
         ]
     else:
-        g_val = grade_val if grade_val is not None else 2
-        t_val = t_score if t_score is not None else 2
-        p_val = p_score if p_score is not None else 2
-        m_val = m_score if m_score is not None else 2
-        s_val = n_sum if n_sum is not None else (t_val + p_val + m_val)
-        t_pct_val = t_pct if t_pct is not None else 45.0
+        if grade_val is not None:
+            g_val_disp = f"<b>Grade {grade_val}</b>"
+            s_val_disp = f"(Elston-Ellis Total Score: {n_sum}/9)" if n_sum is not None else ""
+            nottingham_combined_disp = f"{g_val_disp} {s_val_disp}".strip()
+            t_disp = f"Score {t_score} (Median: {t_pct:.1f}% glandular structure)" if (t_score is not None and t_pct is not None) else (f"Score {t_score}" if t_score is not None else "Pending / Not Assessed")
+            p_disp = f"Score {p_score} (Evaluation of nuclear size, contour, and chromatin)" if p_score is not None else "Pending / Not Assessed"
+            m_disp = f"Score {m_score} (Standardized across 10 HPFs / 2.157 mm²)" if m_score is not None else "Pending / Not Assessed"
+        else:
+            nottingham_combined_disp = "Pending / Not Assessed"
+            t_disp = "Pending / Not Assessed"
+            p_disp = "Pending / Not Assessed"
+            m_disp = "Pending / Not Assessed"
+
         h_type = hist_type or "Invasive Breast Carcinoma of No Special Type (IDC-NST)"
 
         tumor_size_disp = f"{tumor_size_val:.1f} mm" if tumor_size_val is not None else "Not assessed / Pending"
@@ -327,10 +334,10 @@ def generate_clinical_cap_pdf(
             [Paragraph("<b>Pathology Protocol Element</b>", section_head_style), Paragraph("<b>Verified Quantitative Finding / Value</b>", section_head_style)],
             [Paragraph("Specimen / Procedure", bold_body_style), Paragraph("Breast Core Needle Biopsy (H&E Whole-Slide Image)", body_style)],
             [Paragraph("Histologic Subtype", bold_body_style), Paragraph(str(h_type), body_style)],
-            [Paragraph("Nottingham Combined Histologic Grade", bold_body_style), Paragraph(f"<b>Grade {g_val}</b> (Elston-Ellis Total Score: {s_val}/9)", body_style)],
-            [Paragraph("• Glandular / Tubule Formation", body_style), Paragraph(f"Score {t_val} (Median: {t_pct_val:.1f}% glandular structure)", body_style)],
-            [Paragraph("• Nuclear Pleomorphism", body_style), Paragraph(f"Score {p_val} (Evaluation of nuclear size, contour, and chromatin)", body_style)],
-            [Paragraph("• Mitotic Rate", body_style), Paragraph(f"Score {m_val} (Standardized across 10 HPFs / 2.157 mm²)", body_style)],
+            [Paragraph("Nottingham Combined Histologic Grade", bold_body_style), Paragraph(nottingham_combined_disp, body_style)],
+            [Paragraph("• Glandular / Tubule Formation", body_style), Paragraph(t_disp, body_style)],
+            [Paragraph("• Nuclear Pleomorphism", body_style), Paragraph(p_disp, body_style)],
+            [Paragraph("• Mitotic Rate", body_style), Paragraph(m_disp, body_style)],
             [Paragraph("Tumor Size (Invasive)", bold_body_style), Paragraph(tumor_size_disp, body_style)],
             [Paragraph("Pathologic Staging (AJCC)", bold_body_style), Paragraph(staging_disp, body_style)],
             [Paragraph("Surgical Margins", bold_body_style), Paragraph(margins_disp, body_style)],
@@ -362,6 +369,8 @@ def generate_clinical_cap_pdf(
     img_hpf = RLImage(hpf_buf, width=176, height=50)
     img_patch = RLImage(patch_buf, width=176, height=50)
 
+    mitotic_caption = f"Score {m_score} Mitotic Hotspot (0.2157 mm²)" if m_score is not None else "Top Mitotic HPF Area (0.2157 mm²)"
+
     ev_table = Table([
         [
             Paragraph("<b>WSI Tumor Triage Heatmap</b>", section_head_style),
@@ -371,8 +380,8 @@ def generate_clinical_cap_pdf(
         [img_hm, img_hpf, img_patch],
         [
             Paragraph("Path Foundation tumor triage map", body_style),
-            Paragraph(f"Score {m_score} Mitotic Hotspot (0.2157 mm²)", body_style),
-            Paragraph(f"10× normalized gland morphology", body_style)
+            Paragraph(mitotic_caption, body_style),
+            Paragraph("10× normalized gland morphology", body_style)
         ]
     ], colWidths=[186, 186, 188])
     ev_table.setStyle(TableStyle([
@@ -391,19 +400,26 @@ def generate_clinical_cap_pdf(
     story.append(Spacer(1, 4))
 
     # 6. Microscopic Description & Clinical Correlation
-    t_pct_disp = t_pct if t_pct is not None else 45.0
-    t_score_disp = t_score if t_score is not None else 2
-    p_score_disp = p_score if p_score is not None else 2
-    m_score_disp = m_score if m_score is not None else 2
-    micro_text = narrative.get("microscopic_findings") or (
-        f"Histologic examination demonstrates an invasive mammary carcinoma showing {t_pct_disp:.1f}% glandular differentiation "
-        f"(tubule score {t_score_disp}), marked nuclear atypia (pleomorphism score {p_score_disp}), and mitotic rate consistent with "
-        f"score {m_score_disp}. No extensive lymphovascular invasion is identified in the examined tissue sections."
-    )
-    corr_text = narrative.get("clinical_correlation") or (
-        "Nottingham Combined Histological Grade 3 (Poorly Differentiated). "
-        "Routine immunohistochemical reflex testing for ER, PR, HER2, and Ki-67 proliferation index is recommended on diagnostic tissue."
-    )
+    lvi_status = report_data.get("lvi_status", "absent")
+    lvi_desc = "Lymphovascular invasion is identified in examined sections." if lvi_status == "present" else "No lymphovascular invasion is identified in the examined tissue sections."
+    if grade_val is not None:
+        t_text = f"{t_pct:.1f}% glandular differentiation (tubule score {t_score})" if (t_pct is not None and t_score is not None) else (f"tubule score {t_score}" if t_score is not None else "tubular architecture evaluated")
+        p_text = f"pleomorphism score {p_score}" if p_score is not None else "nuclear atypia evaluated"
+        m_text = f"mitotic rate score {m_score}" if m_score is not None else "mitotic figures evaluated"
+        default_micro = (
+            f"Histologic examination demonstrates an invasive mammary carcinoma showing {t_text}, "
+            f"marked nuclear atypia ({p_text}), and mitotic activity ({m_text}). {lvi_desc}"
+        )
+        default_corr = (
+            f"Nottingham Combined Histological Grade {grade_val}. "
+            "Routine immunohistochemical reflex testing for ER, PR, HER2, and Ki-67 proliferation index is recommended on diagnostic tissue."
+        )
+    else:
+        default_micro = f"Histologic examination demonstrates biopsy tissue sections pending quantitative Nottingham grading. {lvi_desc}"
+        default_corr = "Histopathologic grading and receptor biomarker correlation recommended on diagnostic tissue."
+
+    micro_text = narrative.get("microscopic_findings") or default_micro
+    corr_text = narrative.get("clinical_correlation") or default_corr
 
     narr_table = Table([
         [Paragraph("<b>MICROSCOPIC DESCRIPTION:</b>", section_head_style)],

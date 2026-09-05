@@ -167,7 +167,7 @@ def validate_staging_invariants(
     Validate that all calculated staging codes adhere strictly to AJCC mathematical and clinical boundaries.
     Raises ValueError if any discrepancy or invariant violation occurs.
     """
-    if nodes_positive > nodes_examined and nodes_examined > 0:
+    if nodes_positive > nodes_examined:
         raise ValueError(
             f"Staging Invariant Violation: nodes_positive ({nodes_positive}) cannot exceed nodes_examined ({nodes_examined})"
         )
@@ -194,20 +194,67 @@ def validate_narrative_consistency(
     """
     issues: List[str] = []
     text_corpus = " ".join([
-        narrative_dict.get("diagnosis_line", ""),
-        narrative_dict.get("microscopic_findings", ""),
-        narrative_dict.get("clinical_correlation", "")
+        str(narrative_dict.get("diagnosis_line", "")),
+        str(narrative_dict.get("microscopic_findings", "")),
+        str(narrative_dict.get("clinical_correlation", ""))
     ]).lower()
     
-    # Check Grade consistency
+    # 1. Check Grade consistency
     grade = verified_data.get("nottingham_grade", {}).get("grade")
     if grade:
         grade_str = str(grade)
-        # Check if opposing grades are mentioned erroneously
         for g_other in [1, 2, 3]:
             if g_other != grade:
                 pattern = rf"\bgrade\s*{g_other}\b"
-                if re.search(pattern, text_corpus) and not re.search(rf"\bgrade\s*{grade_str}\b", text_corpus):
-                    issues.append(f"Narrative mentions Grade {g_other} instead of confirmed Grade {grade}")
+                if re.search(pattern, text_corpus):
+                    # Flag if opposing grade is explicitly asserted
+                    if not re.search(rf"\bgrade\s*{grade_str}\b", text_corpus):
+                        issues.append(f"Narrative mentions Grade {g_other} instead of confirmed Grade {grade}")
+                    else:
+                        issues.append(f"Narrative contains conflicting Grade mentions (mentions both Grade {g_other} and confirmed Grade {grade})")
+
+    # 2. Check Nottingham Sum consistency if present
+    confirmed_sum = verified_data.get("nottingham_grade", {}).get("nottingham_sum")
+    if confirmed_sum:
+        sum_matches = re.findall(r"\b(?:score|sum)\s*(\d+)/9\b", text_corpus)
+        for s_match in sum_matches:
+            if int(s_match) != int(confirmed_sum):
+                issues.append(f"Narrative states Nottingham sum {s_match}/9 contradicting verified sum {confirmed_sum}/9")
+
+    # 3. Check LVI Concordance
+    lvi_status = verified_data.get("lvi_status")
+    if lvi_status == "present":
+        neg_lvi_patterns = [
+            r"no\s+(?:definite\s+|extensive\s+)?lymphovascular\s+invasion",
+            r"lymphovascular\s+invasion\s+is\s+not\s+identified",
+            r"lvi\s+is\s+negative",
+            r"negative\s+for\s+lymphovascular\s+invasion"
+        ]
+        for p in neg_lvi_patterns:
+            if re.search(p, text_corpus):
+                issues.append("Narrative asserts absence of lymphovascular invasion while verified LVI status is 'present'")
+                break
+    elif lvi_status == "absent":
+        pos_lvi_patterns = [
+            r"lymphovascular\s+invasion\s+(?:is\s+)?present",
+            r"lymphovascular\s+invasion\s+identified",
+            r"positive\s+for\s+lymphovascular\s+invasion"
+        ]
+        for p in pos_lvi_patterns:
+            if re.search(p, text_corpus):
+                # Ensure it wasn't preceded by 'no' or 'not'
+                m = re.search(r"(?:no|not|without)\s+[\w\s]{1,30}" + p, text_corpus)
+                if not m:
+                    issues.append("Narrative asserts presence of lymphovascular invasion while verified LVI status is 'absent'")
+                    break
+
+    # 4. Check Laterality Concordance
+    laterality = verified_data.get("laterality")
+    if laterality == "right":
+        if re.search(r"\bleft\s+breast\b", text_corpus) and not re.search(r"\bright\s+breast\b", text_corpus):
+            issues.append("Narrative references 'left breast' while verified laterality is 'right'")
+    elif laterality == "left":
+        if re.search(r"\bright\s+breast\b", text_corpus) and not re.search(r"\bleft\s+breast\b", text_corpus):
+            issues.append("Narrative references 'right breast' while verified laterality is 'left'")
                     
     return issues

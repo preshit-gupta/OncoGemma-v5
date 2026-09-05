@@ -60,11 +60,13 @@ class Report(Base):
     
     status: Mapped[str] = mapped_column(String, nullable=False, default="draft") # draft, in_review, signed, amended
     pdf_path: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    pdf_sha256: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     signed_by: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     npi: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     attestation_statement: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     signed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     integrity_hash: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    narrative_edited: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     amendments: Mapped[List[Dict[str, Any]]] = mapped_column(JSON_TYPE, nullable=False, default=list)
 
     created_at: Mapped[datetime] = mapped_column(

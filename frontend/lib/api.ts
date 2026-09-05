@@ -736,8 +736,21 @@ export async function signReport(payload: {
     body: JSON.stringify(payload)
   });
   if (!res.ok) {
-    const data = await res.json().catch(() => ({}));
-    throw new Error(data.detail || "Failed to sign and finalize report");
+    const errData = await res.json().catch(() => ({}));
+    let msg = "Failed to sign and finalize report";
+    if (typeof errData.detail === "string") {
+      msg = errData.detail;
+    } else if (errData.detail && typeof errData.detail === "object") {
+      if (Array.isArray(errData.detail.missing_items)) {
+        msg = `${errData.detail.error || "Preconditions not met"}: ${errData.detail.missing_items.join("; ")}`;
+      } else {
+        msg = errData.detail.error || errData.detail.message || JSON.stringify(errData.detail);
+      }
+    }
+    const err: any = new Error(msg);
+    err.status = res.status;
+    err.detail = errData.detail;
+    throw err;
   }
   return res.json();
 }
