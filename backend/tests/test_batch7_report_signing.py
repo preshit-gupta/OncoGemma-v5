@@ -309,6 +309,77 @@ def test_successful_signature_and_canonical_integrity_hash():
     db2.close()
 
 
+def test_sign_report_with_prior_failed_attempts_and_string_case_id():
+    client = TestClient(app)
+    db = TestingSessionLocal()
+    case_uid = uuid.uuid4()
+    case = Case(id=case_uid, status="in_progress", created_by="test_user")
+    db.add(case)
+
+    grading = Grading(
+        case_id=case_uid,
+        histologic_type="Invasive Ductal Carcinoma",
+        type_confirmed_by="user_pathologist_001",
+        tubule_score=2,
+        pleo_score=2,
+        mitotic_score=1,
+        nottingham_sum=5,
+        grade=1
+    )
+    db.add(grading)
+
+    # Add prior failed attempts and confirmed attempt 4 for grading
+    db.add(StageExecution(case_id=case_uid, stage="preprocess", attempt=1, status="confirmed"))
+    db.add(StageExecution(case_id=case_uid, stage="triage", attempt=1, status="confirmed"))
+    db.add(StageExecution(case_id=case_uid, stage="mitosis", attempt=1, status="confirmed"))
+    db.add(StageExecution(case_id=case_uid, stage="grading", attempt=1, status="failed"))
+    db.add(StageExecution(case_id=case_uid, stage="grading", attempt=2, status="failed"))
+    db.add(StageExecution(case_id=case_uid, stage="grading", attempt=3, status="failed"))
+    db.add(StageExecution(case_id=case_uid, stage="grading", attempt=4, status="confirmed"))
+    db.add(StageExecution(case_id=case_uid, stage="report", attempt=1, status="awaiting_review"))
+
+    report = Report(
+        case_id=case_uid,
+        version=1,
+        status="in_review",
+        specimen_type="core_biopsy",
+        procedure="Core Needle Biopsy",
+        laterality="right",
+        tumor_site="upper_outer_quadrant",
+        histologic_type="Invasive Ductal Carcinoma",
+        tumor_size_mm=4.4,
+        lvi_status="present",
+        dcis_present=False,
+        margins={"status": "cannot_be_assessed"},
+        lymph_nodes={"examined_count": 2, "positive_count": 0, "extranodal_extension": False, "largest_metastasis_mm": 0.0}
+    )
+    db.add(report)
+    db.commit()
+    db.close()
+
+    case_id = str(case_uid)
+    res = client.post(
+        "/api/v1/stages/report/sign",
+        json={
+            "case_id": case_id,
+            "signed_by": "Dr. Jane Doe, MD, FCAP",
+            "npi": "1234567890",
+            "password_or_pin": "secret_pin",
+            "attestation_statement": "I electronically attest to the accuracy of all findings."
+        },
+        headers={
+            "X-User-Role": "pathologist",
+            "X-User-Email": "jane.doe@hospital.org"
+        }
+    )
+    assert res.status_code == 200, res.text
+    signed = res.json()
+    assert signed["status"] == "signed"
+    assert signed["signed_by"] == "Dr. Jane Doe, MD, FCAP"
+    assert signed["tumor_size_mm"] == 4.4
+
+
+
 def test_signed_report_immutability_put_and_worker():
     client = TestClient(app)
     db = TestingSessionLocal()

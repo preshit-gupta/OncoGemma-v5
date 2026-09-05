@@ -259,6 +259,7 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
     }
     try {
       setSignLoading(true);
+      setSignErrors([]);
       // Persist any uncommitted form changes before signing (#250)
       try {
         await handleUpdate();
@@ -406,7 +407,10 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
           {/* Sign / Amend Action Buttons */}
           {!isSigned ? (
             <button
-              onClick={() => setShowSignModal(true)}
+              onClick={() => {
+                setSignErrors([]);
+                setShowSignModal(true);
+              }}
               className="px-4 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg transition text-xs font-bold flex items-center space-x-1.5 shadow-lg shadow-emerald-950/50 border border-emerald-400/50"
             >
               <ShieldCheck className="w-4 h-4" />

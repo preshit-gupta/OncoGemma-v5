@@ -677,20 +677,25 @@ def sign_final_report(
             }
         )
 
-    case_uid = to_uuid(payload.case_id)
+    case_id = str(payload.case_id)
+    case_uid = to_uuid(case_id)
     report = _ensure_report_record(case_uid, db)
-    case = db.scalars(select(Case).where(Case.id == case_uid)).first()
-    grading = db.scalars(select(Grading).where(Grading.case_id == case_uid)).first()
+    case = db.scalars(select(Case).where((Case.id == case_uid) | (Case.id == case_id))).first()
+    grading = db.scalars(select(Grading).where((Grading.case_id == case_uid) | (Grading.case_id == case_id))).first()
 
     if report.status == "signed":
         # Idempotent return if already signed
-        return _build_report_response_dict(payload.case_id, db)
+        return _build_report_response_dict(case_id, db)
 
     # Precondition validation (#294)
     missing_items = []
 
     # 1. Prior pipeline stages verification (preprocess, triage, mitosis, grading)
-    stages = db.scalars(select(StageExecution).where(StageExecution.case_id == case_uid)).all()
+    stages = db.scalars(
+        select(StageExecution)
+        .where((StageExecution.case_id == case_uid) | (StageExecution.case_id == case_id))
+        .order_by(StageExecution.attempt.asc())
+    ).all()
     stage_map = {s.stage: s.status for s in stages}
     if stages:
         for req_s in ["preprocess", "triage", "mitosis", "grading"]:
