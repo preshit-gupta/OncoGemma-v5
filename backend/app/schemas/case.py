@@ -55,3 +55,6 @@ class CaseDetailResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+class ApproveStageRequest(BaseModel):
+    override_justification: str | None = None

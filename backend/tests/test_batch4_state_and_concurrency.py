@@ -514,3 +514,142 @@ def test_confirm_triage_gating_and_mitosis_attempt_monotonicity(client, db_sessi
     ).first()
     assert new_mitosis.attempt == 2
     assert new_mitosis.status == "queued"
+
+
+def test_approve_preprocess_done_with_qc_awaiting_review(client, db_session):
+    """
+    Verify approving preprocess succeeds when preprocess status='done'
+    and associated qc status='awaiting_review' (Slide 1 path).
+    """
+    case_id = uuid.uuid4()
+    c = Case(id=case_id, created_by="test_user", status="open")
+    sl = Slide(id=uuid.uuid4(), case_id=case_id, gcs_uri_original="gs://raw/s.svs")
+    se_prep = StageExecution(
+        id=uuid.uuid4(),
+        case_id=case_id,
+        stage="preprocess",
+        attempt=1,
+        status="done"
+    )
+    se_qc = StageExecution(
+        id=uuid.uuid4(),
+        case_id=case_id,
+        stage="qc",
+        attempt=1,
+        status="awaiting_review"
+    )
+    db_session.add_all([c, sl, se_prep, se_qc])
+    db_session.commit()
+
+    with patch("app.core.cloud_tasks.dispatch_stage_task"):
+        res = client.post(
+            f"/api/v1/cases/{case_id}/stages/preprocess/approve",
+            headers={"X-User-Role": "pathologist"}
+        )
+    assert res.status_code == 202
+    assert res.json()["status"] == "approved"
+    assert res.json()["next_stage"] == "triage"
+
+    db_session.refresh(se_prep)
+    db_session.refresh(se_qc)
+    assert se_prep.status == "confirmed"
+    assert se_qc.status == "confirmed"
+
+
+def test_approve_preprocess_qc_failed_requires_override_justification(client, db_session):
+    """
+    Verify approving preprocess when qc status='failed' blocks without justification (409)
+    and succeeds with clinical override justification (Slide 2 path).
+    """
+    case_id = uuid.uuid4()
+    c = Case(id=case_id, created_by="test_user", status="needs_rescan")
+    sl = Slide(id=uuid.uuid4(), case_id=case_id, gcs_uri_original="gs://raw/s.svs")
+    se_prep = StageExecution(
+        id=uuid.uuid4(),
+        case_id=case_id,
+        stage="preprocess",
+        attempt=1,
+        status="done"
+    )
+    se_qc = StageExecution(
+        id=uuid.uuid4(),
+        case_id=case_id,
+        stage="qc",
+        attempt=1,
+        status="failed",
+        error="Critical focus blur: 100.0% of tissue tiles blurry"
+    )
+    db_session.add_all([c, sl, se_prep, se_qc])
+    db_session.commit()
+
+    # 1. Attempt approval without justification -> 409
+    res_blocked = client.post(
+        f"/api/v1/cases/{case_id}/stages/preprocess/approve",
+        headers={"X-User-Role": "pathologist"}
+    )
+    assert res_blocked.status_code == 409
+    assert "clinical override justification" in res_blocked.json()["detail"].lower()
+
+    # 2. Attempt approval with short justification (<10 chars) -> 409
+    res_short = client.post(
+        f"/api/v1/cases/{case_id}/stages/preprocess/approve",
+        headers={"X-User-Role": "pathologist"},
+        json={"override_justification": "Too short"}
+    )
+    assert res_short.status_code == 409
+
+    # 3. Valid clinical override justification (>= 10 chars) -> 202 Approved
+    with patch("app.core.cloud_tasks.dispatch_stage_task"):
+        res_ok = client.post(
+            f"/api/v1/cases/{case_id}/stages/preprocess/approve",
+            headers={"X-User-Role": "pathologist"},
+            json={"override_justification": "Artifact in margin; diagnostic core has adequate cellular clarity."}
+        )
+    assert res_ok.status_code == 202
+    assert res_ok.json()["status"] == "approved"
+
+    db_session.refresh(c)
+    db_session.refresh(se_prep)
+    db_session.refresh(se_qc)
+    assert c.status == "open"
+    assert se_prep.status == "confirmed"
+    assert se_qc.status == "confirmed"
+    assert se_qc.review_edits["override_justification"] == "Artifact in margin; diagnostic core has adequate cellular clarity."
+
+
+def test_retry_preprocess_when_done_or_failed(client, db_session):
+    """
+    Verify retrying preprocess when status is 'done' succeeds, increments attempt to 2,
+    and clears 'needs_rescan' back to 'open'.
+    """
+    case_id = uuid.uuid4()
+    c = Case(id=case_id, created_by="test_user", status="needs_rescan")
+    sl = Slide(id=uuid.uuid4(), case_id=case_id, gcs_uri_original="gs://raw/s.svs")
+    se_prep = StageExecution(
+        id=uuid.uuid4(),
+        case_id=case_id,
+        stage="preprocess",
+        attempt=1,
+        status="done"
+    )
+    db_session.add_all([c, sl, se_prep])
+    db_session.commit()
+
+    with patch("app.core.cloud_tasks.dispatch_stage_task"):
+        res = client.post(
+            f"/api/v1/cases/{case_id}/stages/preprocess/retry",
+            headers={"X-User-Role": "pathologist"}
+        )
+    assert res.status_code == 202
+    assert res.json()["attempt"] == 2
+
+    db_session.refresh(c)
+    assert c.status == "open"
+    retried_prep = db_session.scalars(
+        select(StageExecution)
+        .where(StageExecution.case_id == case_id, StageExecution.stage == "preprocess")
+        .order_by(StageExecution.attempt.desc())
+    ).first()
+    assert retried_prep.attempt == 2
+    assert retried_prep.status == "queued"
+

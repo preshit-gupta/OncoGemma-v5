@@ -188,18 +188,32 @@ export async function uploadSlideFile(
 export async function retryStage(caseId: string, stageName: string) {
   const res = await fetch(`${API_BASE}/api/v1/cases/${caseId}/stages/${stageName}/retry`, {
     method: "POST",
-    headers: { "X-User-Role": "pathologist" }
+    headers: { 
+      "Content-Type": "application/json",
+      "X-User-Role": "pathologist" 
+    },
+    body: JSON.stringify({})
   });
-  if (!res.ok) throw new Error("Failed to retry stage execution");
+  if (!res.ok) {
+    const errData = await res.json().catch(() => null);
+    throw new Error(errData?.detail || `Failed to retry stage execution (${res.status})`);
+  }
   return res.json();
 }
 
-export async function approveStage(caseId: string, stageName: string) {
+export async function approveStage(caseId: string, stageName: string, payload?: { override_justification?: string }) {
   const res = await fetch(`${API_BASE}/api/v1/cases/${caseId}/stages/${stageName}/approve`, {
     method: "POST",
-    headers: { "X-User-Role": "pathologist" }
+    headers: { 
+      "Content-Type": "application/json",
+      "X-User-Role": "pathologist" 
+    },
+    body: JSON.stringify(payload || {})
   });
-  if (!res.ok) throw new Error("Failed to approve stage");
+  if (!res.ok) {
+    const errData = await res.json().catch(() => null);
+    throw new Error(errData?.detail || `Failed to approve stage (${res.status})`);
+  }
   return res.json();
 }
 

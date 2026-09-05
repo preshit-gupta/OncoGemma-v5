@@ -36,7 +36,8 @@ from app.schemas.case import (
     SlideUploadUrlResponse,
     SlideFinalizeRequest,
     SlideMppUpdateRequest,
-    CaseDetailResponse
+    CaseDetailResponse,
+    ApproveStageRequest
 )
 
 router = APIRouter(prefix="/api/v1/cases", tags=["cases"])
@@ -293,7 +294,25 @@ def retry_case_stage(
             detail=f"Stage '{stage_name}' has no previous execution attempt to retry."
         )
 
-    if existing_stage.status not in ("failed", "rejected", "running"):
+    # Guard against retrying completed cases whose final report is signed
+    report_stage = db.scalars(
+        select(StageExecution)
+        .where(StageExecution.case_id == case_id, StageExecution.stage == "report")
+        .order_by(StageExecution.attempt.desc())
+    ).first()
+    if report_stage and report_stage.status == "confirmed":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cannot retry stage on a finalized case with a signed diagnostic report. An amendment is required."
+        )
+
+    if existing_stage.status == "queued":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Stage '{stage_name}' cannot be retried because its status is '{existing_stage.status}'. Only stages in ('failed', 'rejected') can be retried."
+        )
+
+    if existing_stage.status not in ("failed", "rejected", "running", "done", "awaiting_review", "confirmed"):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Stage '{stage_name}' cannot be retried because its status is '{existing_stage.status}'. Only stages in ('failed', 'rejected') can be retried."
@@ -303,6 +322,9 @@ def retry_case_stage(
         existing_stage.status = "failed"
         existing_stage.error = "Interrupted and retried by user while running."
         existing_stage.completed_at = datetime.now(timezone.utc)
+
+    if stage_name == "preprocess":
+        case_obj.status = "open"
 
     next_attempt = existing_stage.attempt + 1
 
@@ -343,6 +365,7 @@ def retry_case_stage(
 def approve_case_stage(
     case_id: uuid.UUID,
     stage_name: str,
+    req: ApproveStageRequest | None = None,
     db: Session = Depends(get_db),
     user: CurrentUser = Depends(get_current_user)
 ):
@@ -370,28 +393,68 @@ def approve_case_stage(
             detail=f"Stage '{stage_name}' execution not found for case {case_id}."
         )
 
-    if current_stage.status != "awaiting_review":
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Stage '{stage_name}' cannot be approved because its status is '{current_stage.status}', expected 'awaiting_review'."
-        )
-
     now_utc = datetime.now(timezone.utc)
-    current_stage.status = "confirmed"
-    current_stage.reviewed_by = user.id
-    current_stage.reviewed_at = now_utc
 
-    # If approving preprocess, also mark associated QC stage as confirmed
     if stage_name == "preprocess":
+        if current_stage.status not in ("awaiting_review", "done", "confirmed"):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Stage 'preprocess' cannot be approved because its status is '{current_stage.status}', expected 'awaiting_review'."
+            )
+
         qc_stage = db.scalars(
             select(StageExecution)
             .where(StageExecution.case_id == case_id, StageExecution.stage == "qc")
             .order_by(StageExecution.attempt.desc())
         ).first()
-        if qc_stage and qc_stage.status in ("awaiting_review", "done"):
-            qc_stage.status = "confirmed"
-            qc_stage.reviewed_by = user.id
-            qc_stage.reviewed_at = now_utc
+
+        if qc_stage:
+            if qc_stage.status in ("queued", "running"):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Automated QC analysis is currently running. Please wait for QC checks to complete before approving slide."
+                )
+            if qc_stage.status == "failed":
+                justification = req.override_justification if req else None
+                if not justification or len(justification.strip()) < 10:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=(
+                            f"Slide failed automated QC checks ({qc_stage.error or 'Artifacts detected'}). "
+                            "A clinical override justification of at least 10 characters is required to approve this slide."
+                        )
+                    )
+                qc_stage.status = "confirmed"
+                qc_stage.reviewed_by = user.id
+                qc_stage.reviewed_at = now_utc
+                qc_stage.review_edits = {"override_justification": justification.strip()}
+
+                override_audit = AuditEvent(
+                    case_id=str(case_id),
+                    actor=user.id,
+                    event_type="score_override",
+                    stage="qc",
+                    payload={
+                        "action": "qc_failure_override",
+                        "justification": justification.strip(),
+                        "previous_error": qc_stage.error
+                    }
+                )
+                db.add(override_audit)
+            elif qc_stage.status in ("awaiting_review", "done"):
+                qc_stage.status = "confirmed"
+                qc_stage.reviewed_by = user.id
+                qc_stage.reviewed_at = now_utc
+    else:
+        if current_stage.status not in ("awaiting_review", "done", "confirmed"):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Stage '{stage_name}' cannot be approved because its status is '{current_stage.status}', expected 'awaiting_review'."
+            )
+
+    current_stage.status = "confirmed"
+    current_stage.reviewed_by = user.id
+    current_stage.reviewed_at = now_utc
 
     # Determine next stage name
     next_stage_map = {
