@@ -17,10 +17,12 @@ export interface ViewerHotspot {
 
 export interface ViewerDetectionMarker {
   id: string;
-  x_um: number;
-  y_um: number;
+  x_um?: number;
+  y_um?: number;
+  centroid_um?: [number, number];
   label: "mitosis" | "not_mitosis" | "unreviewed";
   conf?: number | null;
+  confidence?: number | null;
   in_hpf?: boolean;
 }
 
@@ -186,9 +188,11 @@ export function OpenSeadragonViewer({
     const effectiveMppX = mppX || 0.25;
     const effectiveMppY = mppY || effectiveMppX;
 
-    const pts = currentMarkers.map((m) => {
-      const imgX = m.x_um / effectiveMppX;
-      const imgY = m.y_um / effectiveMppY;
+    const pts = currentMarkers.map((m: any) => {
+      const x_um = m.x_um !== undefined ? m.x_um : (m.centroid_um ? m.centroid_um[0] : 0);
+      const y_um = m.y_um !== undefined ? m.y_um : (m.centroid_um ? m.centroid_um[1] : 0);
+      const imgX = x_um / effectiveMppX;
+      const imgY = y_um / effectiveMppY;
       const vpPoint = viewer.viewport.imageToViewportCoordinates(new (OpenSeadragon as any).Point(imgX, imgY));
       const pixelPoint = viewer.viewport.pixelFromPoint(vpPoint, true);
       return {
@@ -196,7 +200,7 @@ export function OpenSeadragonViewer({
         x: pixelPoint.x,
         y: pixelPoint.y,
         label: m.label,
-        conf: m.conf,
+        conf: m.conf !== undefined ? m.conf : m.confidence,
         in_hpf: m.in_hpf
       };
     });

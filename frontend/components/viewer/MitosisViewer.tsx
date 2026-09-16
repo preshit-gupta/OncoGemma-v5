@@ -251,10 +251,11 @@ export function MitosisViewer({
 
   // Candidates filtered strictly to the active HPF circle (r <= 262 um)
   const activeFieldCandidates = useMemo(() => {
-    if (!activeHpf) return candidates;
+    if (!activeHpf || !activeHpf.center_um) return candidates;
     const [cx, cy] = activeHpf.center_um;
     const r = activeHpf.radius_um || 262.0;
     const filtered = candidates.filter(cand => {
+      if (!cand.centroid_um) return false;
       const dx = cand.centroid_um[0] - cx;
       const dy = cand.centroid_um[1] - cy;
       return (dx * dx + dy * dy) <= (r * r);
@@ -278,9 +279,9 @@ export function MitosisViewer({
 
   // Auto-center stage on selected candidate at 40x
   useEffect(() => {
-    if (!selectedCandidateId || !activeHpf) return;
+    if (!selectedCandidateId || !activeHpf || !activeHpf.center_um) return;
     const cand = activeFieldCandidates.find(c => c.id === selectedCandidateId);
-    if (cand) {
+    if (cand && cand.centroid_um) {
       const [cx, cy] = activeHpf.center_um;
       const dx_um = cand.centroid_um[0] - cx;
       const dy_um = cand.centroid_um[1] - cy;
@@ -322,6 +323,21 @@ export function MitosisViewer({
 
   const handleStageMouseUp = () => {
     setIsDragging(false);
+  };
+
+  const handleStageWheel = (e: React.WheelEvent) => {
+    e.preventDefault();
+    const factor = e.deltaY < 0 ? 1.2 : 0.8;
+    const nextZ = Math.min(6.0, Math.max(1.0, Number((stageZoom * factor).toFixed(2))));
+    setStageZoom(nextZ);
+    if (nextZ <= 1.1) {
+      setPanOffset({ x: 0, y: 0 });
+      setMagMode("10x");
+    } else if (nextZ >= 3.0) {
+      setMagMode("40x");
+    } else {
+      setMagMode("20x");
+    }
   };
 
   // Magnification Zoom In / Zoom Out
@@ -371,7 +387,7 @@ export function MitosisViewer({
   // Convert HPFs to ViewerHotspots for Whole-Slide OpenSeadragon
   const hpfHotspots: ViewerHotspot[] = useMemo(() => {
     if (!showHpfCircles) return [];
-    return hpfs.map((hpf) => {
+    return hpfs.filter(hpf => hpf && hpf.center_um).map((hpf) => {
       const [cx, cy] = hpf.center_um;
       const r = hpf.radius_um || 262.0;
       const poly: number[][] = [];
@@ -394,18 +410,26 @@ export function MitosisViewer({
   const candidateMarkers: ViewerDetectionMarker[] = useMemo(() => {
     if (!showCandidateMarkers) return [];
     return candidates.map((cand) => {
-      let color = "#38bdf8"; // unreviewed sky
-      if (cand.label === "mitosis") color = "#10b981"; // confirmed emerald
-      if (cand.label === "not_mitosis") color = "#64748b"; // rejected slate
+      const [x_um, y_um] = cand.centroid_um || [0, 0];
+      const isInsideHpf = activeHpf && activeHpf.center_um ? (() => {
+        const [cx, cy] = activeHpf.center_um;
+        const r = activeHpf.radius_um || 262.0;
+        const dx = x_um - cx;
+        const dy = y_um - cy;
+        return (dx * dx + dy * dy) <= (r * r);
+      })() : true;
+
       return {
         id: cand.id,
+        x_um,
+        y_um,
         centroid_um: cand.centroid_um,
         label: cand.label,
-        color: color,
-        confidence: cand.ver_conf || cand.det_conf || 0.0
+        conf: cand.ver_conf || cand.det_conf || 0.0,
+        in_hpf: isInsideHpf
       };
     });
-  }, [candidates, showCandidateMarkers]);
+  }, [candidates, showCandidateMarkers, activeHpf]);
 
   // Pan to candidate in thumbnail stage
   const handleJumpToCandidate = (candidate: MitosisCandidate) => {
@@ -464,9 +488,9 @@ export function MitosisViewer({
             // Toggle in to 40x focus
             setStageZoom(3.5);
             setMagMode("40x");
-            if (selectedCandidateId && activeHpf) {
+            if (selectedCandidateId && activeHpf && activeHpf.center_um) {
               const cand = activeFieldCandidates.find(c => c.id === selectedCandidateId);
-              if (cand) {
+              if (cand && cand.centroid_um) {
                 const [cx, cy] = activeHpf.center_um;
                 const dx_um = cand.centroid_um[0] - cx;
                 const dy_um = cand.centroid_um[1] - cy;
@@ -909,8 +933,10 @@ export function MitosisViewer({
                   const seq = parseInt(id.replace("hpf_", ""), 10);
                   if (!isNaN(seq)) handleStartGuidedReview(seq);
                 }}
-                detectionMarkers={detectionMarkers}
+                detectionMarkers={candidateMarkers}
                 showCandidateMarkers={showCandidateMarkers}
+                selectedCandidateId={selectedCandidateId}
+                onSelectCandidate={(id) => setSelectedCandidateId(id)}
                 isAddingRoiMode={isPinningMode}
                 onAddRoiClick={handleAddCandidateFromClick}
                 className="w-full h-full"

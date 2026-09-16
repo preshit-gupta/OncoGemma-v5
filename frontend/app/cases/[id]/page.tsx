@@ -7,6 +7,7 @@ import { fetchCaseDetail, CaseDetail, retryStage, approveStage, updateSlideMpp }
 import { formatISTDateTime } from "@/lib/utils";
 import dynamic from "next/dynamic";
 import { StageRail } from "@/components/viewer/StageRail";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 
 const OpenSeadragonViewer = dynamic(
   () => import("@/components/viewer/OpenSeadragonViewer").then((mod) => mod.OpenSeadragonViewer),
@@ -545,48 +546,56 @@ export default function CaseWorkspacePage({ params }: { params: { id: string } }
               </div>
             </div>
           ) : activeStage === "report" ? (
-            <ReportWorkspace
-              caseId={caseId}
-              onRefreshCase={loadData}
-            />
+            <ErrorBoundary>
+              <ReportWorkspace
+                caseId={caseId}
+                onRefreshCase={loadData}
+              />
+            </ErrorBoundary>
           ) : activeStage === "grading" ? (
-            <GradingReviewWorkspace
-              caseId={caseId}
-              onAdvanceToReport={() => {
-                setHasUserNavigated(true);
-                setActiveStage("report");
-                loadData();
-              }}
-              onReopenMitosis={() => {
-                setHasUserNavigated(true);
-                setActiveStage("mitosis");
-              }}
-            />
+            <ErrorBoundary>
+              <GradingReviewWorkspace
+                caseId={caseId}
+                onAdvanceToReport={() => {
+                  setHasUserNavigated(true);
+                  setActiveStage("report");
+                  loadData();
+                }}
+                onReopenMitosis={() => {
+                  setHasUserNavigated(true);
+                  setActiveStage("mitosis");
+                }}
+              />
+            </ErrorBoundary>
           ) : activeStage === "mitosis" ? (
-            <MitosisViewer
-              caseId={caseId}
-              mppX={slide?.mpp_x || 0.25}
-              mppY={slide?.mpp_y || slide?.mpp_x || 0.25}
-              imageWidthPx={slide?.width_px || 2048}
-              imageHeightPx={slide?.height_px || 2048}
-              onRefreshCase={loadData}
-              tileUrlTemplate={caseDetail?.tile_url_template}
-            />
+            <ErrorBoundary>
+              <MitosisViewer
+                caseId={caseId}
+                mppX={slide?.mpp_x || 0.25}
+                mppY={slide?.mpp_y || slide?.mpp_x || 0.25}
+                imageWidthPx={slide?.width_px || 2048}
+                imageHeightPx={slide?.height_px || 2048}
+                onRefreshCase={loadData}
+                tileUrlTemplate={caseDetail?.tile_url_template}
+              />
+            </ErrorBoundary>
           ) : activeStage === "triage" ? (
-            <TriageViewer
-              caseId={caseId}
-              mppX={slide?.mpp_x || 0.25}
-              mppY={slide?.mpp_y || slide?.mpp_x || 0.25}
-              imageWidthPx={slide?.width_px || 2048}
-              imageHeightPx={slide?.height_px || 2048}
-              onRefreshCase={loadData}
-              onAdvanceToMitosis={() => {
-                setHasUserNavigated(true);
-                setActiveStage("mitosis");
-                loadData();
-              }}
-              tileUrlTemplate={caseDetail?.tile_url_template}
-            />
+            <ErrorBoundary>
+              <TriageViewer
+                caseId={caseId}
+                mppX={slide?.mpp_x || 0.25}
+                mppY={slide?.mpp_y || slide?.mpp_x || 0.25}
+                imageWidthPx={slide?.width_px || 2048}
+                imageHeightPx={slide?.height_px || 2048}
+                onRefreshCase={loadData}
+                onAdvanceToMitosis={() => {
+                  setHasUserNavigated(true);
+                  setActiveStage("mitosis");
+                  loadData();
+                }}
+                tileUrlTemplate={caseDetail?.tile_url_template}
+              />
+            </ErrorBoundary>
           ) : (
             <OpenSeadragonViewer
               caseId={caseId}
