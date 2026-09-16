@@ -126,37 +126,15 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
                 "source": r.source
             })
 
+    if not hotspots:
+        raise ValueError(
+            f"No confirmed tumor hotspots found for case {case_id}. "
+            "Stage 3 Triage must be confirmed by a pathologist before running Stage 4 Mitosis detection."
+        )
+
     scratch_dir = tempfile.mkdtemp(prefix="og_mitosis_")
 
     try:
-        # Fallback to triage output.json if no DB hotspots found
-        if not hotspots:
-            try:
-                t_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/triage/output.json")
-                t_data = json.loads(t_bytes.decode("utf-8"))
-                hotspots = [h for h in t_data.get("hotspots", []) if not h.get("excluded", False)]
-            except Exception:
-                pass
-
-        # If still no hotspots, construct default invasive margin region around center
-        if not hotspots:
-            center_x_um = (width_px * mpp_x) / 2.0
-            center_y_um = (height_px * mpp_y) / 2.0
-            r_box = 1000.0 # 1 mm box
-            default_poly = [
-                [center_x_um - r_box, center_y_um - r_box],
-                [center_x_um + r_box, center_y_um - r_box],
-                [center_x_um + r_box, center_y_um + r_box],
-                [center_x_um - r_box, center_y_um + r_box]
-            ]
-            hotspots.append({
-                "id": "hs_01",
-                "polygon_um": default_poly,
-                "area_mm2": 4.0,
-                "prob_mean": 0.85,
-                "prob_max": 0.95,
-                "source": "model"
-            })
 
         # Download preprocess tissue mask from GCS
         slide_dimensions_um = (float(width_px * mpp_x), float(height_px * mpp_y))
@@ -497,12 +475,12 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
             except Exception:
                 pass
 
-        # Fetch existing pathologist detections before re-populating to preserve reviews & additions
+        # Fetch existing pathologist detections before re-populating to preserve reviews & additions (#464)
         existing_pathologist_dets = list(
             db.scalars(
                 select(Detection).where(
                     Detection.case_id == case_obj.id,
-                    Detection.label_source == "pathologist"
+                    (Detection.label_source.startswith("pathologist")) | (Detection.label_source != "model")
                 )
             ).all()
         )
@@ -522,7 +500,7 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
                 "det_conf": pd.det_conf,
                 "ver_conf": pd.ver_conf,
                 "label": pd.label,
-                "label_source": "pathologist",
+                "label_source": pd.label_source,
                 "crop_uri": pd.crop_uri,
                 "crop_orig_uri": pd.crop_orig_uri
             })
@@ -537,11 +515,11 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
             radius_um=radius_um
         )
 
-        # Persist to Database: preserve pathologist annotations, only replace model detections
+        # Persist to Database: preserve all pathologist annotations, only delete unreviewed model detections (#464)
         db.execute(
             delete(Detection).where(
                 Detection.case_id == case_obj.id,
-                Detection.label_source != "pathologist"
+                Detection.label_source == "model"
             )
         )
         db.execute(delete(HpfSite).where(HpfSite.case_id == case_obj.id))

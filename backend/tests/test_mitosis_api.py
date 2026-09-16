@@ -1,6 +1,7 @@
 """
 Integration tests for Stage 4 Mitosis REST API endpoints, live recompute, and safety gate (v4.3).
 """
+import os
 import uuid
 import pytest
 from fastapi.testclient import TestClient
@@ -11,6 +12,7 @@ from sqlalchemy.pool import StaticPool
 from app.main import app
 from app.core.db import Base, get_db
 from app.models.case import Case
+from app.models.slide import Slide
 from app.models.stage_execution import StageExecution
 from app.models.detection import Detection
 from app.models.hpf_site import HpfSite
@@ -51,6 +53,15 @@ def setup_test_case():
     case_id = uuid.uuid4()
     case = Case(id=case_id, created_by="pathologist_test", status="open")
     db.add(case)
+
+    slide = Slide(
+        id=uuid.uuid4(),
+        case_id=case_id,
+        gcs_uri_original="gs://raw/slide.svs",
+        mpp_x=0.25,
+        mpp_y=0.25
+    )
+    db.add(slide)
 
     stage_exec = StageExecution(
         id=uuid.uuid4(),
@@ -144,6 +155,10 @@ def test_recompute_endpoint(setup_test_case):
 
 
 def test_add_candidate_endpoint(setup_test_case):
+    import tempfile
+    from unittest.mock import patch, MagicMock
+    from PIL import Image
+
     case_id = setup_test_case
     payload = {
         "case_id": case_id,
@@ -151,11 +166,23 @@ def test_add_candidate_endpoint(setup_test_case):
         "label": "mitosis",
         "reviewed_by": "pathologist_01"
     }
-    res = client.post("/api/v1/stages/mitosis/add_candidate", json=payload, headers={"X-User-Role": "pathologist"})
-    assert res.status_code == 200
-    data = res.json()
-    assert data["status"] == "success"
-    assert data["candidate"]["label_source"] == "pathologist"
+
+    mock_slide = MagicMock()
+    mock_slide.read_region.return_value = Image.new("RGB", (128, 128), color=(200, 150, 180))
+
+    with tempfile.NamedTemporaryFile(suffix=".svs", delete=False) as tmp_slide:
+        tmp_slide_path = tmp_slide.name
+    try:
+        with patch("app.routers.mitosis.get_cached_slide_path", return_value=tmp_slide_path), \
+             patch("openslide.OpenSlide", return_value=mock_slide):
+            res = client.post("/api/v1/stages/mitosis/add_candidate", json=payload, headers={"X-User-Role": "pathologist"})
+            assert res.status_code == 200
+            data = res.json()
+            assert data["status"] == "success"
+            assert data["candidate"]["label_source"] == "pathologist"
+    finally:
+        if os.path.exists(tmp_slide_path):
+            os.remove(tmp_slide_path)
 
 
 def test_bulk_action_endpoint(setup_test_case):

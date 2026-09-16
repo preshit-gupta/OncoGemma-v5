@@ -5,7 +5,7 @@ import uuid
 import tempfile
 import shutil
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 from PIL import Image
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Response
@@ -467,6 +467,44 @@ def get_hpf_thumbnail(
     return Response(content=extracted_bytes, media_type=media_type, headers={"Cache-Control": "public, max-age=86400"})
 
 
+def sync_and_persist_hpf_counts(case_id: str, db: Session) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Synchronizes HpfSite.mitotic_count in the database with current candidate detections
+    and computes the Nottingham Mitotic Score (#110).
+    """
+    case_uid = to_uuid(case_id)
+    det_rows = db.scalars(
+        select(Detection).where((Detection.case_id == case_uid) | (Detection.case_id == str(case_id)))
+    ).all()
+    hpf_rows = db.scalars(
+        select(HpfSite).where((HpfSite.case_id == case_uid) | (HpfSite.case_id == str(case_id))).order_by(HpfSite.seq.asc())
+    ).all()
+
+    cand_list = [
+        {"id": d.id, "centroid_um": d.centroid_um, "label": d.label}
+        for d in det_rows
+    ]
+    hpf_list = [
+        {"seq": h.seq, "center_um": h.center_um, "radius_um": h.radius_um, "count": 0, "source": h.source}
+        for h in hpf_rows
+    ]
+
+    updated_hpfs, total_count = calculate_hpf_mitosis_counts(cand_list, hpf_list)
+    summary = compute_nottingham_mitotic_score(
+        count_total=total_count,
+        n_hpf=len(updated_hpfs) if updated_hpfs else 10,
+        radius_um=updated_hpfs[0]["radius_um"] if updated_hpfs else 262.0
+    )
+
+    for uh in updated_hpfs:
+        for hr in hpf_rows:
+            if hr.seq == uh["seq"]:
+                hr.mitotic_count = uh["count"]
+                break
+
+    return updated_hpfs, summary
+
+
 @router.post("/recompute")
 def recompute_scoring(payload: RecomputePayload, db: Session = Depends(get_db)):
     """
@@ -483,30 +521,47 @@ def recompute_scoring(payload: RecomputePayload, db: Session = Depends(get_db)):
 
     candidates_dict = {d.id: d for d in det_rows}
 
-    # Apply candidate label changes if provided
+    # Apply candidate label changes if provided and log audit event per changed label (#114)
+    logged_candidate_ids = set()
     if payload.candidate_labels:
         for cid, new_label in payload.candidate_labels.items():
             if cid in candidates_dict:
                 d = candidates_dict[cid]
                 if d.label != new_label:
+                    old_label = d.label
                     d.label = new_label
                     d.label_source = "pathologist"
+                    audit = AuditEvent(
+                        case_id=case_id,
+                        actor="pathologist",
+                        event_type="review_edit",
+                        stage="mitosis",
+                        payload={
+                            "detection_id": cid,
+                            "from": old_label,
+                            "to": new_label
+                        }
+                    )
+                    db.add(audit)
+                    logged_candidate_ids.add(cid)
 
-    # Audit single toggle event
+    # Audit explicit toggle event if not already logged
     if payload.audit_toggle:
         toggle = payload.audit_toggle
-        audit = AuditEvent(
-            case_id=case_id,
-            actor="pathologist",
-            event_type="review_edit",
-            stage="mitosis",
-            payload={
-                "detection_id": toggle.get("id"),
-                "from": toggle.get("from"),
-                "to": toggle.get("to")
-            }
-        )
-        db.add(audit)
+        tid = toggle.get("id")
+        if tid and tid not in logged_candidate_ids:
+            audit = AuditEvent(
+                case_id=case_id,
+                actor="pathologist",
+                event_type="review_edit",
+                stage="mitosis",
+                payload={
+                    "detection_id": tid,
+                    "from": toggle.get("from"),
+                    "to": toggle.get("to")
+                }
+            )
+            db.add(audit)
 
     # Fetch or update HPF sites
     if payload.hpfs:
@@ -524,35 +579,8 @@ def recompute_scoring(payload: RecomputePayload, db: Session = Depends(get_db)):
             db.add(hpf_row)
         db.flush()
 
-    hpf_rows = db.scalars(
-        select(HpfSite).where(HpfSite.case_id == case_id).order_by(HpfSite.seq.asc())
-    ).all()
-
-    # Build candidates list for scoring
-    cand_list = [
-        {"id": d.id, "centroid_um": d.centroid_um, "label": d.label}
-        for d in candidates_dict.values()
-    ]
-    hpf_list = [
-        {"seq": h.seq, "center_um": h.center_um, "radius_um": h.radius_um, "count": 0, "source": h.source}
-        for h in hpf_rows
-    ]
-
-    # Recompute HPF counts & Nottingham Score
-    updated_hpfs, total_count = calculate_hpf_mitosis_counts(cand_list, hpf_list)
-    summary = compute_nottingham_mitotic_score(
-        count_total=total_count,
-        n_hpf=len(updated_hpfs) if updated_hpfs else 10,
-        radius_um=updated_hpfs[0]["radius_um"] if updated_hpfs else 262.0
-    )
-
-    # Update counts in DB
-    for uh in updated_hpfs:
-        for hr in hpf_rows:
-            if hr.seq == uh["seq"]:
-                hr.mitotic_count = uh["count"]
-                break
-
+    # Synchronize and persist HPF counts (#110)
+    updated_hpfs, summary = sync_and_persist_hpf_counts(case_id, db)
     db.commit()
 
     return {
@@ -589,34 +617,28 @@ def add_pathologist_mitosis(payload: AddCandidatePayload, db: Session = Depends(
     else:
         mpp_x = None
 
-    scratch_dir = tempfile.mkdtemp(prefix="og_add_mit_")
     crop_pil = None
-    try:
-        if slide_obj and mpp_x:
-            gcs_uri_original = resolve_slide_raw_uri(case_id, slide_obj) or getattr(slide_obj, "gcs_uri_original", None) or f"gs://{settings.GCS_RAW_BUCKET}/cases/{case_id}/{slide_obj.id}.svs"
-            raw_bucket_name, blob_name = parse_gcs_uri(gcs_uri_original)
-            ext = os.path.splitext(blob_name)[1] or ".svs"
-            local_slide_path = os.path.join(scratch_dir, f"slide{ext}")
-            try:
-                download_blob_to_filename(raw_bucket_name, blob_name, local_slide_path)
-                if os.path.exists(local_slide_path):
-                    import openslide
-                    with OPENSLIDE_GLOBAL_LOCK:
-                        oslide = openslide.OpenSlide(local_slide_path)
-                        px = int(cx_um / mpp_x - 64)
-                        py = int(cy_um / mpp_x - 64)
-                        crop_pil = oslide.read_region((px, py), 0, (128, 128)).convert("RGB")
-                        oslide.close()
-            except Exception:
-                crop_pil = None
-    finally:
-        shutil.rmtree(scratch_dir, ignore_errors=True)
+    if slide_obj and mpp_x:
+        gcs_uri_original = resolve_slide_raw_uri(case_id, slide_obj) or getattr(slide_obj, "gcs_uri_original", None) or f"gs://{settings.GCS_RAW_BUCKET}/cases/{case_id}/{slide_obj.id}.svs"
+        raw_bucket_name, blob_name = parse_gcs_uri(gcs_uri_original)
+        try:
+            local_slide_path = get_cached_slide_path(raw_bucket_name, blob_name)
+            if os.path.exists(local_slide_path):
+                import openslide
+                with OPENSLIDE_GLOBAL_LOCK:
+                    oslide = openslide.OpenSlide(local_slide_path)
+                    px = int(cx_um / mpp_x - 64)
+                    py = int(cy_um / mpp_x - 64)
+                    crop_pil = oslide.read_region((px, py), 0, (128, 128)).convert("RGB")
+                    oslide.close()
+        except Exception as e:
+            print(f"[add_pathologist_mitosis Error] Slide crop extraction failed: {e}")
 
     if crop_pil is None:
-        crop_pil = Image.new("RGB", (128, 128), color=(235, 215, 230))
-        arr = np.array(crop_pil)
-        arr[54:74, 58:70] = (45, 10, 80)
-        crop_pil = Image.fromarray(arr)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not extract authentic optical crop for candidate at ({cx_um:.1f}, {cy_um:.1f}) µm from slide"
+        )
 
     buf = io.BytesIO()
     crop_pil.save(buf, format="PNG")
@@ -651,6 +673,9 @@ def add_pathologist_mitosis(payload: AddCandidatePayload, db: Session = Depends(
         }
     )
     db.add(audit)
+
+    # Synchronize HpfSite mitotic counts immediately (#110)
+    sync_and_persist_hpf_counts(case_id, db)
     db.commit()
 
     return {
@@ -694,6 +719,9 @@ def bulk_reject_unreviewed(payload: BulkActionPayload, db: Session = Depends(get
         }
     )
     db.add(audit)
+
+    # Synchronize HpfSite mitotic counts immediately (#110)
+    sync_and_persist_hpf_counts(case_id, db)
     db.commit()
 
     # Return updated stage data
@@ -777,6 +805,9 @@ def re_place_hpfs(payload: BulkActionPayload, db: Session = Depends(get_db)):
             source="model"
         )
         db.add(hpf_row)
+
+    # Synchronize HpfSite mitotic counts immediately (#110)
+    sync_and_persist_hpf_counts(case_id, db)
     db.commit()
 
     return get_mitosis_stage_data(case_id, db)

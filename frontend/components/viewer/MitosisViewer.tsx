@@ -32,6 +32,7 @@ import {
   recomputeMitosis, 
   addPathologistMitosis, 
   bulkRejectUnreviewedMitosis, 
+  replaceMitosisHpfs,
   confirmMitosisStage,
   API_BASE 
 } from "@/lib/api";
@@ -124,6 +125,33 @@ export function MitosisViewer({
       setError(err.message || "Failed to load Mitosis Stage data.");
     } finally {
       setLoading(false);
+    }
+  };
+
+  const [isReplacingHpfs, setIsReplacingHpfs] = useState<boolean>(false);
+  const [galleryScope, setGalleryScope] = useState<"field" | "all">("field");
+
+  // Re-place HPFs based on confirmed mitoses (#468)
+  const handleReplaceHpfs = async () => {
+    try {
+      setIsReplacingHpfs(true);
+      setError(null);
+      const stageData = await replaceMitosisHpfs(caseId);
+      setData(stageData);
+      if (stageData.hpfs) {
+        setHpfs(stageData.hpfs);
+      }
+      if (stageData.summary) {
+        setSummary(stageData.summary);
+      }
+      if (stageData.candidates) {
+        setCandidates(stageData.candidates);
+      }
+    } catch (err: any) {
+      console.error(err);
+      setError(err.message || "Failed to re-place HPFs.");
+    } finally {
+      setIsReplacingHpfs(false);
     }
   };
 
@@ -296,18 +324,15 @@ export function MitosisViewer({
     setIsDragging(false);
   };
 
-  const handleStageWheel = (e: React.WheelEvent) => {
-    e.preventDefault();
-    const zoomFactor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
-    const nextZoom = Math.min(6.0, Math.max(1.0, stageZoom * zoomFactor));
-    setStageZoom(nextZoom);
-    if (nextZoom <= 1.05) {
+  // Magnification Zoom In / Zoom Out
+  const handleToggleZoom = () => {
+    if (stageZoom > 1.5) {
+      setStageZoom(1.0);
       setPanOffset({ x: 0, y: 0 });
       setMagMode("10x");
-    } else if (nextZoom >= 2.8) {
-      setMagMode("40x");
     } else {
-      setMagMode("20x");
+      setStageZoom(3.5);
+      setMagMode("40x");
     }
   };
 
@@ -358,37 +383,31 @@ export function MitosisViewer({
       return {
         id: `hpf_${hpf.seq}`,
         polygon_um: poly,
-        area_mm2: 0.216,
-        prob_mean: hpf.count > 0 ? 0.95 : 0.4,
-        source: `HPF #${hpf.seq} (${hpf.count} mitoses)`
+        label: `HPF #${hpf.seq} (${hpf.count} mit)`,
+        color: approvedFields[hpf.seq] ? "rgba(16, 185, 129, 0.85)" : (hpf.seq === activeHpfSeq && workflowPhase === "field_review" ? "rgba(14, 165, 233, 0.9)" : "rgba(245, 158, 11, 0.8)"),
+        fill_color: approvedFields[hpf.seq] ? "rgba(16, 185, 129, 0.15)" : (hpf.seq === activeHpfSeq && workflowPhase === "field_review" ? "rgba(14, 165, 233, 0.2)" : "rgba(245, 158, 11, 0.12)")
       };
     });
-  }, [hpfs, showHpfCircles]);
+  }, [hpfs, approvedFields, activeHpfSeq, workflowPhase, showHpfCircles]);
 
-  // Convert candidate detections to ViewerDetectionMarkers
-  const detectionMarkers: ViewerDetectionMarker[] = useMemo(() => {
+  // Convert Candidates to ViewerDetectionMarkers for Whole-Slide OpenSeadragon
+  const candidateMarkers: ViewerDetectionMarker[] = useMemo(() => {
     if (!showCandidateMarkers) return [];
     return candidates.map((cand) => {
-      let inHpf = false;
-      if (activeHpf) {
-        const dx = cand.centroid_um[0] - activeHpf.center_um[0];
-        const dy = cand.centroid_um[1] - activeHpf.center_um[1];
-        if (dx * dx + dy * dy <= (activeHpf.radius_um || 262.0) * (activeHpf.radius_um || 262.0)) {
-          inHpf = true;
-        }
-      }
+      let color = "#38bdf8"; // unreviewed sky
+      if (cand.label === "mitosis") color = "#10b981"; // confirmed emerald
+      if (cand.label === "not_mitosis") color = "#64748b"; // rejected slate
       return {
         id: cand.id,
-        x_um: cand.centroid_um[0],
-        y_um: cand.centroid_um[1],
+        centroid_um: cand.centroid_um,
         label: cand.label,
-        conf: cand.ver_conf || cand.det_conf,
-        in_hpf: inHpf
+        color: color,
+        confidence: cand.ver_conf || cand.det_conf || 0.0
       };
     });
-  }, [candidates, activeHpf, showCandidateMarkers]);
+  }, [candidates, showCandidateMarkers]);
 
-  // Jump viewer to candidate
+  // Pan to candidate in thumbnail stage
   const handleJumpToCandidate = (candidate: MitosisCandidate) => {
     setSelectedCandidateId(candidate.id);
   };
@@ -421,7 +440,7 @@ export function MitosisViewer({
         } else if (e.key === "m") {
           e.preventDefault();
           if (selectedCandidateId) {
-            const target = candidates.find(c => c.id === selectedCandidateId);
+            const target = activeFieldCandidates.find(c => c.id === selectedCandidateId);
             if (target) {
               handleToggleCandidate(target.id, target.label === "mitosis" ? "unreviewed" : "mitosis");
             }
@@ -429,7 +448,7 @@ export function MitosisViewer({
         } else if (e.key === "x") {
           e.preventDefault();
           if (selectedCandidateId) {
-            const target = candidates.find(c => c.id === selectedCandidateId);
+            const target = activeFieldCandidates.find(c => c.id === selectedCandidateId);
             if (target) {
               handleToggleCandidate(target.id, target.label === "not_mitosis" ? "unreviewed" : "not_mitosis");
             }
@@ -525,11 +544,46 @@ export function MitosisViewer({
     );
   }
 
+  if (error && !data) {
+    return (
+      <div className="flex-1 flex flex-col items-center justify-center bg-slate-950 text-slate-200 p-6">
+        <div className="p-4 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-400 max-w-md text-center flex flex-col items-center gap-3">
+          <AlertTriangle className="w-8 h-8 text-rose-400" />
+          <h3 className="font-semibold text-slate-100">Failed to Load Mitosis Stage</h3>
+          <p className="text-xs text-rose-300/90">{error}</p>
+          <button
+            onClick={loadStageData}
+            className="mt-2 px-4 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold flex items-center gap-1.5"
+          >
+            <RotateCcw className="w-3.5 h-3.5" /> Retry
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   const opticalPatchUrl = `${API_BASE}/api/v1/stages/mitosis/${caseId}/hpfs/${activeHpf?.seq || 1}/thumbnail?mag=${magMode}&stain=${stainMode}&v=${data?.stage_execution_id || 'v4'}`;
   const wholeSlideThumbnailUrl = `${API_BASE}/api/v1/cases/${caseId}/thumbnail`;
 
   return (
     <div className="flex-1 flex flex-col h-full bg-slate-950 text-slate-100 overflow-hidden font-sans">
+      {/* Top Error Alert Banner (#653) */}
+      {error && (
+        <div className="px-4 py-2 bg-rose-950/90 border-b border-rose-800 text-rose-200 text-xs flex items-center justify-between shrink-0">
+          <div className="flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
+            <span>{error}</span>
+          </div>
+          <button
+            onClick={() => setError(null)}
+            className="text-rose-400 hover:text-rose-200 p-1"
+            title="Dismiss"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
+
       {/* TOP HEADER: Clean Navigation & Mitotic Score Summary */}
       <header className="px-4 py-2 bg-slate-900/95 border-b border-slate-800 shrink-0 flex flex-col gap-2 shadow-md">
         <div className="flex items-center justify-between">
@@ -812,6 +866,21 @@ export function MitosisViewer({
             >
               <Crosshair className="w-3.5 h-3.5" />
               {isPinningMode ? "Click Slide to Pin" : "+ Pin (40×)"}
+            </button>
+
+            {/* Re-place HPFs Button (#468) */}
+            <button
+              onClick={handleReplaceHpfs}
+              disabled={isReplacingHpfs}
+              className="px-2.5 py-1 rounded text-[11px] font-semibold flex items-center gap-1.5 transition-all border bg-slate-800 text-sky-300 border-sky-700/60 hover:bg-sky-950/70 disabled:opacity-50"
+              title="Re-run greedy 10-HPF placement based on confirmed mitoses"
+            >
+              {isReplacingHpfs ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin text-sky-400" />
+              ) : (
+                <Compass className="w-3.5 h-3.5 text-sky-400" />
+              )}
+              <span>Re-place HPFs</span>
             </button>
           </div>
         </div>
@@ -1226,24 +1295,48 @@ export function MitosisViewer({
               </div>
             </div>
 
-            {/* Right: Candidate Gallery Scoped to Active HPF */}
-            <div className="w-96 shrink-0 h-full">
-              <MitosisGallery
-                caseId={caseId}
-                candidates={activeFieldCandidates}
-                selectedCandidateId={selectedCandidateId}
-                onSelectCandidate={(cand) => {
-                  setSelectedCandidateId(cand.id);
-                }}
-                onToggleCandidate={handleToggleCandidate}
-                onJumpToCandidate={handleJumpToCandidate}
-                stainMode={stainMode}
-                filterMode={filterMode}
-                onSetFilterMode={setFilterMode}
-                fieldSeq={activeHpfSeq}
-                totalFields={hpfs.length || 10}
-                onApproveFieldAndNext={handleApproveFieldAndNext}
-              />
+            {/* Right: Candidate Gallery Scoped to Active HPF or All Candidates (#126) */}
+            <div className="w-96 shrink-0 h-full flex flex-col bg-slate-900 border-l border-slate-800">
+              {/* Scope Selector: Active Field vs All Candidates */}
+              <div className="px-3 py-1.5 bg-slate-900 border-b border-slate-800 flex items-center justify-between shrink-0">
+                <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider">Candidate Scope</span>
+                <div className="flex items-center bg-slate-950 p-0.5 rounded border border-slate-800">
+                  <button
+                    onClick={() => setGalleryScope("field")}
+                    className={`px-2 py-0.5 rounded text-[10px] font-medium transition ${
+                      galleryScope === "field" ? "bg-sky-600 text-white font-semibold shadow-sm" : "text-slate-400 hover:text-slate-200"
+                    }`}
+                  >
+                    Field #{activeHpfSeq} ({activeFieldCandidates.length})
+                  </button>
+                  <button
+                    onClick={() => setGalleryScope("all")}
+                    className={`px-2 py-0.5 rounded text-[10px] font-medium transition ${
+                      galleryScope === "all" ? "bg-sky-600 text-white font-semibold shadow-sm" : "text-slate-400 hover:text-slate-200"
+                    }`}
+                  >
+                    All ({candidates.length})
+                  </button>
+                </div>
+              </div>
+              <div className="flex-1 overflow-hidden">
+                <MitosisGallery
+                  caseId={caseId}
+                  candidates={galleryScope === "all" ? candidates : activeFieldCandidates}
+                  selectedCandidateId={selectedCandidateId}
+                  onSelectCandidate={(cand) => {
+                    setSelectedCandidateId(cand.id);
+                  }}
+                  onToggleCandidate={handleToggleCandidate}
+                  onJumpToCandidate={handleJumpToCandidate}
+                  stainMode={stainMode}
+                  filterMode={filterMode}
+                  onSetFilterMode={setFilterMode}
+                  fieldSeq={activeHpfSeq}
+                  totalFields={hpfs.length || 10}
+                  onApproveFieldAndNext={handleApproveFieldAndNext}
+                />
+              </div>
             </div>
           </div>
         )}
