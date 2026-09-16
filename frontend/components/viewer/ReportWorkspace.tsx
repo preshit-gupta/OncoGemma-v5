@@ -19,6 +19,8 @@ import {
   Info,
   Calendar,
   UserCheck,
+  AlertCircle,
+  Clock,
   X
 } from "lucide-react";
 import {
@@ -43,6 +45,41 @@ function computeAllredScore(percent: number | null | undefined, intensity: numbe
   return Math.min(8, prop + intensity);
 }
 
+// Real-time clinical AJCC 8th/9th ed staging computation from local form inputs (#679)
+function computeLiveAjccStaging(tumorSize: number | null, posNodes: number, examNodes: number) {
+  let pt = "pTX";
+  let ptCode = "TX";
+  if (tumorSize !== null && tumorSize > 0) {
+    if (tumorSize <= 1.0) { pt = "pT1mic"; ptCode = "T1"; }
+    else if (tumorSize <= 5.0) { pt = "pT1a"; ptCode = "T1"; }
+    else if (tumorSize <= 10.0) { pt = "pT1b"; ptCode = "T1"; }
+    else if (tumorSize <= 20.0) { pt = "pT1c"; ptCode = "T1"; }
+    else if (tumorSize <= 50.0) { pt = "pT2"; ptCode = "T2"; }
+    else { pt = "pT3"; ptCode = "T3"; }
+  }
+
+  let pn = "pNX";
+  let pnCode = "NX";
+  if (examNodes > 0) {
+    if (posNodes === 0) { pn = "pN0"; pnCode = "N0"; }
+    else if (posNodes <= 3) { pn = "pN1a"; pnCode = "N1"; }
+    else if (posNodes <= 9) { pn = "pN2a"; pnCode = "N2"; }
+    else { pn = "pN3a"; pnCode = "N3"; }
+  }
+
+  let group = "Pending";
+  if (ptCode === "T1" && pnCode === "N0") group = "IA";
+  else if (ptCode === "T2" && pnCode === "N0") group = "IIA";
+  else if (ptCode === "T1" && pnCode === "N1") group = "IIA";
+  else if (ptCode === "T2" && pnCode === "N1") group = "IIB";
+  else if (ptCode === "T3" && pnCode === "N0") group = "IIB";
+  else if (ptCode === "T3" && (pnCode === "N1" || pnCode === "N2")) group = "IIIA";
+  else if (pnCode === "N2") group = "IIIA";
+  else if (pnCode === "N3") group = "IIIC";
+
+  return { pt, pn, group };
+}
+
 const ATTESTATION_TEXT =
   "I electronically attest that I have reviewed the Whole-Slide Image (WSI), AI-generated hotspot triage regions, mitotic figure annotations across 10 high-power fields, and Nottingham histological parameters, and I verify that the diagnostic findings, CAP synoptic elements, and AJCC staging in this report are clinically accurate.";
 
@@ -56,8 +93,10 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
   const [loading, setLoading] = useState<boolean>(true);
   const [saving, setSaving] = useState<boolean>(false);
   const [generatingNarrative, setGeneratingNarrative] = useState<boolean>(false);
+  const [error, setError] = useState<string | null>(null);
 
   // Form State (no fabricated defaults, #182, #270)
+  const [specimenType, setSpecimenType] = useState<string>("core_biopsy");
   const [procedure, setProcedure] = useState<string>("Core Needle Biopsy");
   const [laterality, setLaterality] = useState<string>("right");
   const [tumorSite, setTumorSite] = useState<string>("upper_outer_quadrant");
@@ -102,9 +141,11 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
   const loadData = async () => {
     try {
       setLoading(true);
+      setError(null);
       const res = await fetchReportData(caseId);
       setData(res);
 
+      setSpecimenType(res.specimen_type || (res.procedure?.toLowerCase().includes("excision") ? "excision" : "core_biopsy"));
       setProcedure(res.procedure || "Core Needle Biopsy");
       setLaterality(res.laterality || "right");
       setTumorSite(res.tumor_site || "upper_outer_quadrant");
@@ -137,8 +178,9 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
       setDiagnosisLine(res.narrative?.diagnosis_line || defaultDiag);
       setMicroscopicFindings(res.narrative?.microscopic_findings || defaultMicro);
       setClinicalCorrelation(res.narrative?.clinical_correlation || defaultCorr);
-    } catch (err) {
+    } catch (err: any) {
       console.error(err);
+      setError(err.message || "Failed to load report data");
     } finally {
       setLoading(false);
     }
@@ -188,6 +230,7 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
 
       const payload = {
         case_id: caseId,
+        specimen_type: specimenType,
         procedure,
         laterality,
         tumor_site: tumorSite,
@@ -198,13 +241,13 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
           status: marginStatus,
           closest_margin_mm: closestMarginMm,
           closest_margin_name: closestMarginName,
-          positive_margins: []
+          positive_margins: data?.margins?.positive_margins || []
         },
         lymph_nodes: {
           examined_count: nodesExamined,
           positive_count: nodesPositive,
           extranodal_extension: extranodalExt,
-          largest_metastasis_mm: 0.0
+          largest_metastasis_mm: data?.lymph_nodes?.largest_metastasis_mm ?? 0.0
         },
         biomarkers: biomarkersPayload,
         narrative: {
@@ -227,8 +270,16 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
   };
 
   const handleRegenerateNarrative = async () => {
+    const confirmRegen = window.confirm(
+      "Regenerating the diagnostic narrative with MedGemma will overwrite any manual narrative edits. Any unsaved form changes will first be saved. Proceed?"
+    );
+    if (!confirmRegen) return;
+
     try {
       setGeneratingNarrative(true);
+      // 1. Save draft edits first so server uses current clinical inputs (#264)
+      await handleUpdate();
+      // 2. Regenerate narrative on server
       const res = await regenerateReportNarrative(caseId);
       if (res.narrative) {
         setDiagnosisLine(res.narrative.diagnosis_line);
@@ -236,9 +287,9 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
         setClinicalCorrelation(res.narrative.clinical_correlation);
       }
       await loadData();
-    } catch (err) {
+    } catch (err: any) {
       console.error(err);
-      alert("Failed to regenerate narrative");
+      alert(err.message || "Failed to regenerate narrative");
     } finally {
       setGeneratingNarrative(false);
     }
@@ -329,10 +380,34 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
         <p className="text-sm font-medium">Loading CAP-Compliant Synoptic Report...</p>
       </div>
     );
+  if (error || !data) {
+    return (
+      <div className="flex flex-col items-center justify-center h-full text-slate-400 space-y-3 bg-slate-950 p-8">
+        <div className="p-3 bg-red-950/50 border border-red-800/80 rounded-xl text-red-400">
+          <AlertCircle className="w-8 h-8" />
+        </div>
+        <p className="text-base font-semibold text-slate-200">Unable to Load Report</p>
+        <p className="text-sm text-slate-400 max-w-md text-center">
+          {error || "Report data could not be retrieved. The pipeline stage may not have generated a report yet."}
+        </p>
+        <button
+          onClick={loadData}
+          className="mt-2 px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold rounded-lg border border-slate-700 transition"
+        >
+          Retry
+        </button>
+      </div>
+    );
   }
 
   const isSigned = data?.status === "signed" || data?.status === "amended";
   const isResection = procedure.toLowerCase().includes("excision") || procedure.toLowerCase().includes("mastectomy");
+
+  // Compute real-time live AJCC staging preview (#679)
+  const liveStaging = computeLiveAjccStaging(tumorSizeMm, nodesPositive, nodesExamined);
+  const displayPt = isSigned ? (data?.staging?.pt_stage || "pTX") : liveStaging.pt;
+  const displayPn = isSigned ? (data?.staging?.pn_stage || "pNX") : liveStaging.pn;
+  const displayGroup = isSigned ? (data?.staging?.stage_group || "Pending") : liveStaging.stage_group;
 
   return (
     <div className="flex-1 flex flex-col h-full overflow-hidden bg-slate-950 text-slate-100">
@@ -523,7 +598,7 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
                 <div className="p-2.5 bg-slate-950/80 border border-slate-800 rounded-lg">
                   <div className="text-[10px] text-slate-400 font-semibold uppercase">Primary Tumor (pT)</div>
                   <div className="text-sm font-bold text-sky-300 mt-0.5">
-                    {data?.staging?.pt_stage || "Pending"}
+                    {displayPt}
                   </div>
                   <div className="text-[10px] text-slate-500">
                     {tumorSizeMm !== null ? `${tumorSizeMm} mm` : "Size not entered"}
@@ -533,7 +608,7 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
                 <div className="p-2.5 bg-slate-950/80 border border-slate-800 rounded-lg">
                   <div className="text-[10px] text-slate-400 font-semibold uppercase">Regional Nodes (pN)</div>
                   <div className="text-sm font-bold text-sky-300 mt-0.5">
-                    {data?.staging?.pn_stage || "Pending"}
+                    {displayPn}
                   </div>
                   <div className="text-[10px] text-slate-500">
                     {nodesPositive}/{nodesExamined} nodes pos.
@@ -551,7 +626,7 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
                 <div className="p-2.5 bg-slate-950/80 border border-emerald-800/40 rounded-lg bg-emerald-950/10">
                   <div className="text-[10px] text-emerald-400 font-semibold uppercase">AJCC Stage Group</div>
                   <div className="text-sm font-bold text-emerald-300 mt-0.5">
-                    Stage {data?.staging?.stage_group || "Pending"}
+                    {displayGroup.startsWith("Stage") ? displayGroup : `Stage ${displayGroup}`}
                   </div>
                   <div className="text-[10px] text-slate-500">CAP protocol group</div>
                 </div>
@@ -785,22 +860,29 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
                 <div className="p-3 bg-slate-950/80 border border-slate-800 rounded-lg space-y-1">
                   <div className="text-[10px] text-slate-400 font-semibold uppercase">CAP Histologic Subtype</div>
                   <div className="text-sm font-bold text-white truncate">
-                    {data?.nottingham_grade?.histologic_type || "IDC-NST"}
+                    {data?.nottingham_grade?.histologic_type || data?.histologic_type || "Pending Assessment"}
                   </div>
-                  <div className="text-[10px] text-emerald-400 flex items-center space-x-1">
-                    <UserCheck className="w-3 h-3" />
-                    <span>Pathologist Confirmed</span>
-                  </div>
+                  {(data?.nottingham_grade as any)?.type_confirmed || ((data?.nottingham_grade as any)?.type_confirmed_by && (data?.nottingham_grade as any)?.type_confirmed_by !== "unconfirmed") ? (
+                    <div className="text-[10px] text-emerald-400 flex items-center space-x-1">
+                      <UserCheck className="w-3 h-3" />
+                      <span>Confirmed by {(data?.nottingham_grade as any)?.type_confirmed_by || "Pathologist"}</span>
+                    </div>
+                  ) : (
+                    <div className="text-[10px] text-amber-400/90 flex items-center space-x-1">
+                      <Clock className="w-3 h-3" />
+                      <span>Pending Type Confirmation</span>
+                    </div>
+                  )}
                 </div>
 
                 {/* Nottingham Grade */}
                 <div className="p-3 bg-slate-950/80 border border-slate-800 rounded-lg space-y-1">
                   <div className="text-[10px] text-slate-400 font-semibold uppercase">Nottingham Grade</div>
                   <div className="text-sm font-bold text-sky-300">
-                    Grade {data?.nottingham_grade?.grade || 3} ({data?.nottingham_grade?.nottingham_sum || 8}/9)
+                    {data?.nottingham_grade?.grade ? `Grade ${data.nottingham_grade.grade} (${data.nottingham_grade.nottingham_sum ?? "?"}/9)` : "Pending Assessment"}
                   </div>
                   <div className="text-[10px] text-slate-400">
-                    T{data?.nottingham_grade?.tubule_score || 3} + P{data?.nottingham_grade?.pleo_score || 3} + M{data?.nottingham_grade?.mitotic_score || 2}
+                    {data?.nottingham_grade?.tubule_score ? `T${data.nottingham_grade.tubule_score} + P${data.nottingham_grade.pleo_score} + M${data.nottingham_grade.mitotic_score}` : "Scores not yet finalized"}
                   </div>
                 </div>
 
@@ -808,10 +890,10 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
                 <div className="p-3 bg-slate-950/80 border border-slate-800 rounded-lg space-y-1">
                   <div className="text-[10px] text-slate-400 font-semibold uppercase">Mitotic Density</div>
                   <div className="text-sm font-bold text-purple-300">
-                    Score {data?.nottingham_grade?.mitotic_score || 2} (5.56/mm²)
+                    {data?.nottingham_grade?.mitotic_score ? `Score ${data.nottingham_grade.mitotic_score}` : "Pending"}
                   </div>
                   <div className="text-[10px] text-slate-400">
-                    12 mitoses across 10 HPFs
+                    Standardized per mm²
                   </div>
                 </div>
               </div>
@@ -830,28 +912,44 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
                     <tr>
                       <td className="px-3 py-2 font-medium text-slate-200">1. Glandular / Tubule Formation</td>
                       <td className="px-3 py-2 text-slate-400">
-                        {data?.nottingham_grade?.tubule_percent ? `${data.nottingham_grade.tubule_percent}%` : "<10%"} tubular differentiation (sheet-like solid architecture)
+                        {data?.nottingham_grade?.tubule_percent !== undefined && data?.nottingham_grade?.tubule_percent !== null
+                          ? `${data.nottingham_grade.tubule_percent}% tubular differentiation`
+                          : data?.nottingham_grade?.tubule_score
+                          ? "Tubular differentiation assessed"
+                          : "Not assessed"}
                       </td>
                       <td className="px-3 py-2 text-right font-bold text-sky-400">
-                        Score {data?.nottingham_grade?.tubule_score || 3}
+                        {data?.nottingham_grade?.tubule_score ? `Score ${data.nottingham_grade.tubule_score}` : "—"}
                       </td>
                     </tr>
                     <tr>
                       <td className="px-3 py-2 font-medium text-slate-200">2. Nuclear Pleomorphism</td>
                       <td className="px-3 py-2 text-slate-400">
-                        Marked nuclear variation in size and contour, open vesicular chromatin, prominent nucleoli
+                        {data?.nottingham_grade?.pleo_score
+                          ? (data.nottingham_grade.pleo_score === 1
+                            ? "Small, regular uniform cells"
+                            : data.nottingham_grade.pleo_score === 2
+                            ? "Moderate variation in nuclear size and shape"
+                            : "Marked variation in nuclear size and shape, prominent nucleoli")
+                          : "Not assessed"}
                       </td>
                       <td className="px-3 py-2 text-right font-bold text-sky-400">
-                        Score {data?.nottingham_grade?.pleo_score || 3}
+                        {data?.nottingham_grade?.pleo_score ? `Score ${data.nottingham_grade.pleo_score}` : "—"}
                       </td>
                     </tr>
                     <tr>
                       <td className="px-3 py-2 font-medium text-slate-200">3. Mitotic Figure Density</td>
                       <td className="px-3 py-2 text-slate-400">
-                        12 mitotic figures identified across 10 standardized 40× HPFs (2.157 mm², 5.56 mitoses/mm²)
+                        {data?.nottingham_grade?.mitotic_score
+                          ? (data.nottingham_grade.mitotic_score === 1
+                            ? "Low mitotic count (<3.65 mitoses/mm²)"
+                            : data.nottingham_grade.mitotic_score === 2
+                            ? "Moderate mitotic count (3.65 - 7.30 mitoses/mm²)"
+                            : "High mitotic count (≥7.30 mitoses/mm²)")
+                          : "Not assessed"}
                       </td>
                       <td className="px-3 py-2 text-right font-bold text-purple-400">
-                        Score {data?.nottingham_grade?.mitotic_score || 2}
+                        {data?.nottingham_grade?.mitotic_score ? `Score ${data.nottingham_grade.mitotic_score}` : "—"}
                       </td>
                     </tr>
                   </tbody>

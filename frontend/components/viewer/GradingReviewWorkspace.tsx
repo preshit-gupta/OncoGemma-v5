@@ -27,7 +27,8 @@ import {
   Plus,
   Minus,
   MessageSquare,
-  Lock
+  Lock,
+  Crosshair
 } from "lucide-react";
 import {
   GradingStageData,
@@ -46,22 +47,29 @@ interface GradingReviewWorkspaceProps {
   caseId: string;
   onAdvanceToReport?: () => void;
   onReopenMitosis?: () => void;
+  onLocateOnSlide?: (pointUm: [number, number], zoomMag?: number) => void;
 }
 
-const HISTOLOGIC_TYPE_OPTIONS = [
+export const HISTOLOGIC_TYPE_OPTIONS = [
   { id: "IDC-NST", label: "Invasive Breast Carcinoma of No Special Type (IDC-NST / Ductal)" },
   { id: "ILC", label: "Invasive Lobular Carcinoma (ILC)" },
+  { id: "mixed_ductal_lobular", label: "Mixed Invasive Ductal and Lobular Carcinoma" },
   { id: "mucinous", label: "Mucinous Carcinoma" },
   { id: "tubular", label: "Tubular Carcinoma" },
+  { id: "cribriform", label: "Invasive Cribriform Carcinoma" },
   { id: "papillary", label: "Invasive Papillary Carcinoma" },
+  { id: "micropapillary", label: "Invasive Micropapillary Carcinoma" },
   { id: "metaplastic", label: "Metaplastic Carcinoma" },
+  { id: "apocrine", label: "Carcinoma with Apocrine Differentiation" },
+  { id: "medullary_features", label: "Invasive Carcinoma with Medullary Features" },
   { id: "other", label: "Other / Special Variant Carcinoma" }
 ];
 
 export function GradingReviewWorkspace({
   caseId,
   onAdvanceToReport,
-  onReopenMitosis
+  onReopenMitosis,
+  onLocateOnSlide
 }: GradingReviewWorkspaceProps) {
   const [data, setData] = useState<GradingStageData | null>(null);
   const [loading, setLoading] = useState(true);
@@ -132,6 +140,24 @@ export function GradingReviewWorkspace({
     loadData();
   }, [caseId]);
 
+  // Auto-poll while Stage 5 is queued or running
+  useEffect(() => {
+    if (!data || data.status === "running" || data.status === "queued") {
+      const timer = setInterval(() => {
+        fetchGradingStageData(caseId).then((res) => {
+          if (res && res.status !== "queued") {
+            setData(res);
+            if (res.histologic_type) {
+              setSelectedHistologicType(res.histologic_type.confirmed_type || res.histologic_type.proposed_type || "IDC-NST");
+              setIsTypeConfirmed(res.histologic_type.is_confirmed);
+            }
+          }
+        }).catch(() => {});
+      }, 3000);
+      return () => clearInterval(timer);
+    }
+  }, [caseId, data?.status]);
+
   // Patch Actions
   const handleApprovePatch = async (patch: GradingPatch) => {
     try {
@@ -190,11 +216,6 @@ export function GradingReviewWorkspace({
     if (!editingPatch) return;
     try {
       setActionLoading(true);
-      const isModified =
-        patchEditTubule !== editingPatch.tubule.tubule_percent ||
-        patchEditTumorPresent !== editingPatch.tubule.tumor_present ||
-        patchEditPleo !== editingPatch.pleo.pleomorphism_score;
-
       const res = await reviewGradingPatches({
         case_id: caseId,
         action: "update",
@@ -204,16 +225,13 @@ export function GradingReviewWorkspace({
             tubule_percent: patchEditTubule,
             tumor_present: patchEditTumorPresent,
             pleomorphism_score: patchEditPleo,
-            status: isModified ? "modified" : "approved",
+            status: "modified",
             notes: patchEditNotes.trim()
           }
         ]
       });
       setData(res);
       setEditingPatch(null);
-      if (selectedPatch && selectedPatch.id === editingPatch.id) {
-        setSelectedPatch(res.patches.find((p) => p.id === editingPatch.id) || null);
-      }
     } catch (err: any) {
       console.error(err);
       alert(err.message || "Failed to save patch modifications");
@@ -301,14 +319,19 @@ export function GradingReviewWorkspace({
   const [isGradeRecomputing, setIsGradeRecomputing] = useState<boolean>(false);
   const recomputeTimerRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Live Reactive Nottingham Sum & Grade Synthesis
-  const activeTubuleScore = tubuleOverrideScore ?? (data?.current?.tubule_score || 2);
-  const activePleoScore = pleoOverrideScore ?? (data?.current?.pleo_score || 2);
-  const activeMitoticScore = data?.current?.mitotic_score || data?.mitotic_summary?.mitotic_score || 2;
+  // Live Reactive Nottingham Sum & Grade Synthesis (Safe, zero fabrication)
+  const activeTubuleScore = tubuleOverrideScore ?? data?.current?.tubule_score ?? data?.machine?.tubule_score ?? null;
+  const activePleoScore = pleoOverrideScore ?? data?.current?.pleo_score ?? data?.machine?.pleo_score ?? null;
+  const activeMitoticScore = data?.current?.mitotic_score ?? data?.machine?.mitotic_score ?? data?.mitotic_summary?.mitotic_score ?? null;
+
+  const hasCompleteScores = activeTubuleScore !== null && activePleoScore !== null && activeMitoticScore !== null;
+  const rawSum = hasCompleteScores ? (activeTubuleScore! + activePleoScore! + activeMitoticScore!) : null;
+  const activeSum = serverGradePreview?.nottingham_sum ?? data?.current?.nottingham_sum ?? rawSum;
+  const activeGrade = serverGradePreview?.grade ?? data?.current?.grade ?? (activeSum !== null ? (activeSum <= 5 ? 1 : activeSum <= 7 ? 2 : 3) : null);
 
   // Authoritative server preview recalculation on any override or score change
   useEffect(() => {
-    if (!data) return;
+    if (!data || !hasCompleteScores) return;
 
     if (recomputeTimerRef.current) {
       clearTimeout(recomputeTimerRef.current);
@@ -319,10 +342,10 @@ export function GradingReviewWorkspace({
       try {
         const preview = await recomputeGradingPreview({
           case_id: caseId,
-          tubule_score: activeTubuleScore,
+          tubule_score: activeTubuleScore!,
           tubule_percent: tubuleOverridePercent ?? data?.current?.tubule_percent ?? data?.machine?.tubule_percent,
-          pleo_score: activePleoScore,
-          mitotic_score: activeMitoticScore
+          pleo_score: activePleoScore!,
+          mitotic_score: activeMitoticScore!
         });
         if (preview) {
           setServerGradePreview({
@@ -340,11 +363,7 @@ export function GradingReviewWorkspace({
     return () => {
       if (recomputeTimerRef.current) clearTimeout(recomputeTimerRef.current);
     };
-  }, [caseId, activeTubuleScore, activePleoScore, activeMitoticScore, tubuleOverridePercent, data]);
-
-  // Derived from authoritative server recompute response (with fallback if awaiting response)
-  const activeSum = serverGradePreview?.nottingham_sum ?? (data?.current?.nottingham_sum || (activeTubuleScore + activePleoScore + activeMitoticScore));
-  const activeGrade = serverGradePreview?.grade ?? (data?.current?.grade || (activeSum <= 5 ? 1 : activeSum <= 7 ? 2 : 3));
+  }, [caseId, activeTubuleScore, activePleoScore, activeMitoticScore, tubuleOverridePercent, data, hasCompleteScores]);
 
   // Keyboard Escape listener to dismiss open modal overlays
   useEffect(() => {
@@ -381,9 +400,14 @@ export function GradingReviewWorkspace({
     isPleoJustificationValid &&
     !isSubmitting;
 
-  const handleApplyTubuleOverride = (score: number) => {
+  const handleApplyTubuleOverride = (score: number, percent?: number) => {
     if (isConfirmed) return;
     setTubuleOverrideScore(score);
+    if (percent !== undefined) {
+      setTubuleOverridePercent(percent);
+    } else if (tubuleOverridePercent === null) {
+      setTubuleOverridePercent(score === 1 ? 80 : score === 2 ? 40 : 5);
+    }
     setIsTubuleEditing(false);
   };
 
@@ -494,6 +518,18 @@ export function GradingReviewWorkspace({
         <div className="w-10 h-10 border-4 border-sky-500 border-t-transparent rounded-full animate-spin mb-4" />
         <p className="text-sm font-medium">Evaluating Nottingham Parameters with MedGemma 1.5...</p>
         <p className="text-xs text-slate-400 mt-1">Processing 24 normalized 10× evidence patches</p>
+      </div>
+    );
+  }
+
+  if (data?.status === "running" || data?.status === "queued") {
+    return (
+      <div className="flex-1 flex flex-col items-center justify-center p-8 bg-slate-950 text-slate-200">
+        <Loader2 className="w-10 h-10 text-sky-400 animate-spin mb-4" />
+        <h3 className="text-base font-semibold text-slate-100">Stage 5: Nottingham Grading in Progress</h3>
+        <p className="text-xs text-slate-400 mt-1 max-w-md text-center">
+          Evaluating 24 normalized tumor patches with MedGemma and synthesizing Elston-Ellis Nottingham grade scores...
+        </p>
       </div>
     );
   }
@@ -784,6 +820,32 @@ export function GradingReviewWorkspace({
                     ))}
                   </div>
 
+                  {/* Corrected Tubule Percent Numeric Input (#262) */}
+                  <div className="flex items-center justify-between bg-slate-950 px-2.5 py-1.5 rounded border border-slate-800">
+                    <label className="text-[11px] text-slate-300">Corrected Tubule Formation %:</label>
+                    <div className="flex items-center gap-1">
+                      <input
+                        type="number"
+                        min="0"
+                        max="100"
+                        step="1"
+                        value={tubuleOverridePercent ?? ""}
+                        onChange={(e) => {
+                          const val = e.target.value === "" ? null : parseFloat(e.target.value);
+                          setTubuleOverridePercent(val);
+                          if (val !== null) {
+                            if (val > 75) setTubuleOverrideScore(1);
+                            else if (val >= 10) setTubuleOverrideScore(2);
+                            else setTubuleOverrideScore(3);
+                          }
+                        }}
+                        placeholder="e.g. 40"
+                        className="w-16 bg-slate-900 border border-slate-700 rounded px-2 py-0.5 text-xs text-white font-mono text-right outline-none focus:border-sky-500"
+                      />
+                      <span className="text-xs text-slate-400">%</span>
+                    </div>
+                  </div>
+
                   {isTubuleOverridden && (
                     <div>
                       <label className="text-[10px] text-slate-400 block mb-1">
@@ -944,7 +1006,7 @@ export function GradingReviewWorkspace({
                   <span className="w-6 h-6 rounded-full bg-emerald-950 border border-emerald-500 text-emerald-300 font-bold text-xs flex items-center justify-center">
                     M
                   </span>
-                  <h2 className="text-sm font-bold text-white">Mitotic Count (10 HPFs)</h2>
+                  <h2 className="text-sm font-bold text-white">Mitotic Activity (Density per mm²)</h2>
                 </div>
                 <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
                   allHpfsApproved ? "bg-emerald-950 border border-emerald-500 text-emerald-300" : "bg-amber-950 border border-amber-500 text-amber-300"
@@ -955,11 +1017,11 @@ export function GradingReviewWorkspace({
 
               <div className="mt-2 bg-slate-950 rounded-lg p-3 border border-slate-800">
                 <div className="flex items-baseline justify-between">
-                  <span className="text-xs text-slate-400">Score & Rate:</span>
+                  <span className="text-xs text-slate-400">Score & Density:</span>
                   <span className="text-xl font-extrabold text-white">
-                    Score {activeMitoticScore}{" "}
+                    Score {activeMitoticScore ?? "—"}{" "}
                     <span className="text-xs font-normal text-slate-400">
-                      ({activeMitoticScore === 1 ? "<8 mitoses" : activeMitoticScore === 2 ? "8-15 mitoses" : "≥16 mitoses"})
+                      ({activeMitoticScore === 1 ? "<3.65/mm²" : activeMitoticScore === 2 ? "3.65-7.30/mm²" : "≥7.30/mm²"})
                     </span>
                   </span>
                 </div>
@@ -973,13 +1035,21 @@ export function GradingReviewWorkspace({
 
               <div className="mt-3 space-y-1 text-xs text-slate-400">
                 <div className="flex justify-between">
-                  <span>Standard Area:</span>
-                  <span className="text-slate-200 font-mono">2.157 mm²</span>
+                  <span>Standard Evaluated Area:</span>
+                  <span className="text-slate-200 font-mono">
+                    {data.mitotic_summary?.area_mm2 ? data.mitotic_summary.area_mm2.toFixed(3) : "2.157"} mm²
+                  </span>
                 </div>
                 <div className="flex justify-between">
                   <span>Standardized Density:</span>
                   <span className="text-slate-200 font-mono">
-                    {((data.mitotic_summary?.total_mitoses ?? 0) / 2.157).toFixed(1)} mitoses/mm²
+                    {(data.mitotic_summary?.mitoses_per_mm2 ?? ((data.mitotic_summary?.total_mitoses ?? 0) / (data.mitotic_summary?.area_mm2 || 2.157))).toFixed(1)} mitoses/mm²
+                  </span>
+                </div>
+                <div className="flex justify-between text-[11px] text-slate-500 pt-0.5">
+                  <span>Classic 10 HPF Equiv:</span>
+                  <span className="font-mono">
+                    {(data.mitotic_summary?.classic_per_10hpf ?? ((data.mitotic_summary?.total_mitoses ?? 0) * (2.74 / (data.mitotic_summary?.area_mm2 || 2.157)))).toFixed(0)} mitoses
                   </span>
                 </div>
               </div>
@@ -1776,14 +1846,36 @@ export function GradingReviewWorkspace({
                     {selectedPatch.hotspot_id || "Direct Sampling"}
                   </span>
                 </div>
-                {selectedPatch.tissue_density !== undefined && selectedPatch.tissue_density !== null && (
-                  <div className="flex items-center gap-2">
-                    <span className="text-[10px] text-slate-400">Tissue Density:</span>
-                    <span className="font-mono font-bold text-emerald-400">
-                      {Math.round(selectedPatch.tissue_density * 100)}%
-                    </span>
-                  </div>
-                )}
+                <div className="flex items-center gap-3">
+                  {selectedPatch.tissue_density !== undefined && selectedPatch.tissue_density !== null && (
+                    <div className="flex items-center gap-1">
+                      <span className="text-[10px] text-slate-400">Tissue Density:</span>
+                      <span className="font-mono font-bold text-emerald-400">
+                        {Math.round(selectedPatch.tissue_density * 100)}%
+                      </span>
+                    </div>
+                  )}
+                  {/* Whole-Slide Location Button (#487) */}
+                  <button
+                    onClick={() => {
+                      const pointUm: [number, number] = selectedPatch.center_um || [
+                        selectedPatch.center_x_px * (data?.slide?.mpp_x || 0.25),
+                        selectedPatch.center_y_px * (data?.slide?.mpp_y || 0.25)
+                      ];
+                      if (onLocateOnSlide) {
+                        onLocateOnSlide(pointUm, 20.0);
+                        setSelectedPatch(null);
+                      } else {
+                        alert(`Patch coordinates on Whole-Slide Image:\n• Centroid: (${pointUm[0].toFixed(1)} µm, ${pointUm[1].toFixed(1)} µm)\n• Pixel Center: (${selectedPatch.center_x_px} px, ${selectedPatch.center_y_px} px)`);
+                      }
+                    }}
+                    className="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-sky-300 rounded text-[11px] font-medium flex items-center gap-1 border border-slate-700 transition cursor-pointer"
+                    title="Jump to patch position on whole slide viewer"
+                  >
+                    <Crosshair className="w-3 h-3 text-sky-400" />
+                    <span>Locate on Slide</span>
+                  </button>
+                </div>
               </div>
 
               <div className="grid grid-cols-2 gap-3 text-xs">

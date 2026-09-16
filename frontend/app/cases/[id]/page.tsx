@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useState, useRef } from "react";
 import Link from "next/link";
 import { ArrowLeft, RefreshCcw, Info, X, Microscope, AlertTriangle, CheckCircle2, RotateCcw } from "lucide-react";
 import { fetchCaseDetail, CaseDetail, retryStage, approveStage, updateSlideMpp } from "@/lib/api";
@@ -48,13 +48,18 @@ export default function CaseWorkspacePage({ params }: { params: { id: string } }
 
   const [hasUserNavigated, setHasUserNavigated] = useState<boolean>(false);
 
+  const inFlightRef = useRef<boolean>(false);
+
   const loadData = async () => {
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
     try {
       const data = await fetchCaseDetail(caseId);
       setCaseDetail(data);
     } catch (err) {
       console.error(err);
     } finally {
+      inFlightRef.current = false;
       setLoading(false);
     }
   };
@@ -107,9 +112,11 @@ export default function CaseWorkspacePage({ params }: { params: { id: string } }
   const gradingStage = getLatestStage(caseDetail?.stages, "grading");
   const reportStage = getLatestStage(caseDetail?.stages, "report");
 
+  const hasSlide = Boolean(slide?.gcs_uri_original || slide?.id);
   const isIngestDone = ingestStage?.status === "completed" || ingestStage?.status === "done";
-  const isIngestRunning = ingestStage?.status === "running" || ingestStage?.status === "queued" || !ingestStage;
-  const isIngestFailed = ingestStage?.status === "failed";
+  const isIngestRunning = Boolean(hasSlide && ingestStage && (ingestStage.status === "running" || ingestStage.status === "queued"));
+  const isIngestMissing = Boolean(!hasSlide || !ingestStage);
+  const isIngestFailed = Boolean(ingestStage?.status === "failed");
   const isNeedsMpp = slide?.status === "needs_mpp" || caseDetail?.status === "needs_mpp" || (isIngestDone && (!slide?.mpp_x || slide?.mpp_x <= 0));
   const isQcFailed = qcStage?.status === "failed";
   const isQcRunning = qcStage?.status === "running" || qcStage?.status === "queued";
@@ -556,6 +563,27 @@ export default function CaseWorkspacePage({ params }: { params: { id: string } }
                     )}
                   </button>
                 </form>
+              </div>
+            </div>
+          ) : isIngestMissing && !isIngestDone ? (
+            <div className="flex flex-col items-center justify-center h-full text-slate-300 space-y-4 bg-slate-950 p-8">
+              <div className="relative w-16 h-16 flex items-center justify-center bg-slate-900 rounded-full border border-slate-800">
+                <Microscope className="w-8 h-8 text-slate-400" />
+              </div>
+              <div className="text-center max-w-md">
+                <h3 className="text-base font-bold text-white tracking-tight">No Whole-Slide Image Attached</h3>
+                <p className="text-xs text-slate-400 mt-1.5 leading-relaxed">
+                  This case does not have a slide file uploaded or the ingest pipeline stage was not initialized.
+                </p>
+                <div className="mt-5 flex items-center justify-center space-x-3">
+                  <Link
+                    href="/cases"
+                    className="px-4 py-2 bg-sky-600 hover:bg-sky-500 text-white text-xs font-semibold rounded-lg transition shadow flex items-center space-x-1.5"
+                  >
+                    <ArrowLeft className="w-3.5 h-3.5" />
+                    <span>Return to Cases & Upload Slide</span>
+                  </Link>
+                </div>
               </div>
             </div>
           ) : isIngestRunning ? (

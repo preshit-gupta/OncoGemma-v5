@@ -36,11 +36,53 @@ export interface CaseDetail extends Case {
   tile_url_template?: string | null;
 }
 
+export function formatApiError(errData: any, fallbackMessage: string): string {
+  if (!errData) return fallbackMessage;
+  if (typeof errData === "string") return errData;
+  const detail = errData.detail !== undefined ? errData.detail : errData;
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    const msgs = detail.map((d: any) => {
+      if (typeof d === "string") return d;
+      if (d && typeof d === "object") {
+        const field = Array.isArray(d.loc) ? d.loc.slice(1).join(".") : d.loc;
+        const msg = d.msg || JSON.stringify(d);
+        return field ? `${field}: ${msg}` : msg;
+      }
+      return String(d);
+    });
+    return msgs.join("; ") || fallbackMessage;
+  }
+  if (typeof detail === "object" && detail !== null) {
+    if (detail.message) {
+      if (Array.isArray(detail.missing_items) && detail.missing_items.length > 0) {
+        return `${detail.message}: ${detail.missing_items.join(", ")}`;
+      }
+      return detail.message;
+    }
+    if (detail.missing_items && Array.isArray(detail.missing_items)) {
+      return `Missing items: ${detail.missing_items.join(", ")}`;
+    }
+    if (detail.error && typeof detail.error === "string") {
+      return detail.error;
+    }
+    try {
+      return JSON.stringify(detail);
+    } catch (_) {
+      return fallbackMessage;
+    }
+  }
+  return String(detail) || fallbackMessage;
+}
+
 export async function fetchCases(): Promise<Case[]> {
   const res = await fetch(`${API_BASE}/api/v1/cases`, {
     headers: { "X-User-Role": "pathologist" }
   });
-  if (!res.ok) throw new Error("Failed to fetch cases");
+  if (!res.ok) {
+    const errData = await res.json().catch(() => null);
+    throw new Error(formatApiError(errData, "Failed to fetch cases"));
+  }
   return res.json();
 }
 
@@ -49,7 +91,10 @@ export async function createCase(): Promise<Case> {
     method: "POST",
     headers: { "X-User-Role": "pathologist" }
   });
-  if (!res.ok) throw new Error("Failed to create case");
+  if (!res.ok) {
+    const errData = await res.json().catch(() => null);
+    throw new Error(formatApiError(errData, "Failed to create case"));
+  }
   return res.json();
 }
 
@@ -90,12 +135,8 @@ export async function uploadSlideDirectToGCS(
     });
 
     if (!urlRes.ok) {
-      let errDetail = urlRes.statusText;
-      try {
-        const body = await urlRes.json();
-        if (body.detail) errDetail = body.detail;
-      } catch (_) {}
-      throw new Error(`Failed to acquire direct upload URL (HTTP ${urlRes.status}): ${errDetail}`);
+      const body = await urlRes.json().catch(() => null);
+      throw new Error(`Failed to acquire direct upload URL (HTTP ${urlRes.status}): ${formatApiError(body, urlRes.statusText)}`);
     }
 
     const data = await urlRes.json();
@@ -153,12 +194,8 @@ export async function uploadSlideDirectToGCS(
   });
 
   if (!finalizeRes.ok) {
-    let errDetail = finalizeRes.statusText;
-    try {
-      const b = await finalizeRes.json();
-      if (b.detail) errDetail = b.detail;
-    } catch (_) {}
-    throw new Error(`Failed to finalize slide registration in cloud: ${errDetail}`);
+    const b = await finalizeRes.json().catch(() => null);
+    throw new Error(`Failed to finalize slide registration in cloud: ${formatApiError(b, finalizeRes.statusText)}`);
   }
 
   try {
@@ -209,7 +246,7 @@ export async function uploadSlideFile(
         let errorMsg = `HTTP Upload Error (${xhr.status})`;
         try {
           const body = JSON.parse(xhr.responseText);
-          if (body.detail) errorMsg = body.detail;
+          errorMsg = formatApiError(body, errorMsg);
         } catch (_) {}
         reject(new Error(errorMsg));
       }
@@ -235,7 +272,7 @@ export async function retryStage(caseId: string, stageName: string) {
   });
   if (!res.ok) {
     const errData = await res.json().catch(() => null);
-    throw new Error(errData?.detail || `Failed to retry stage execution (${res.status})`);
+    throw new Error(formatApiError(errData, `Failed to retry stage execution (${res.status})`));
   }
   return res.json();
 }
@@ -251,7 +288,7 @@ export async function approveStage(caseId: string, stageName: string, payload?: 
   });
   if (!res.ok) {
     const errData = await res.json().catch(() => null);
-    throw new Error(errData?.detail || `Failed to approve stage (${res.status})`);
+    throw new Error(formatApiError(errData, `Failed to approve stage (${res.status})`));
   }
   return res.json();
 }
@@ -263,7 +300,7 @@ export async function deleteCase(caseId: string) {
   });
   if (!res.ok) {
     const errData = await res.json().catch(() => null);
-    throw new Error(errData?.detail || `Failed to delete case (${res.status})`);
+    throw new Error(formatApiError(errData, `Failed to delete case (${res.status})`));
   }
 }
 
@@ -274,7 +311,7 @@ export async function clearAllCases() {
   });
   if (!res.ok) {
     const errData = await res.json().catch(() => null);
-    throw new Error(errData?.detail || `Failed to clear cases (${res.status})`);
+    throw new Error(formatApiError(errData, `Failed to clear cases (${res.status})`));
   }
   return res.json();
 }
@@ -283,7 +320,10 @@ export async function fetchCaseDetail(caseId: string): Promise<CaseDetail> {
   const res = await fetch(`${API_BASE}/api/v1/cases/${caseId}`, {
     headers: { "X-User-Role": "pathologist" }
   });
-  if (!res.ok) throw new Error("Failed to fetch case detail");
+  if (!res.ok) {
+    const errData = await res.json().catch(() => null);
+    throw new Error(formatApiError(errData, "Failed to fetch case detail"));
+  }
   return res.json();
 }
 
@@ -337,7 +377,10 @@ export async function fetchMitosisStageData(caseId: string): Promise<MitosisStag
   const res = await fetch(`${API_BASE}/api/v1/stages/mitosis/${caseId}`, {
     headers: { "X-User-Role": "pathologist" }
   });
-  if (!res.ok) throw new Error(`Failed to fetch mitosis stage data (Status: ${res.status})`);
+  if (!res.ok) {
+    const errData = await res.json().catch(() => null);
+    throw new Error(formatApiError(errData, `Failed to fetch mitosis stage data (Status: ${res.status})`));
+  }
   return res.json();
 }
 
@@ -355,7 +398,10 @@ export async function recomputeMitosis(payload: {
     },
     body: JSON.stringify(payload)
   });
-  if (!res.ok) throw new Error("Failed to recompute mitosis score");
+  if (!res.ok) {
+    const errData = await res.json().catch(() => null);
+    throw new Error(formatApiError(errData, "Failed to recompute mitosis score"));
+  }
   return res.json();
 }
 
@@ -378,7 +424,10 @@ export async function addPathologistMitosis(
       reviewed_by: reviewedBy
     })
   });
-  if (!res.ok) throw new Error("Failed to add candidate mitosis");
+  if (!res.ok) {
+    const errData = await res.json().catch(() => null);
+    throw new Error(formatApiError(errData, "Failed to add candidate mitosis"));
+  }
   return res.json();
 }
 
@@ -398,7 +447,10 @@ export async function bulkRejectUnreviewedMitosis(
       reviewed_by: reviewedBy
     })
   });
-  if (!res.ok) throw new Error("Failed to bulk reject unreviewed candidates");
+  if (!res.ok) {
+    const errData = await res.json().catch(() => null);
+    throw new Error(formatApiError(errData, "Failed to bulk reject unreviewed candidates"));
+  }
   return res.json();
 }
 
@@ -414,7 +466,10 @@ export async function replaceMitosisHpfs(caseId: string): Promise<MitosisStageDa
       action: "re_place_hpfs"
     })
   });
-  if (!res.ok) throw new Error("Failed to re-place HPF sites");
+  if (!res.ok) {
+    const errData = await res.json().catch(() => null);
+    throw new Error(formatApiError(errData, "Failed to re-place HPF sites"));
+  }
   return res.json();
 }
 
@@ -435,7 +490,7 @@ export async function confirmMitosisStage(
   });
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
-    throw new Error(data.detail || "Failed to confirm mitosis stage");
+    throw new Error(formatApiError(data, "Failed to confirm mitosis stage"));
   }
   return res.json();
 }
@@ -570,7 +625,10 @@ export async function fetchGradingStageData(caseId: string): Promise<GradingStag
   const res = await fetch(`${API_BASE}/api/v1/stages/grading/${caseId}`, {
     headers: { "X-User-Role": "pathologist" }
   });
-  if (!res.ok) throw new Error(`Failed to fetch grading stage data (Status: ${res.status})`);
+  if (!res.ok) {
+    const errData = await res.json().catch(() => null);
+    throw new Error(formatApiError(errData, `Failed to fetch grading stage data (Status: ${res.status})`));
+  }
   return res.json();
 }
 
@@ -585,7 +643,7 @@ export async function reviewGradingPatches(payload: PatchReviewPayload): Promise
   });
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
-    throw new Error(data.detail || "Failed to update patch reviews");
+    throw new Error(formatApiError(data, "Failed to update patch reviews"));
   }
   return res.json();
 }
@@ -601,7 +659,7 @@ export async function reviewGradingHpfs(payload: HpfReviewPayload): Promise<Grad
   });
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
-    throw new Error(data.detail || "Failed to update HPF reviews");
+    throw new Error(formatApiError(data, "Failed to update HPF reviews"));
   }
   return res.json();
 }
@@ -628,7 +686,10 @@ export async function recomputeGradingPreview(payload: {
     },
     body: JSON.stringify(payload)
   });
-  if (!res.ok) throw new Error("Failed to recompute grade preview");
+  if (!res.ok) {
+    const errData = await res.json().catch(() => null);
+    throw new Error(formatApiError(errData, "Failed to recompute grade preview"));
+  }
   return res.json();
 }
 
@@ -648,7 +709,7 @@ export async function confirmHistologicType(payload: {
   });
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
-    throw new Error(data.detail || "Failed to confirm histologic subtype");
+    throw new Error(formatApiError(data, "Failed to confirm histologic subtype"));
   }
   return res.json();
 }
@@ -676,7 +737,7 @@ export async function confirmGradingStage(payload: {
   });
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
-    throw new Error(data.detail || "Failed to confirm grading stage");
+    throw new Error(formatApiError(data, "Failed to confirm grading stage"));
   }
   return res.json();
 }
@@ -762,7 +823,10 @@ export async function fetchReportData(caseId: string): Promise<CapReportData> {
   const res = await fetch(`${API_BASE}/api/v1/stages/report/${caseId}`, {
     headers: { "X-User-Role": "pathologist" }
   });
-  if (!res.ok) throw new Error(`Failed to fetch CAP report data (Status: ${res.status})`);
+  if (!res.ok) {
+    const errData = await res.json().catch(() => null);
+    throw new Error(formatApiError(errData, `Failed to fetch CAP report data (Status: ${res.status})`));
+  }
   return res.json();
 }
 
@@ -777,7 +841,7 @@ export async function updateReportData(payload: Partial<CapReportData> & { case_
   });
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
-    throw new Error(data.detail || "Failed to update report data");
+    throw new Error(formatApiError(data, "Failed to update report data"));
   }
   return res.json();
 }
@@ -789,7 +853,7 @@ export async function regenerateReportNarrative(caseId: string): Promise<{ statu
   });
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
-    throw new Error(data.detail || "Failed to regenerate diagnostic narrative");
+    throw new Error(formatApiError(data, "Failed to regenerate diagnostic narrative"));
   }
   return res.json();
 }
@@ -811,16 +875,7 @@ export async function signReport(payload: {
   });
   if (!res.ok) {
     const errData = await res.json().catch(() => ({}));
-    let msg = "Failed to sign and finalize report";
-    if (typeof errData.detail === "string") {
-      msg = errData.detail;
-    } else if (errData.detail && typeof errData.detail === "object") {
-      if (Array.isArray(errData.detail.missing_items)) {
-        msg = `${errData.detail.error || "Preconditions not met"}: ${errData.detail.missing_items.join("; ")}`;
-      } else {
-        msg = errData.detail.error || errData.detail.message || JSON.stringify(errData.detail);
-      }
-    }
+    const msg = formatApiError(errData, "Failed to sign and finalize report");
     const err: any = new Error(msg);
     err.status = res.status;
     err.detail = errData.detail;
@@ -845,7 +900,7 @@ export async function amendReport(payload: {
   });
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
-    throw new Error(data.detail || "Failed to submit report amendment");
+    throw new Error(formatApiError(data, "Failed to submit report amendment"));
   }
   return res.json();
 }
@@ -866,7 +921,7 @@ export async function updateSlideMpp(
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: "Failed to update MPP" }));
-    throw new Error(err.detail || "Failed to update MPP");
+    throw new Error(formatApiError(err, "Failed to update MPP"));
   }
   return res.json();
 }

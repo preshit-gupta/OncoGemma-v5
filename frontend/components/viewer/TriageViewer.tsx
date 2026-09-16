@@ -103,7 +103,7 @@ export function TriageViewer({
 
   const fetchTriageData = async (silent: boolean = false) => {
     try {
-      if (!silent) setLoading(true);
+      if (!silent && !data) setLoading(true);
       const res = await fetch(`${API_BASE}/api/v1/stages/triage/${caseId}?_t=${Date.now()}`, {
         headers: { "X-User-Role": "pathologist" }
       });
@@ -112,7 +112,14 @@ export function TriageViewer({
       }
       const json = await res.json();
       setData(json);
-      setHotspotsList(json.effective_hotspots || []);
+      const incomingHotspots = json.effective_hotspots || [];
+      setHotspotsList((prev) => {
+        // Retain unsaved user-added hotspots so background re-fetch never wipes them out
+        const userAdded = prev.filter(
+          (h) => h.source === "pathologist_added" && !incomingHotspots.some((ih: any) => ih.id === h.id)
+        );
+        return [...incomingHotspots, ...userAdded];
+      });
       if (json.review_edits && Array.isArray(json.review_edits)) {
         const deleted = json.review_edits
           .filter((e: any) => e.op === "delete" && e.id)
@@ -129,9 +136,15 @@ export function TriageViewer({
   const handleReprocessTriage = async () => {
     try {
       setReprocessing(true);
+      // Persist draft edits before reprocessing so the new attempt retains pathologist edits (#655)
+      try {
+        await handleSaveDraftEdits({ suppressSubmittingToggle: true });
+      } catch (saveErr) {
+        console.warn("Could not save draft edits before re-processing:", saveErr);
+      }
       await retryStage(caseId, "triage");
       if (onRefreshCase) onRefreshCase();
-      await fetchTriageData();
+      await fetchTriageData(true);
     } catch (err: any) {
       console.error(err);
       setError(`Failed to re-process triage: ${err.message}`);
@@ -204,8 +217,8 @@ export function TriageViewer({
       [Number((x_um - half_um).toFixed(2)), Number((y_um - half_um).toFixed(2))]
     ];
 
-    const userCount = hotspotsList.filter((h) => h.id.startsWith("user_")).length;
-    const newId = `user_${(userCount + 1).toString().padStart(2, "0")}`;
+    // Collision-proof unique ROI identifier (#234)
+    const newId = `user_roi_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
     const newHs: HotspotItem = {
       id: newId,
       polygon_um: polygon,
@@ -237,8 +250,8 @@ export function TriageViewer({
     }
 
     const areaMm2 = computePolygonAreaMm2(closed);
-    const userCount = hotspotsList.filter((h) => h.id.startsWith("user_")).length;
-    const newId = `user_${(userCount + 1).toString().padStart(2, "0")}`;
+    // Collision-proof unique ROI identifier (#234)
+    const newId = `user_roi_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
     const newHs: HotspotItem = {
       id: newId,
       polygon_um: closed,
@@ -462,6 +475,7 @@ export function TriageViewer({
           isAddingRoiMode={isAddingRoiMode}
           onAddRoiClick={handleAddRoiFromClick}
           tileUrlTemplate={tileUrlTemplate}
+          grid={data?.grid}
         />
 
         {/* Interactive Click-to-Add ROI Floating Banner */}

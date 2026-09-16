@@ -73,14 +73,27 @@ export default function CasesPage() {
     }
   };
 
-  const handleClearAll = async () => {
-    if (!confirm("Are you sure you want to clear all diagnostic cases from the dashboard?")) return;
+  const [showClearModal, setShowClearModal] = useState(false);
+  const [clearConfirmText, setClearConfirmText] = useState("");
+  const [clearing, setClearing] = useState(false);
+
+  const handleOpenClearModal = () => {
+    setClearConfirmText("");
+    setShowClearModal(true);
+  };
+
+  const handleExecuteClearAll = async () => {
+    if (clearConfirmText !== "DELETE") return;
+    setClearing(true);
     try {
       await clearAllCases();
+      setShowClearModal(false);
       await loadCases();
     } catch (err: any) {
       console.error(err);
       alert(err.message || "Failed to clear cases");
+    } finally {
+      setClearing(false);
     }
   };
 
@@ -130,7 +143,7 @@ export default function CasesPage() {
         <div className="flex items-center space-x-3">
           {cases.length > 0 && (
             <button
-              onClick={handleClearAll}
+              onClick={handleOpenClearModal}
               className="inline-flex items-center space-x-1.5 px-3 py-2 bg-slate-100 hover:bg-rose-50 text-slate-600 hover:text-rose-600 rounded-lg text-xs font-semibold border border-slate-200 transition"
               title="Clear all cases from database"
             >
@@ -225,6 +238,66 @@ export default function CasesPage() {
               </Link>
             </div>
           ))}
+        </div>
+      )}
+
+      {/* Clear All Confirmation Modal (Issue #269) */}
+      {showClearModal && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          className="fixed inset-0 z-50 bg-slate-900/80 backdrop-blur-sm flex items-center justify-center p-4"
+        >
+          <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-200 space-y-4">
+            <div className="flex items-center space-x-3 text-rose-600">
+              <div className="w-10 h-10 rounded-full bg-rose-50 flex items-center justify-center border border-rose-200">
+                <AlertTriangle className="w-5 h-5 text-rose-600" />
+              </div>
+              <div>
+                <h3 className="text-base font-bold text-slate-900">Clear All Diagnostic Cases?</h3>
+                <p className="text-xs text-slate-500">Irreversible clinical data deletion</p>
+              </div>
+            </div>
+
+            <p className="text-xs text-slate-600 leading-relaxed">
+              This action will permanently delete <strong className="text-slate-900">all {cases.length} case records</strong>, whole-slide pyramid tiles, mitosis annotations, Nottingham grade evaluations, and CAP reports from the database and Cloud Storage.
+            </p>
+
+            <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 space-y-2">
+              <label htmlFor="delete-confirm-input" className="block text-xs font-semibold text-slate-700">
+                Type <span className="font-mono text-rose-600 bg-rose-50 px-1.5 py-0.5 rounded border border-rose-200">DELETE</span> to confirm:
+              </label>
+              <input
+                id="delete-confirm-input"
+                type="text"
+                autoFocus
+                value={clearConfirmText}
+                onChange={(e) => setClearConfirmText(e.target.value)}
+                placeholder="DELETE"
+                className="w-full bg-white border border-slate-300 rounded-lg px-3 py-2 text-xs font-mono font-bold text-slate-900 focus:outline-none focus:border-rose-500"
+              />
+            </div>
+
+            <div className="flex items-center justify-end space-x-2 pt-2 border-t border-slate-100">
+              <button
+                type="button"
+                onClick={() => setShowClearModal(false)}
+                disabled={clearing}
+                className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs font-semibold transition"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleExecuteClearAll}
+                disabled={clearConfirmText !== "DELETE" || clearing}
+                className="px-4 py-2 bg-rose-600 hover:bg-rose-500 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-lg text-xs font-bold transition shadow-sm flex items-center space-x-1.5"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>{clearing ? "Deleting..." : "Permanently Delete All Cases"}</span>
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

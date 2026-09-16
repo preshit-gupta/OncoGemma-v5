@@ -182,7 +182,7 @@ export function MitosisViewer({
   // Server debounced sync (<50ms execution on server; single authoritative scoring source)
   const syncWithServer = useCallback((
     updatedCandidates: MitosisCandidate[], 
-    updatedHpfs: VirtualHpfSite[], 
+    updatedHpfs?: VirtualHpfSite[] | null, 
     auditToggle?: { id: string; from: string; to: string }
   ) => {
     if (debounceTimerRef.current) {
@@ -194,15 +194,20 @@ export function MitosisViewer({
       try {
         const labelsMap: Record<string, string> = {};
         updatedCandidates.forEach(c => { labelsMap[c.id] = c.label; });
-        const res = await recomputeMitosis({
+        const payload: any = {
           case_id: caseId,
           candidate_labels: labelsMap,
-          hpfs: updatedHpfs,
           audit_toggle: auditToggle
-        });
+        };
+        if (updatedHpfs && updatedHpfs.length > 0) {
+          payload.hpfs = updatedHpfs;
+        }
+        const res = await recomputeMitosis(payload);
         if (res && res.summary) {
           setSummary(res.summary);
-          setHpfs(res.hpfs);
+          if (res.hpfs) {
+            setHpfs(res.hpfs);
+          }
         }
       } catch (err) {
         console.error("Debounced recompute sync error:", err);
@@ -226,8 +231,8 @@ export function MitosisViewer({
     });
 
     setCandidates(updated);
-    // Sync debounced to server with audit event; authoritative score returned from server
-    syncWithServer(updated, hpfs, { id, from: oldLabel, to: newLabel });
+    // Sync debounced to server with audit event; authoritative score returned from server (omit hpfs so existing HPF rows are not deleted)
+    syncWithServer(updated, null, { id, from: oldLabel, to: newLabel });
   };
 
   const handleAddCandidateFromClick = async (x_um: number, y_um: number) => {
@@ -366,7 +371,7 @@ export function MitosisViewer({
         return c;
       });
       setCandidates(currentCandidates);
-      syncWithServer(currentCandidates, hpfs);
+      syncWithServer(currentCandidates);
     }
 
     setApprovedFields(prev => ({ ...prev, [activeHpfSeq]: true }));
@@ -431,15 +436,39 @@ export function MitosisViewer({
     });
   }, [candidates, showCandidateMarkers, activeHpf]);
 
-  // Pan to candidate in thumbnail stage
+  // Pan and center candidate on microscope stage in 40x viewer
   const handleJumpToCandidate = (candidate: MitosisCandidate) => {
     setSelectedCandidateId(candidate.id);
+    if (candidate.centroid_um && activeHpf && activeHpf.center_um) {
+      const [cx, cy] = activeHpf.center_um;
+      const dx_um = candidate.centroid_um[0] - cx;
+      const dy_um = candidate.centroid_um[1] - cy;
+      const reticleRadiusPx = 236.0;
+      const hpfRadiusUm = activeHpf.radius_um || 262.0;
+      const pxX = 260 + (dx_um / hpfRadiusUm) * reticleRadiusPx;
+      const pxY = 260 + (dy_um / hpfRadiusUm) * reticleRadiusPx;
+      setStageZoom(3.5);
+      setMagMode("40x");
+      setPanOffset({
+        x: (260 - pxX) * 3.5,
+        y: (260 - pxY) * 3.5
+      });
+    }
   };
 
   // Keyboard Navigation: j, k (cards), m (mitosis), x (reject), Enter (approve field)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (["INPUT", "TEXTAREA"].includes((e.target as HTMLElement)?.tagName)) return;
+      const target = e.target as HTMLElement;
+      if (
+        ["INPUT", "TEXTAREA", "SELECT"].includes(target?.tagName) ||
+        target?.isContentEditable
+      ) {
+        return;
+      }
+      if (e.ctrlKey || e.metaKey || e.altKey) {
+        return;
+      }
 
       if (workflowPhase === "field_review") {
         const filtered = activeFieldCandidates.filter(c => {
@@ -936,7 +965,13 @@ export function MitosisViewer({
                 detectionMarkers={candidateMarkers}
                 showCandidateMarkers={showCandidateMarkers}
                 selectedCandidateId={selectedCandidateId}
-                onSelectCandidate={(id) => setSelectedCandidateId(id)}
+                onSelectCandidate={(id) => {
+                  setSelectedCandidateId(id);
+                  const cand = candidates.find(c => c.id === id);
+                  if (cand) {
+                    handleJumpToCandidate(cand);
+                  }
+                }}
                 isAddingRoiMode={isPinningMode}
                 onAddRoiClick={handleAddCandidateFromClick}
                 className="w-full h-full"
@@ -962,7 +997,7 @@ export function MitosisViewer({
                   </div>
                   <div className="flex items-center justify-between text-xs">
                     <span className="text-slate-400">Total Evaluated Area:</span>
-                    <span className="font-mono font-bold text-slate-200">2.157 mm² (10 HPFs)</span>
+                    <span className="font-mono font-bold text-slate-200">{summary.area_mm2.toFixed(3)} mm² ({summary.n_hpf} HPFs)</span>
                   </div>
                   <div className="flex items-center justify-between text-xs">
                     <span className="text-slate-400">Calculated Proliferation:</span>

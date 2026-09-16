@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef, useState, useCallback } from "react";
 import OpenSeadragon from "openseadragon";
 import { ZoomIn, ZoomOut, Maximize, ChevronDown, Check, Layers, Image as ImageIcon, Info } from "lucide-react";
 import { API_BASE } from "@/lib/api";
@@ -26,6 +26,13 @@ export interface ViewerDetectionMarker {
   in_hpf?: boolean;
 }
 
+export interface ViewerGridParams {
+  origin_um?: number[];
+  stride_um?: number;
+  nx?: number;
+  ny?: number;
+}
+
 interface OpenSeadragonViewerProps {
   caseId?: string;
   mppX?: number;
@@ -49,6 +56,7 @@ interface OpenSeadragonViewerProps {
   focusMag?: number;
   isAddingRoiMode?: boolean;
   onAddRoiClick?: (x_um: number, y_um: number) => void;
+  grid?: ViewerGridParams | null;
   className?: string;
 }
 
@@ -77,6 +85,7 @@ export function OpenSeadragonViewer({
   tileUrlTemplate = null,
   focusPointUm = null,
   focusMag = 20.0,
+  grid = null,
   className
 }: OpenSeadragonViewerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -112,6 +121,11 @@ export function OpenSeadragonViewer({
     onAddRoiClickRef.current = onAddRoiClick;
   }, [onAddRoiClick]);
 
+  const isEditingZoomRef = useRef(isEditingZoom);
+  useEffect(() => {
+    isEditingZoomRef.current = isEditingZoom;
+  }, [isEditingZoom]);
+
   const hotspotsRef = useRef(hotspots);
   useEffect(() => {
     hotspotsRef.current = hotspots;
@@ -127,6 +141,7 @@ export function OpenSeadragonViewer({
   const currentOverlayUriRef = useRef<string | null>(null);
   const isAddingOverlayRef = useRef<boolean>(false);
   const isBaseSlideOpenRef = useRef<boolean>(false);
+  const rafPendingRef = useRef<number | null>(null);
 
   // Programmatic smooth camera fly-to when focusPointUm changes
   useEffect(() => {
@@ -171,7 +186,7 @@ export function OpenSeadragonViewer({
 
     const calculatedMag = imageZoom * (40.0 * 0.25 / effectiveMppX);
     setCurrentMag(calculatedMag);
-    if (!isEditingZoom) {
+    if (!isEditingZoomRef.current) {
       setCustomZoomInput(calculatedMag.toFixed(1));
     }
   };
@@ -248,21 +263,31 @@ export function OpenSeadragonViewer({
     setSvgPolygons(polys);
   };
 
-  useEffect(() => {
-    if (!containerRef.current) return;
+  const scheduleViewportUpdate = useCallback(() => {
+    if (rafPendingRef.current !== null) return;
+    rafPendingRef.current = requestAnimationFrame(() => {
+      rafPendingRef.current = null;
+      updateScalebar();
+      updatePolygons();
+      updateMarkers();
+    });
+  }, [mppX, mppY]);
 
-    // Capture previous viewport bounds so zooming/panning is preserved across layer switches
-    const prevBounds = viewerRef.current?.viewport ? viewerRef.current.viewport.getBounds() : null;
-
-    if (viewerRef.current) {
-      viewerRef.current.destroy();
-      viewerRef.current = null;
+  const onViewportChangeImmediate = useCallback(() => {
+    if (rafPendingRef.current !== null) {
+      cancelAnimationFrame(rafPendingRef.current);
+      rafPendingRef.current = null;
     }
+    updateScalebar();
+    updatePolygons();
+    updateMarkers();
+  }, [mppX, mppY]);
 
+  const getTileSource = useCallback((layerName: "orig" | "norm") => {
     const maxDim = Math.max(imageWidthPx, imageHeightPx);
     const maxLevel = Math.ceil(Math.log2(maxDim)) || 11;
 
-    const tileSource: any = {
+    return {
       width: imageWidthPx,
       height: imageHeightPx,
       tileSize: 256,
@@ -271,7 +296,7 @@ export function OpenSeadragonViewer({
       maxLevel: maxLevel,
       getTileUrl: (level: number, x: number, y: number) => {
         // Beyond 10x level (level > maxLevel - 2), normalized pyramid falls back to original colors
-        const effectiveLayer = (activeLayer === "norm" && level > maxLevel - 2) ? "orig" : activeLayer;
+        const effectiveLayer = (layerName === "norm" && level > maxLevel - 2) ? "orig" : layerName;
         if (tileUrlTemplate) {
           let url = tileUrlTemplate;
           if (url.includes("{layer}")) {
@@ -287,10 +312,40 @@ export function OpenSeadragonViewer({
         return `${API_BASE}/api/v1/cases/${caseId}/tiles/${effectiveLayer}/${level}/${x}_${y}.png`;
       }
     };
+  }, [caseId, imageWidthPx, imageHeightPx, tileUrlTemplate]);
+
+  // Smooth layer transition without destroying OSD instance
+  useEffect(() => {
+    if (!viewerRef.current || !isBaseSlideOpenRef.current) return;
+    const currentBounds = viewerRef.current.viewport ? viewerRef.current.viewport.getBounds() : null;
+    const tileSource = getTileSource(activeLayer);
+    viewerRef.current.open(tileSource);
+    if (currentBounds && viewerRef.current.viewport) {
+      const onOpenHandler = () => {
+        try {
+          if (viewerRef.current?.viewport) {
+            viewerRef.current.viewport.fitBounds(currentBounds, true);
+          }
+        } catch (_) {}
+        viewerRef.current?.removeHandler("open", onOpenHandler);
+      };
+      viewerRef.current.addHandler("open", onOpenHandler);
+    }
+  }, [activeLayer, getTileSource]);
+
+  useEffect(() => {
+    if (!containerRef.current) return;
+
+    if (viewerRef.current) {
+      viewerRef.current.destroy();
+      viewerRef.current = null;
+    }
+
+    const tileSource = getTileSource(activeLayer);
 
     const viewer = OpenSeadragon({
       element: containerRef.current,
-      prefixUrl: "https://openseadragon.github.io/openseadragon/images/",
+      prefixUrl: "/images/osd/",
       tileSources: tileSource,
       showNavigationControl: false,
       animationTime: 0.3,
@@ -303,32 +358,22 @@ export function OpenSeadragonViewer({
 
     viewerRef.current = viewer;
 
-    const onViewportChange = () => {
-      updateScalebar();
-      updatePolygons();
-      updateMarkers();
-    };
-
     viewer.addHandler("open", () => {
       isBaseSlideOpenRef.current = true;
-      onViewportChange();
+      onViewportChangeImmediate();
       if (viewer.viewport) {
-        if (prevBounds) {
-          viewer.viewport.fitBounds(prevBounds, true);
-        } else {
-          viewer.viewport.goHome(true);
-        }
+        viewer.viewport.goHome(true);
         viewer.viewport.applyConstraints();
       }
       syncOverlay();
     });
 
-    viewer.addHandler("animation", onViewportChange);
-    viewer.addHandler("animation-finish", onViewportChange);
-    viewer.addHandler("pan", onViewportChange);
-    viewer.addHandler("zoom", onViewportChange);
-    viewer.addHandler("resize", onViewportChange);
-    viewer.addHandler("update-viewport", onViewportChange);
+    viewer.addHandler("animation", scheduleViewportUpdate);
+    viewer.addHandler("animation-finish", onViewportChangeImmediate);
+    viewer.addHandler("pan", scheduleViewportUpdate);
+    viewer.addHandler("zoom", scheduleViewportUpdate);
+    viewer.addHandler("resize", onViewportChangeImmediate);
+    viewer.addHandler("update-viewport", scheduleViewportUpdate);
 
     viewer.addHandler("canvas-click", (event: any) => {
       if (!isAddingRoiModeRef.current) return;
@@ -345,6 +390,10 @@ export function OpenSeadragonViewer({
     });
 
     return () => {
+      if (rafPendingRef.current !== null) {
+        cancelAnimationFrame(rafPendingRef.current);
+        rafPendingRef.current = null;
+      }
       isBaseSlideOpenRef.current = false;
       overlayItemRef.current = null;
       currentOverlayUriRef.current = null;
@@ -354,7 +403,7 @@ export function OpenSeadragonViewer({
         viewerRef.current = null;
       }
     };
-  }, [caseId, activeLayer, imageWidthPx, imageHeightPx, mppX, mppY, tileUrlTemplate]);
+  }, [caseId, imageWidthPx, imageHeightPx, mppX, mppY, tileUrlTemplate, getTileSource]);
 
   // Sync heatmap overlay and opacity smoothly without re-downloading or stacking duplicate images
   const syncOverlay = () => {
@@ -408,12 +457,32 @@ export function OpenSeadragonViewer({
         isAddingOverlayRef.current = true;
         const uriToLoad = overlayImageUri;
 
+        let overlayX = 0;
+        let overlayY = 0;
+        let overlayWidth = 1.0;
+
+        const effectiveMppX = mppX || 0.25;
+        const slideWidthUm = imageWidthPx * effectiveMppX;
+
+        if (
+          grid &&
+          grid.origin_um &&
+          grid.origin_um.length >= 2 &&
+          grid.stride_um &&
+          grid.nx &&
+          slideWidthUm > 0
+        ) {
+          overlayX = grid.origin_um[0] / slideWidthUm;
+          overlayY = grid.origin_um[1] / slideWidthUm;
+          overlayWidth = (grid.nx * grid.stride_um) / slideWidthUm;
+        }
+
         viewer.addSimpleImage({
           url: uriToLoad,
           opacity: targetOpacity,
-          x: 0,
-          y: 0,
-          width: 1.0,
+          x: overlayX,
+          y: overlayY,
+          width: overlayWidth,
           index: world.getItemCount(),
           success: (event: any) => {
             try {
@@ -471,7 +540,7 @@ export function OpenSeadragonViewer({
 
   useEffect(() => {
     syncOverlay();
-  }, [overlayOpacity, showOverlay, overlayImageUri, imageWidthPx, imageHeightPx]);
+  }, [overlayOpacity, showOverlay, overlayImageUri, imageWidthPx, imageHeightPx, grid]);
 
 
 
