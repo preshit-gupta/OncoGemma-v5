@@ -113,7 +113,38 @@ def run_qc(stage_execution: StageExecution, session: Session) -> tuple[str, dict
         case_obj = session.get(Case, case_id)
 
         if verdict == "pass":
-            stage_execution.status = "awaiting_review"
+            stage_execution.status = "done"
+
+            # Auto-advance to triage stage (attempt 1 or monotonic next attempt) per PRD 02 §3.3
+            stmt_triage = (
+                select(StageExecution)
+                .where(
+                    StageExecution.case_id == case_id,
+                    StageExecution.stage == "triage"
+                )
+                .order_by(StageExecution.attempt.desc())
+            )
+            existing_triage = session.scalars(stmt_triage).first()
+            next_triage_attempt = (existing_triage.attempt + 1) if existing_triage else 1
+
+            next_triage_stage = StageExecution(
+                case_id=case_id,
+                stage="triage",
+                attempt=next_triage_attempt,
+                status="queued",
+                input_ref={"slide_id": str(slide_id), "qc_output_ref": output_ref}
+            )
+            session.add(next_triage_stage)
+            session.commit()
+            session.refresh(next_triage_stage)
+
+            from app.core.cloud_tasks import dispatch_stage_task
+            dispatch_stage_task(
+                case_id=str(case_id),
+                stage="triage",
+                stage_exec_id=str(next_triage_stage.id),
+                payload={"slide_id": str(slide_id), "qc_output_ref": output_ref}
+            )
         elif verdict == "warn":
             stage_execution.status = "awaiting_review"
         elif verdict == "fail":

@@ -9,7 +9,7 @@ import threading
 from io import BytesIO
 import numpy as np
 from PIL import Image
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy.orm import Session
 from sqlalchemy import select
 
@@ -126,6 +126,31 @@ def stream_slide_tile(slide: Slide, layer: str, z: int, filename: str, case_id: 
     slide_max_level = int(math.ceil(math.log2(max_dim))) if max_dim > 0 else 11
     cap_10x_level = max(0, slide_max_level - 2)
 
+    # Validate zoom level bounds (Issue #200, #636)
+    if z < 0 or z > slide_max_level:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Tile zoom level {z} out of bounds (max level {slide_max_level})"
+        )
+
+    # Validate coordinate bounds (Issue #200)
+    parts = stem.split("_")
+    if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invalid tile coordinate format")
+    c, r = int(parts[0]), int(parts[1])
+
+    scale_factor = 2 ** max(0, (slide_max_level - z))
+    level_w = max(1, math.ceil(slide_w / scale_factor))
+    level_h = max(1, math.ceil(slide_h / scale_factor))
+    max_cols = max(1, math.ceil(level_w / 256))
+    max_rows = max(1, math.ceil(level_h / 256))
+
+    if c < 0 or c >= max_cols or r < 0 or r >= max_rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Tile ({c}, {r}) out of bounds for level {z} (max grid {max_cols}x{max_rows})"
+        )
+
     target_layer = layer
     if layer == "norm" and z > cap_10x_level:
         target_layer = "orig"
@@ -155,35 +180,27 @@ def stream_slide_tile(slide: Slide, layer: str, z: int, filename: str, case_id: 
     except Exception as gcs_err:
         print(f"[Tile Router Warning] Real GCS fetch note: {gcs_err}")
 
-    # 2. Dynamic On-The-Fly Tile Generation with Persistent Local Slide Cache (Issue #635)
+    # 2. Fallback to cached slide on local disk if already present (Issue #200, #636)
     try:
-        parts = stem.split("_")
-        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
-            c, r = int(parts[0]), int(parts[1])
-            cid = str(case_id or slide.case_id)
-            gcs_uri_original = resolve_slide_raw_uri(cid, slide) or slide.gcs_uri_original or f"gs://{settings.GCS_RAW_BUCKET}/cases/{cid}/{slide.id}.svs"
-            raw_bucket_name, blob_name = parse_gcs_uri(gcs_uri_original)
-            slide_ext = os.path.splitext(blob_name)[1] or ".svs"
-            
-            cache_dir = os.path.join(tempfile.gettempdir(), "og_slides_cache")
-            os.makedirs(cache_dir, exist_ok=True)
-            local_slide_path = os.path.join(cache_dir, f"{slide.id}{slide_ext}")
+        cid = str(case_id or slide.case_id)
+        gcs_uri_original = resolve_slide_raw_uri(cid, slide) or slide.gcs_uri_original or f"gs://{settings.GCS_RAW_BUCKET}/cases/{cid}/{slide.id}.svs"
+        raw_bucket_name, blob_name = parse_gcs_uri(gcs_uri_original)
+        slide_ext = os.path.splitext(blob_name)[1] or ".svs"
+        
+        cache_dir = os.path.join(tempfile.gettempdir(), "og_slides_cache")
+        local_slide_path = os.path.join(cache_dir, f"{slide.id}{slide_ext}")
 
-            # Cache slide locally once per container; zero network re-downloads for all subsequent tiles
-            if not os.path.exists(local_slide_path) or os.path.getsize(local_slide_path) == 0:
-                download_blob_to_filename(raw_bucket_name, blob_name, local_slide_path)
-
-            if os.path.exists(local_slide_path):
-                tile_bytes = generate_tile_on_the_fly(
-                    slide_file_path=local_slide_path,
-                    slide_obj=slide,
-                    z=target_z,
-                    c=c,
-                    r=r,
-                    layer=target_layer
-                )
-                if tile_bytes:
-                    return Response(content=tile_bytes, media_type="image/png", headers=no_cache_headers)
+        if os.path.exists(local_slide_path) and os.path.getsize(local_slide_path) > 0:
+            tile_bytes = generate_tile_on_the_fly(
+                slide_file_path=local_slide_path,
+                slide_obj=slide,
+                z=target_z,
+                c=c,
+                r=r,
+                layer=target_layer
+            )
+            if tile_bytes:
+                return Response(content=tile_bytes, media_type="image/png", headers=no_cache_headers)
     except Exception as dynamic_err:
         print(f"[Tile Router Warning] Dynamic tile extraction fallback error: {dynamic_err}")
 

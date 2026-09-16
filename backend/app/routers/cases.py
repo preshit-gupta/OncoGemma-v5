@@ -16,8 +16,10 @@ from app.core.gcs import (
     download_blob_to_filename,
     generate_signed_upload_url,
     get_gcs_tile_template_url,
-    parse_gcs_uri
+    parse_gcs_uri,
+    blob_exists
 )
+from starlette.concurrency import run_in_threadpool
 from app.core.openslide_lock import OPENSLIDE_GLOBAL_LOCK
 from app.core.cloud_tasks import dispatch_stage_task
 from app.models.case import Case
@@ -183,13 +185,20 @@ async def upload_slide_file(
 
     file_uuid = uuid.uuid4()
     ext = file.filename.rsplit(".", 1)[-1].lower() if file.filename and "." in file.filename else "svs"
+    allowed_exts = {"svs", "ndpi", "tif", "tiff", "mrxs", "scn", "bcf", "jpg", "jpeg", "png"}
+    if ext not in allowed_exts:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported file extension .{ext}. Allowed formats: {', '.join(sorted(allowed_exts))}"
+        )
     
     blob_name = f"cases/{case_id}/{file_uuid}.{ext}"
     gcs_uri = f"gs://{settings.GCS_RAW_BUCKET}/{blob_name}"
 
     try:
         await file.seek(0)
-        upload_blob_from_file(
+        await run_in_threadpool(
+            upload_blob_from_file,
             bucket_name=settings.GCS_RAW_BUCKET,
             blob_name=blob_name,
             file_obj=file.file,
@@ -393,20 +402,26 @@ def approve_case_stage(
             detail=f"Stage '{stage_name}' execution not found for case {case_id}."
         )
 
+    if current_stage.status == "confirmed":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Stage '{stage_name}' has already been confirmed."
+        )
+
     now_utc = datetime.now(timezone.utc)
 
-    if stage_name == "preprocess":
-        if current_stage.status not in ("awaiting_review", "done", "confirmed"):
+    qc_stage = db.scalars(
+        select(StageExecution)
+        .where(StageExecution.case_id == case_id, StageExecution.stage == "qc")
+        .order_by(StageExecution.attempt.desc())
+    ).first()
+
+    if stage_name in ("preprocess", "qc"):
+        if current_stage.status not in ("awaiting_review", "done", "failed"):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail=f"Stage 'preprocess' cannot be approved because its status is '{current_stage.status}', expected 'awaiting_review'."
+                detail=f"Stage '{stage_name}' cannot be approved because its status is '{current_stage.status}', expected 'awaiting_review'."
             )
-
-        qc_stage = db.scalars(
-            select(StageExecution)
-            .where(StageExecution.case_id == case_id, StageExecution.stage == "qc")
-            .order_by(StageExecution.attempt.desc())
-        ).first()
 
         if qc_stage:
             if qc_stage.status in ("queued", "running"):
@@ -446,7 +461,12 @@ def approve_case_stage(
                 qc_stage.reviewed_by = user.id
                 qc_stage.reviewed_at = now_utc
     else:
-        if current_stage.status not in ("awaiting_review", "done", "confirmed"):
+        if qc_stage and qc_stage.status == "failed":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Slide has a failed automated QC status that has not been clinically overridden."
+            )
+        if current_stage.status not in ("awaiting_review", "done"):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"Stage '{stage_name}' cannot be approved because its status is '{current_stage.status}', expected 'awaiting_review'."
@@ -459,6 +479,7 @@ def approve_case_stage(
     # Determine next stage name
     next_stage_map = {
         "preprocess": "triage",
+        "qc": "triage",
         "triage": "mitosis",
         "mitosis": "grading",
         "grading": "report"
@@ -545,6 +566,20 @@ def finalize_slide_upload(
     if not case_obj:
         raise HTTPException(status_code=404, detail="Case not found")
 
+    expected_prefix = f"gs://{settings.GCS_RAW_BUCKET}/cases/{case_id}/"
+    if not req.gcs_uri.startswith(expected_prefix):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid gcs_uri. Slide URI must be under {expected_prefix}"
+        )
+
+    raw_bucket_name, blob_name = parse_gcs_uri(req.gcs_uri)
+    if not blob_exists(raw_bucket_name, blob_name):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Raw slide object does not exist at {req.gcs_uri}"
+        )
+
     slide_obj = Slide(
         case_id=case_id,
         gcs_uri_original=req.gcs_uri,
@@ -567,7 +602,11 @@ def finalize_slide_upload(
         stage="ingest",
         attempt=next_attempt,
         status="queued",
-        input_ref={"gcs_uri_original": req.gcs_uri, "slide_id": str(slide_obj.id)}
+        input_ref={
+            "gcs_uri_original": req.gcs_uri,
+            "slide_id": str(slide_obj.id),
+            "client_sha256": req.client_sha256
+        }
     )
     db.add(stage_exec)
     case_obj.status = "open"

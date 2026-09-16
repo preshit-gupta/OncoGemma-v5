@@ -58,30 +58,60 @@ export async function uploadSlideDirectToGCS(
   file: File,
   onProgress?: (percent: number) => void
 ): Promise<any> {
-  // 1. Request Signed Upload URL from FastAPI control plane
-  const urlRes = await fetch(`${API_BASE}/api/v1/cases/${caseId}/slide/upload-url`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-User-Role": "pathologist"
-    },
-    body: JSON.stringify({
-      filename: file.name,
-      size_bytes: file.size,
-      content_type: file.type || "application/octet-stream"
-    })
-  });
+  const sessionKey = `og_upload_session_${caseId}`;
+  let upload_url: string = "";
+  let gcs_uri: string = "";
 
-  if (!urlRes.ok) {
-    let errDetail = urlRes.statusText;
+  // Check localStorage for active resumable upload session (Issue #413)
+  try {
+    const saved = localStorage.getItem(sessionKey);
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      if (parsed.fileName === file.name && parsed.fileSize === file.size && parsed.upload_url) {
+        upload_url = parsed.upload_url;
+        gcs_uri = parsed.gcs_uri;
+      }
+    }
+  } catch (_) {}
+
+  // 1. Request Signed Upload URL from FastAPI control plane if not cached
+  if (!upload_url) {
+    const urlRes = await fetch(`${API_BASE}/api/v1/cases/${caseId}/slide/upload-url`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-User-Role": "pathologist"
+      },
+      body: JSON.stringify({
+        filename: file.name,
+        size_bytes: file.size,
+        content_type: file.type || "application/octet-stream"
+      })
+    });
+
+    if (!urlRes.ok) {
+      let errDetail = urlRes.statusText;
+      try {
+        const body = await urlRes.json();
+        if (body.detail) errDetail = body.detail;
+      } catch (_) {}
+      throw new Error(`Failed to acquire direct upload URL (HTTP ${urlRes.status}): ${errDetail}`);
+    }
+
+    const data = await urlRes.json();
+    upload_url = data.upload_url;
+    gcs_uri = data.gcs_uri;
+
     try {
-      const body = await urlRes.json();
-      if (body.detail) errDetail = body.detail;
+      localStorage.setItem(sessionKey, JSON.stringify({
+        upload_url,
+        gcs_uri,
+        fileName: file.name,
+        fileSize: file.size,
+        startedAt: Date.now()
+      }));
     } catch (_) {}
-    throw new Error(`Failed to acquire direct upload URL (HTTP ${urlRes.status}): ${errDetail}`);
   }
-
-  const { upload_url, gcs_uri } = await urlRes.json();
 
   // 2. Upload file directly from browser to GCS bucket via Signed URL
   await new Promise<void>((resolve, reject) => {
@@ -123,8 +153,17 @@ export async function uploadSlideDirectToGCS(
   });
 
   if (!finalizeRes.ok) {
-    throw new Error("Failed to finalize slide registration in cloud");
+    let errDetail = finalizeRes.statusText;
+    try {
+      const b = await finalizeRes.json();
+      if (b.detail) errDetail = b.detail;
+    } catch (_) {}
+    throw new Error(`Failed to finalize slide registration in cloud: ${errDetail}`);
   }
+
+  try {
+    localStorage.removeItem(sessionKey);
+  } catch (_) {}
 
   return finalizeRes.json();
 }

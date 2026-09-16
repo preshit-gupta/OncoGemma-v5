@@ -409,8 +409,13 @@ def test_slide_rescan_attempt_monotonicity(client, db_session):
     db_session.commit()
 
     # Finalize slide re-upload
+    from app.core.config import settings
+    from app.core.gcs import upload_blob_from_bytes
+    blob_name = f"cases/{case_id}/rescan_slide.svs"
+    upload_blob_from_bytes(settings.GCS_RAW_BUCKET, blob_name, b"RESCAN_DATA", "application/octet-stream")
+
     req = SlideFinalizeRequest(
-        gcs_uri="gs://raw/rescan_slide.svs",
+        gcs_uri=f"gs://{settings.GCS_RAW_BUCKET}/{blob_name}",
         client_sha256="abc123rescan"
     )
     with patch("app.core.cloud_tasks.dispatch_stage_task"):

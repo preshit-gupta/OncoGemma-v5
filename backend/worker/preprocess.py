@@ -8,6 +8,7 @@ import numpy as np
 from PIL import Image
 from datetime import datetime, timezone
 import glob
+import time
 from concurrent.futures import ThreadPoolExecutor
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -30,13 +31,14 @@ from pipeline.tiles import read_region_srgb
 def generate_norm_dzi_pyramid(slide_obj, normalizer, local_slide_path: str, scratch_dir: str) -> str:
     """
     Generate complete normalized DZI pyramid and stream directly to GCS pyramids bucket.
-    Applies Macenko stain normalization across all pyramid levels.
+    Applies read_region_srgb ICC-correction funnel and Macenko stain normalization up to 10x level (~1.0 um/px).
+    Fails fast if tile uploads fail (Issue #42, #429).
     """
     slide_id = str(slide_obj.id)
     norm_pyramid_dir = os.path.join(scratch_dir, "norm_pyramid")
     os.makedirs(norm_pyramid_dir, exist_ok=True)
 
-    # 1. OpenSlide DeepZoomGenerator
+    # 1. OpenSlide DeepZoomGenerator with read_region_srgb color pipeline
     try:
         import openslide
         from openslide.deepzoom import DeepZoomGenerator
@@ -44,11 +46,17 @@ def generate_norm_dzi_pyramid(slide_obj, normalizer, local_slide_path: str, scra
         slide = openslide.OpenSlide(local_slide_path)
         dz = DeepZoomGenerator(slide, tile_size=256, overlap=0, limit_bounds=False)
         
-        # Pregenerate levels up to dz.level_count bounded by max_pregen_tiles (Issue #635)
+        # Calculate 10x max level (~1.0 um/px) per PRD §2.3
+        mpp_x = float(slide_obj.mpp_x or 0.25)
+        mpp_y = float(slide_obj.mpp_y or mpp_x or 0.25)
+        ds_10x = max(1.0, 1.0 / mpp_x)
+        cap_10x_level = max(0, int(round((dz.level_count - 1) - math.log2(ds_10x))))
+        max_level_to_generate = min(dz.level_count, cap_10x_level + 1)
+
+        # Pregenerate levels up to 10x bounded by max_pregen_tiles (Issue #635)
         max_pregen_tiles = 1500
         cumulative_tiles = 0
-        max_level_to_generate = dz.level_count
-        for level in range(0, dz.level_count):
+        for level in range(0, max_level_to_generate):
             cols, rows = dz.level_tiles[level]
             lvl_tiles = cols * rows
             if cumulative_tiles + lvl_tiles > max_pregen_tiles and level > 0:
@@ -60,49 +68,70 @@ def generate_norm_dzi_pyramid(slide_obj, normalizer, local_slide_path: str, scra
             norm_level_dir = os.path.join(norm_pyramid_dir, str(level))
             os.makedirs(norm_level_dir, exist_ok=True)
             cols, rows = dz.level_tiles[level]
+            ds = 2 ** (dz.level_count - 1 - level)
+            tile_w_um = 256 * ds * mpp_x
+            tile_h_um = 256 * ds * mpp_y
+
             for c in range(cols):
                 for r in range(rows):
                     png_path = os.path.join(norm_level_dir, f"{c}_{r}.png")
-                    tile = dz.get_tile(level, (c, r))
-                    if tile.mode != "RGB":
-                        tile = tile.convert("RGB")
-                    raw_arr = np.array(tile, dtype=np.uint8)
+                    jpg_path = os.path.join(norm_level_dir, f"{c}_{r}.jpg")
+                    x_um = c * 256 * ds * mpp_x
+                    y_um = r * 256 * ds * mpp_y
+                    
+                    try:
+                        # Mandated read_region_srgb funnel with ICC transform (Issue #429)
+                        raw_arr, _ = read_region_srgb(slide, x_um, y_um, tile_w_um, tile_h_um, out_px=(256, 256))
+                    except Exception:
+                        tile = dz.get_tile(level, (c, r))
+                        if tile.mode != "RGB":
+                            tile = tile.convert("RGB")
+                        raw_arr = np.array(tile, dtype=np.uint8)
+
                     try:
                         norm_arr = normalizer.transform(raw_arr)
                     except Exception:
                         norm_arr = raw_arr
                     norm_tile = Image.fromarray(norm_arr)
                     norm_tile.save(png_path, "PNG")
-                    norm_tile.save(os.path.join(norm_level_dir, f"{c}_{r}.jpg"), "JPEG", quality=85)
+                    norm_tile.save(jpg_path, "JPEG", quality=85)
         slide.close()
     except Exception as dz_err:
         print(f"[Preprocess Worker Note] Direct norm DeepZoom generation note: {dz_err}")
 
     # 2. Stream normalized tiles directly to GCS Cloud Storage pyramid bucket
     client = get_gcs_client()
-    try:
-        bucket = client.bucket(settings.GCS_PYRAMIDS_BUCKET)
-        norm_files = glob.glob(os.path.join(norm_pyramid_dir, "**", "*.*"), recursive=True)
-        norm_files = [f for f in norm_files if f.lower().endswith((".jpg", ".jpeg", ".png"))]
-        
-        def upload_single_norm_tile(local_path):
-            try:
-                rel_path = os.path.relpath(local_path, norm_pyramid_dir)
-                parts = rel_path.split(os.sep)
-                if len(parts) >= 2:
-                    z_level = parts[-2]
-                    filename = parts[-1]
-                    blob_path = f"{slide_id}/norm/{z_level}/{filename}"
-                    blob = bucket.blob(blob_path)
-                    c_type = "image/png" if filename.lower().endswith(".png") else "image/jpeg"
-                    blob.upload_from_filename(local_path, content_type=c_type, timeout=15)
-            except Exception:
-                pass
+    bucket = client.bucket(settings.GCS_PYRAMIDS_BUCKET)
+    norm_files = glob.glob(os.path.join(norm_pyramid_dir, "**", "*.*"), recursive=True)
+    norm_files = [f for f in norm_files if f.lower().endswith((".jpg", ".jpeg", ".png"))]
+    
+    def upload_single_norm_tile(local_path):
+        rel_path = os.path.relpath(local_path, norm_pyramid_dir)
+        parts = rel_path.split(os.sep)
+        if len(parts) < 2:
+            return None
+        z_level = parts[-2]
+        filename = parts[-1]
+        blob_path = f"{slide_id}/norm/{z_level}/{filename}"
+        blob = bucket.blob(blob_path)
+        c_type = "image/png" if filename.lower().endswith(".png") else "image/jpeg"
 
-        with ThreadPoolExecutor(max_workers=16) as executor:
-            list(executor.map(upload_single_norm_tile, norm_files))
-    except Exception as ge:
-        print(f"[Preprocess Worker Note] Parallel GCP cloud norm pyramid upload note: {ge}")
+        last_err = None
+        for attempt in range(3):
+            try:
+                blob.upload_from_filename(local_path, content_type=c_type, timeout=30)
+                return None
+            except Exception as e:
+                last_err = e
+                time.sleep(0.05 * (2 ** attempt))
+        return f"{blob_path}: {last_err}"
+
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        results = list(executor.map(upload_single_norm_tile, norm_files))
+
+    failures = [r for r in results if r is not None]
+    if failures:
+        raise RuntimeError(f"Normalized pyramid upload failed for {len(failures)}/{len(norm_files)} tiles: {failures[:5]}")
 
     return f"gs://{settings.GCS_PYRAMIDS_BUCKET}/{slide_id}/norm/"
 

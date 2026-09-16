@@ -8,6 +8,7 @@ import hashlib
 import tempfile
 import shutil
 import glob
+import time
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 from sqlalchemy import select
@@ -266,31 +267,40 @@ def generate_dzi_pyramid(filepath: str, output_dir: str) -> str:
 def upload_dzi_tree_to_gcs(dzi_files_dir: str, slide_id: str):
     """
     Save generated DZI tile tree directly to Google Cloud Storage pyramid bucket with zero local persistence.
+    Collects tile upload errors, retries with backoff, and raises RuntimeError if any tile fails (Issue #42).
     """
     client = get_gcs_client()
-    try:
-        bucket = client.bucket(settings.GCS_PYRAMIDS_BUCKET)
-        tile_files = glob.glob(os.path.join(dzi_files_dir, "**", "*.*"), recursive=True)
-        tile_files = [f for f in tile_files if f.lower().endswith((".jpg", ".jpeg", ".png"))]
-        
-        def upload_single_tile(local_path):
-            try:
-                rel_path = os.path.relpath(local_path, dzi_files_dir)
-                parts = rel_path.split(os.sep)
-                if len(parts) >= 2:
-                    z_level = parts[-2]
-                    filename = parts[-1]
-                    blob_path = f"{slide_id}/orig/{z_level}/{filename}"
-                    blob = bucket.blob(blob_path)
-                    c_type = "image/png" if filename.lower().endswith(".png") else "image/jpeg"
-                    blob.upload_from_filename(local_path, content_type=c_type, timeout=15)
-            except Exception:
-                pass
+    bucket = client.bucket(settings.GCS_PYRAMIDS_BUCKET)
+    tile_files = glob.glob(os.path.join(dzi_files_dir, "**", "*.*"), recursive=True)
+    tile_files = [f for f in tile_files if f.lower().endswith((".jpg", ".jpeg", ".png"))]
+    
+    def upload_single_tile(local_path):
+        rel_path = os.path.relpath(local_path, dzi_files_dir)
+        parts = rel_path.split(os.sep)
+        if len(parts) < 2:
+            return None
+        z_level = parts[-2]
+        filename = parts[-1]
+        blob_path = f"{slide_id}/orig/{z_level}/{filename}"
+        blob = bucket.blob(blob_path)
+        c_type = "image/png" if filename.lower().endswith(".png") else "image/jpeg"
 
-        with ThreadPoolExecutor(max_workers=16) as executor:
-            list(executor.map(upload_single_tile, tile_files))
-    except Exception as ge:
-        print(f"[Ingest Worker Note] Parallel GCP cloud pyramid upload note: {ge}")
+        last_err = None
+        for attempt in range(3):
+            try:
+                blob.upload_from_filename(local_path, content_type=c_type, timeout=30)
+                return None
+            except Exception as e:
+                last_err = e
+                time.sleep(0.05 * (2 ** attempt))
+        return f"{blob_path}: {last_err}"
+
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        results = list(executor.map(upload_single_tile, tile_files))
+
+    failures = [r for r in results if r is not None]
+    if failures:
+        raise RuntimeError(f"Pyramid upload failed for {len(failures)}/{len(tile_files)} tiles: {failures[:5]}")
 
 def run_ingest(stage_execution: StageExecution, session: Session) -> tuple[str, dict]:
     """
@@ -337,6 +347,16 @@ def run_ingest(stage_execution: StageExecution, session: Session) -> tuple[str, 
 
         if not os.path.exists(local_slide_path):
             raise FileNotFoundError(f"Original slide file not found in GCS for ingest stage in case {stage_execution.case_id} (URI: {gcs_uri_original})")
+
+        # Verify client SHA256 checksum if provided before de-identification (Issue #18)
+        client_checksum = slide_obj.checksum_sha256 or input_ref.get("client_sha256")
+        if client_checksum:
+            download_sha256 = calculate_sha256(local_slide_path)
+            if download_sha256.lower() != client_checksum.lower():
+                raise ValueError(
+                    f"Slide integrity verification failed: client checksum ({client_checksum}) "
+                    f"does not match downloaded GCS object checksum ({download_sha256})"
+                )
 
         # 1. De-identify and strip label and macro images before metadata extraction (Issue #37)
         was_stripped = strip_label_and_macro_images(local_slide_path)

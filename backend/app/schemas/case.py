@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from uuid import UUID
-from pydantic import BaseModel, field_serializer
+from pydantic import BaseModel, field_serializer, field_validator
 
 class CaseCreate(BaseModel):
     pass
@@ -32,6 +32,13 @@ class SlideUploadUrlResponse(BaseModel):
 class SlideFinalizeRequest(BaseModel):
     gcs_uri: str
     client_sha256: str | None = None
+
+    @field_validator("gcs_uri")
+    @classmethod
+    def validate_gcs_uri(cls, v: str) -> str:
+        if not v or not v.strip().startswith("gs://") or len(v.strip()) <= 5:
+            raise ValueError("gcs_uri must be a valid gs:// URI")
+        return v.strip()
 
 class SlideMppUpdateRequest(BaseModel):
     mpp_x: float

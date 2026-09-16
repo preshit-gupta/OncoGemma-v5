@@ -186,10 +186,13 @@ app.include_router(admin_router)
 @app.get("/health")
 @app.get("/api/health")
 @app.get("/healthz")
-def health_check():
-    try:
+async def health_check():
+    from starlette.concurrency import run_in_threadpool
+    def _ping():
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
+    try:
+        await run_in_threadpool(_ping)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

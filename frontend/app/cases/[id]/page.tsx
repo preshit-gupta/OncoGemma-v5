@@ -65,16 +65,23 @@ export default function CaseWorkspacePage({ params }: { params: { id: string } }
     return () => clearInterval(interval);
   }, [caseId]);
 
+  const getLatestStage = (stages: any[] | undefined, name: string) => {
+    if (!stages || !stages.length) return undefined;
+    const matching = stages.filter((s) => s.stage === name);
+    if (!matching.length) return undefined;
+    return matching.reduce((prev, curr) => ((curr.attempt || 1) > (prev.attempt || 1) ? curr : prev), matching[0]);
+  };
+
   // Controlled auto-advance: advances to highest active/ready stage
   useEffect(() => {
     if (!caseDetail?.stages) return;
     const stages = caseDetail.stages;
 
-    const prepStage = stages.find((s) => s.stage === "preprocess");
-    const triageStage = stages.find((s) => s.stage === "triage");
-    const mitosisStage = stages.find((s) => s.stage === "mitosis");
-    const gradingStage = stages.find((s) => s.stage === "grading");
-    const reportStage = stages.find((s) => s.stage === "report");
+    const prepStage = getLatestStage(stages, "preprocess");
+    const triageStage = getLatestStage(stages, "triage");
+    const mitosisStage = getLatestStage(stages, "mitosis");
+    const gradingStage = getLatestStage(stages, "grading");
+    const reportStage = getLatestStage(stages, "report");
 
     if (!hasUserNavigated) {
       if (reportStage && (reportStage.status === "running" || reportStage.status === "done" || reportStage.status === "confirmed" || reportStage.status === "awaiting_review")) {
@@ -92,10 +99,13 @@ export default function CaseWorkspacePage({ params }: { params: { id: string } }
   }, [caseDetail, hasUserNavigated]);
 
   const slide = caseDetail?.slides?.[0];
-  const ingestStage = caseDetail?.stages?.find((s) => s.stage === "ingest");
-  const preprocessStage = caseDetail?.stages?.find((s) => s.stage === "preprocess");
-  const qcStage = caseDetail?.stages?.find((s) => s.stage === "qc");
-  const triageStage = caseDetail?.stages?.find((s) => s.stage === "triage");
+  const ingestStage = getLatestStage(caseDetail?.stages, "ingest");
+  const preprocessStage = getLatestStage(caseDetail?.stages, "preprocess");
+  const qcStage = getLatestStage(caseDetail?.stages, "qc");
+  const triageStage = getLatestStage(caseDetail?.stages, "triage");
+  const mitosisStage = getLatestStage(caseDetail?.stages, "mitosis");
+  const gradingStage = getLatestStage(caseDetail?.stages, "grading");
+  const reportStage = getLatestStage(caseDetail?.stages, "report");
 
   const isIngestDone = ingestStage?.status === "completed" || ingestStage?.status === "done";
   const isIngestRunning = ingestStage?.status === "running" || ingestStage?.status === "queued" || !ingestStage;
@@ -136,7 +146,6 @@ export default function CaseWorkspacePage({ params }: { params: { id: string } }
 
   const isPreprocessDone = preprocessStage?.status === "done" || preprocessStage?.status === "confirmed" || preprocessStage?.status === "awaiting_review";
   const isTriageDone = triageStage?.status === "done" || triageStage?.status === "confirmed" || triageStage?.status === "awaiting_review";
-  const mitosisStage = caseDetail?.stages?.find((s) => s.stage === "mitosis");
   const isMitosisDone = mitosisStage?.status === "done" || mitosisStage?.status === "confirmed" || mitosisStage?.status === "awaiting_review";
 
   const handleRetryIngest = async () => {
@@ -285,7 +294,13 @@ export default function CaseWorkspacePage({ params }: { params: { id: string } }
           {isPreprocessDone && activeStage === "preprocess" && (
             <div className="flex items-center space-x-2 border-r border-slate-700 pr-3 mr-1">
               <button
-                onClick={handleReprocessPreprocess}
+                onClick={() => {
+                  const hasDownstream = triageStage || mitosisStage || gradingStage || reportStage;
+                  if (hasDownstream && !window.confirm("Warning: Re-processing this slide will invalidate downstream triage, mitosis, grading, and report results. Are you sure you want to proceed?")) {
+                    return;
+                  }
+                  handleReprocessPreprocess();
+                }}
                 disabled={actionLoading}
                 className="px-3 py-1.5 bg-amber-600/90 hover:bg-amber-600 text-white rounded-lg transition text-xs font-semibold flex items-center space-x-1.5 shadow border border-amber-500/50"
                 title="Re-run Macenko stain normalization & QC gate"
@@ -294,7 +309,12 @@ export default function CaseWorkspacePage({ params }: { params: { id: string } }
                 <span>Re-Process Slide</span>
               </button>
 
-              {isQcFailed ? (
+              {preprocessStage?.status === "confirmed" ? (
+                <span className="px-3 py-1.5 bg-emerald-950/80 text-emerald-400 border border-emerald-500/40 rounded-lg text-xs font-semibold flex items-center space-x-1.5 shadow">
+                  <CheckCircle2 className="w-3.5 h-3.5" />
+                  <span>Slide Quality Confirmed</span>
+                </span>
+              ) : isQcFailed ? (
                 <button
                   onClick={() => setOverrideModalOpen(true)}
                   disabled={actionLoading}
@@ -322,7 +342,13 @@ export default function CaseWorkspacePage({ params }: { params: { id: string } }
           {isTriageDone && activeStage === "triage" && (
             <div className="flex items-center space-x-2 border-r border-slate-700 pr-3 mr-1">
               <button
-                onClick={handleReprocessTriage}
+                onClick={() => {
+                  const hasDownstream = mitosisStage || gradingStage || reportStage;
+                  if (hasDownstream && !window.confirm("Warning: Re-assessing hotspots will invalidate downstream mitosis, grading, and report results. Are you sure you want to proceed?")) {
+                    return;
+                  }
+                  handleReprocessTriage();
+                }}
                 disabled={actionLoading}
                 className="px-3 py-1.5 bg-amber-600/90 hover:bg-amber-600 text-white rounded-lg transition text-xs font-semibold flex items-center space-x-1.5 shadow border border-amber-500/50"
                 title="Re-run Vertex AI Path Foundation screening and hotspot assessment"
@@ -331,15 +357,22 @@ export default function CaseWorkspacePage({ params }: { params: { id: string } }
                 <span>Re-Assess Hotspots</span>
               </button>
 
-              <button
-                onClick={handleApproveTriage}
-                disabled={actionLoading}
-                className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg transition text-xs font-semibold flex items-center space-x-1.5 shadow border border-emerald-400/50"
-                title="Confirm hotspots & proceed to Step 4 (v4.3 Mitosis Counting)"
-              >
-                <CheckCircle2 className="w-3.5 h-3.5" />
-                <span>Confirm Hotspots & Proceed to Step 4</span>
-              </button>
+              {triageStage?.status === "confirmed" ? (
+                <span className="px-3 py-1.5 bg-emerald-950/80 text-emerald-400 border border-emerald-500/40 rounded-lg text-xs font-semibold flex items-center space-x-1.5 shadow">
+                  <CheckCircle2 className="w-3.5 h-3.5" />
+                  <span>Hotspots Confirmed</span>
+                </span>
+              ) : (
+                <button
+                  onClick={handleApproveTriage}
+                  disabled={actionLoading}
+                  className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg transition text-xs font-semibold flex items-center space-x-1.5 shadow border border-emerald-400/50"
+                  title="Confirm hotspots & proceed to Step 4 (v4.3 Mitosis Counting)"
+                >
+                  <CheckCircle2 className="w-3.5 h-3.5" />
+                  <span>Confirm Hotspots & Proceed to Step 4</span>
+                </button>
+              )}
             </div>
           )}
 
@@ -347,7 +380,13 @@ export default function CaseWorkspacePage({ params }: { params: { id: string } }
           {isMitosisDone && activeStage === "mitosis" && (
             <div className="flex items-center space-x-2 border-r border-slate-700 pr-3 mr-1">
               <button
-                onClick={handleReprocessMitosis}
+                onClick={() => {
+                  const hasDownstream = gradingStage || reportStage;
+                  if (hasDownstream && !window.confirm("Warning: Re-counting mitoses will invalidate downstream Nottingham grading and report results. Are you sure you want to proceed?")) {
+                    return;
+                  }
+                  handleReprocessMitosis();
+                }}
                 disabled={actionLoading}
                 className="px-3 py-1.5 bg-amber-600/90 hover:bg-amber-600 text-white rounded-lg transition text-xs font-semibold flex items-center space-x-1.5 shadow border border-amber-500/50"
                 title="Re-run mitosis detection and virtual HPF placement"
@@ -356,15 +395,22 @@ export default function CaseWorkspacePage({ params }: { params: { id: string } }
                 <span>Re-Count Mitoses</span>
               </button>
 
-              <button
-                onClick={handleApproveMitosis}
-                disabled={actionLoading}
-                className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg transition text-xs font-semibold flex items-center space-x-1.5 shadow border border-emerald-400/50"
-                title="Confirm mitoses & proceed to Step 5 (v4.4 Nottingham Grading)"
-              >
-                <CheckCircle2 className="w-3.5 h-3.5" />
-                <span>Confirm Mitoses & Proceed to Step 5</span>
-              </button>
+              {mitosisStage?.status === "confirmed" ? (
+                <span className="px-3 py-1.5 bg-emerald-950/80 text-emerald-400 border border-emerald-500/40 rounded-lg text-xs font-semibold flex items-center space-x-1.5 shadow">
+                  <CheckCircle2 className="w-3.5 h-3.5" />
+                  <span>Mitoses Confirmed</span>
+                </span>
+              ) : (
+                <button
+                  onClick={handleApproveMitosis}
+                  disabled={actionLoading}
+                  className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg transition text-xs font-semibold flex items-center space-x-1.5 shadow border border-emerald-400/50"
+                  title="Confirm mitoses & proceed to Step 5 (v4.4 Nottingham Grading)"
+                >
+                  <CheckCircle2 className="w-3.5 h-3.5" />
+                  <span>Confirm Mitoses & Proceed to Step 5</span>
+                </button>
+              )}
             </div>
           )}
 
