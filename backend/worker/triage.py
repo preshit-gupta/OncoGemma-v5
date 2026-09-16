@@ -303,6 +303,7 @@ def run_triage(stage_execution: StageExecution, session: Session) -> tuple[str, 
         if os_slide:
             try:
                 thumb = os_slide.get_thumbnail((nx, ny)).convert("RGB")
+                thumb = thumb.resize((nx, ny), Image.Resampling.BILINEAR)
                 arr = np.array(thumb).astype(float)
                 r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
                 is_glass = (r > 215) & (g > 215) & (b > 215)
@@ -343,24 +344,48 @@ def run_triage(stage_execution: StageExecution, session: Session) -> tuple[str, 
 
         gcs_parquet_path = f"cases/{case_id}/triage/pathfoundation_{model_version}.parquet"
         cached_embeddings = None
+        cached_cells = None
         try:
             cached_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, gcs_parquet_path)
             reader = pa.BufferReader(cached_bytes)
             t = pq.read_table(reader)
-            cached_embeddings = t.to_pandas().values.astype(np.float32)
+            df = t.to_pandas()
+            if "ix" in df.columns and "iy" in df.columns and "emb" in df.columns:
+                cached_cells = list(zip(df["ix"].astype(int), df["iy"].astype(int)))
+                cached_embeddings = np.stack(df["emb"].values).astype(np.float32)
+            else:
+                cached_embeddings = df.values.astype(np.float32)
             endpoint_calls_made = 0
             print(f"[Triage Worker] Loaded cached Path Foundation embeddings from GCS ({cached_embeddings.shape})")
         except Exception:
             cached_embeddings = None
+            cached_cells = None
 
         if not sample_patches and not settings.USE_MOCK_VERTEX_AI and cached_embeddings is None:
             raise RuntimeError(f"Could not extract real 224px @ 1.0 mpp patches from slide for case {case_id}")
 
         patch_count = max(len(sample_patches), 1)
 
+        def save_parquet_cache(embs, cells):
+            try:
+                records = []
+                for idx, emb in enumerate(embs):
+                    c_ix, c_iy = cells[idx] if idx < len(cells) else (0, 0)
+                    records.append({"ix": c_ix, "iy": c_iy, "emb": emb.tolist()})
+                df_to_save = pd.DataFrame(records)
+                table = pa.Table.from_pandas(df_to_save)
+                pq.write_table(table, parquet_path)
+                with open(parquet_path, "rb") as pf:
+                    upload_blob_from_bytes(settings.GCS_ARTIFACTS_BUCKET, gcs_parquet_path, pf.read(), "application/octet-stream")
+                print(f"[Triage Worker] Successfully cached {len(embs)} embeddings to {gcs_parquet_path}")
+            except Exception as pe:
+                print(f"[Triage Worker Parquet Save Note] {pe}")
+
         # 3. Call Live Vertex AI Path Foundation or use cached embeddings
         if cached_embeddings is not None:
             embeddings = cached_embeddings
+            if cached_cells:
+                sampled_cells = cached_cells
             endpoint_calls_made = 0
         elif settings.VERTEX_PATH_FOUNDATION_ENDPOINT_ID and not settings.USE_MOCK_VERTEX_AI:
             client = VertexPathFoundationClient(
@@ -371,23 +396,11 @@ def run_triage(stage_execution: StageExecution, session: Session) -> tuple[str, 
             )
             embeddings = client.predict_embeddings(patch_count=patch_count, patches=sample_patches, batch_size=16)
             endpoint_calls_made = patch_count
-            try:
-                table = pa.Table.from_pandas(pd.DataFrame(embeddings))
-                pq.write_table(table, parquet_path)
-                with open(parquet_path, "rb") as pf:
-                    upload_blob_from_bytes(settings.GCS_ARTIFACTS_BUCKET, gcs_parquet_path, pf.read(), "application/octet-stream")
-            except Exception as pe:
-                print(f"[Triage Worker Parquet Save Note] {pe}")
+            save_parquet_cache(embeddings, sampled_cells)
         elif settings.USE_MOCK_VERTEX_AI:
             embeddings = asyncio.run(mock_vertex_ai_endpoint(patch_count))
             endpoint_calls_made = patch_count
-            try:
-                table = pa.Table.from_pandas(pd.DataFrame(embeddings))
-                pq.write_table(table, parquet_path)
-                with open(parquet_path, "rb") as pf:
-                    upload_blob_from_bytes(settings.GCS_ARTIFACTS_BUCKET, gcs_parquet_path, pf.read(), "application/octet-stream")
-            except Exception as pe:
-                print(f"[Triage Worker Parquet Save Note] {pe}")
+            save_parquet_cache(embeddings, sampled_cells)
         else:
             raise RuntimeError("Vertex AI Path Foundation Endpoint ID is required when USE_MOCK_VERTEX_AI is false!")
 

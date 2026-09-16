@@ -1,7 +1,8 @@
 {
   "model_name": "probe_v1",
-  "dataset": "PatchCamelyon (PCam)",
-  "train_auc": 0.965,
+  "dataset": "synthetic_dev",
+  "provenance": "synthetic_development_probe",
   "pf_model_version": "path-foundation-v1",
-  "embedding_dim": 384
+  "embedding_dim": 384,
+  "weights_sha256": "3093ac4158633a05b8c570f479c2d448d0bf25beeb2fce77b90641ac75409734"
 }

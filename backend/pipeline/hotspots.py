@@ -36,6 +36,10 @@ def extract_hotspots(
     if not np.any(valid_mask):
         return []
 
+    # If no cell meets the probability threshold, zero-tumor case -> return empty proposal set (#81)
+    if np.nanmax(prob_grid) < prob_threshold:
+        return []
+
     prob_filled = np.nan_to_num(prob_grid, nan=0.0)
     smoothed_prob = gaussian_filter(prob_filled, sigma=sigma)
     smoothed_weight = gaussian_filter(valid_mask.astype(float), sigma=sigma)
@@ -97,12 +101,14 @@ def extract_hotspots(
                 "exclude_reason": None
             })
 
-    # If local maxima yielded fewer than max_hotspots, fill from top overall tissue points
+    # If local maxima yielded fewer than max_hotspots, fill only from tissue cells reaching secondary threshold (#81)
+    secondary_threshold = max(0.20, prob_threshold * 0.75)
     if len(hotspots) < max_hotspots:
         tissue_coords = np.argwhere(valid_mask)
-        tissue_coords = sorted(tissue_coords, key=lambda c: smoothed[c[0], c[1]], reverse=True)
+        valid_coords = [c for c in tissue_coords if smoothed[c[0], c[1]] >= secondary_threshold]
+        valid_coords = sorted(valid_coords, key=lambda c: smoothed[c[0], c[1]], reverse=True)
 
-        for r, c in tissue_coords:
+        for r, c in valid_coords:
             if len(hotspots) >= max_hotspots:
                 break
             too_close = False
@@ -122,6 +128,7 @@ def extract_hotspots(
                     cy_um + half_box_um
                 )
                 final_coords = [[round(x, 2), round(y, 2)] for x, y in site_box.exterior.coords]
+                is_lowconf = smoothed[r, c] < prob_threshold
                 hotspots.append({
                     "id": f"hs_{len(hotspots) + 1:02d}",
                     "_r": r,
@@ -130,7 +137,7 @@ def extract_hotspots(
                     "area_mm2": round((half_box_um * 2) ** 2 / 1e6, 3),
                     "prob_mean": round(float(smoothed[r, c]), 3),
                     "prob_max": round(float(prob_filled[r, c]), 3),
-                    "source": "model",
+                    "source": "model_lowconf" if is_lowconf else "model",
                     "excluded": False,
                     "exclude_reason": None
                 })

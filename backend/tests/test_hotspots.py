@@ -65,10 +65,10 @@ def test_extract_hotspots_spatial_separation():
     ny, nx = 50, 50
     prob_grid = np.zeros((ny, nx), dtype=np.float32)
 
-    # Concentrated hotspot at center
-    prob_grid[25, 25] = 0.99
-    prob_grid[24, 25] = 0.98
-    prob_grid[25, 24] = 0.97
+    y, x = np.ogrid[:ny, :nx]
+    for cy, cx, val in [(25, 25, 0.99), (10, 10, 0.95), (10, 40, 0.92), (40, 10, 0.89), (40, 40, 0.85)]:
+        dist = np.sqrt((y - cy)**2 + (x - cx)**2)
+        prob_grid[dist <= 2] = val
 
     cfg = {
         "sigma": 1.0,

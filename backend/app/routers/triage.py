@@ -314,9 +314,9 @@ def get_hotspot_thumbnail(
     if not slide_obj and case_obj and getattr(case_obj, "slides", None):
         slide_obj = case_obj.slides[0]
     if not slide_obj:
-        slide_obj = db.scalars(select(Slide)).first()
+        raise HTTPException(status_code=404, detail=f"Slide not found for case {case_id}")
 
-    if not slide_obj or not getattr(slide_obj, "mpp_x", None) or not getattr(slide_obj, "mpp_y", None):
+    if not getattr(slide_obj, "mpp_x", None) or not getattr(slide_obj, "mpp_y", None):
         raise HTTPException(status_code=400, detail="Slide is missing valid MPP (status='needs_mpp'). Cannot extract patch.")
 
     mpp_x = float(slide_obj.mpp_x)
@@ -529,7 +529,11 @@ def confirm_triage(payload: TriageConfirmPayload, db: Session = Depends(get_db))
             out_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{payload.case_id}/triage/output.json")
             machine_hotspots = json.loads(out_bytes.decode("utf-8")).get("hotspots", [])
     except Exception as e:
-        print(f"[Triage Confirm Note] Could not load hotspots from GCS: {e}")
+        print(f"[Triage Confirm Error] Could not load hotspots from GCS: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Failed to load triage machine output from storage: {e}. Confirmation aborted."
+        )
 
     edits = stage_exec.review_edits or []
     effective_hotspots = apply_edit_ops(machine_hotspots, edits)

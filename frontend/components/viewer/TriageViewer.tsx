@@ -19,7 +19,10 @@ import {
   Layers, 
   Activity,
   RotateCcw,
-  MapPin
+  MapPin,
+  PenTool,
+  Edit3,
+  Check
 } from "lucide-react";
 import { API_BASE, retryStage } from "@/lib/api";
 import { OpenSeadragonViewer } from "./OpenSeadragonViewer";
@@ -93,6 +96,9 @@ export function TriageViewer({
   const [noInvasiveTumor, setNoInvasiveTumor] = useState<boolean>(false);
   const [excludeReasonInput, setExcludeReasonInput] = useState<{ [id: string]: string }>({});
   const [deletedHotspotIds, setDeletedHotspotIds] = useState<string[]>([]);
+  const [roiDrawType, setRoiDrawType] = useState<"box" | "polygon">("box");
+  const [activePolygonPoints, setActivePolygonPoints] = useState<[number, number][]>([]);
+  const [editingVertexHotspotId, setEditingVertexHotspotId] = useState<string | null>(null);
 
 
   const fetchTriageData = async (silent: boolean = false) => {
@@ -164,10 +170,31 @@ export function TriageViewer({
   const handleDeleteHotspot = (id: string) => {
     setDeletedHotspotIds((prev) => Array.from(new Set([...prev, id])));
     setHotspotsList((prev) => prev.filter((h) => h.id !== id));
+    if (selectedHotspotId === id) setSelectedHotspotId(null);
+    if (previewHotspot?.id === id) setPreviewHotspot(null);
+    if (editingVertexHotspotId === id) setEditingVertexHotspotId(null);
   };
 
+  const computePolygonAreaMm2 = (pts: number[][]): number => {
+    if (!pts || pts.length < 3) return 0.36;
+    let area = 0;
+    const n = pts.length;
+    for (let i = 0; i < n; i++) {
+      const j = (i + 1) % n;
+      area += pts[i][0] * pts[j][1];
+      area -= pts[j][0] * pts[i][1];
+    }
+    return Number((Math.abs(area) / 2.0 / 1e6).toFixed(3));
+  };
 
   const handleAddRoiFromClick = (x_um: number, y_um: number) => {
+    if (roiDrawType === "polygon") {
+      const pt: [number, number] = [Number(x_um.toFixed(2)), Number(y_um.toFixed(2))];
+      setActivePolygonPoints((prev) => [...prev, pt]);
+      return;
+    }
+
+    // Default 600x600 µm standardized HPF box
     const half_um = 300.0;
     const polygon = [
       [Number((x_um - half_um).toFixed(2)), Number((y_um - half_um).toFixed(2))],
@@ -195,11 +222,116 @@ export function TriageViewer({
     setPreviewHotspot(newHs);
   };
 
-  const handleSaveDraftEdits = async () => {
-    try {
+  const handleFinishCustomPolygon = () => {
+    if (activePolygonPoints.length < 3) {
+      alert("A polygon requires at least 3 points. Click points on the slide to outline the tumor focus.");
+      return;
+    }
+
+    const closed = [...activePolygonPoints];
+    if (
+      closed[0][0] !== closed[closed.length - 1][0] ||
+      closed[0][1] !== closed[closed.length - 1][1]
+    ) {
+      closed.push([closed[0][0], closed[0][1]]);
+    }
+
+    const areaMm2 = computePolygonAreaMm2(closed);
+    const userCount = hotspotsList.filter((h) => h.id.startsWith("user_")).length;
+    const newId = `user_${(userCount + 1).toString().padStart(2, "0")}`;
+    const newHs: HotspotItem = {
+      id: newId,
+      polygon_um: closed,
+      area_mm2: areaMm2 > 0 ? areaMm2 : 0.36,
+      prob_mean: 0.88,
+      prob_max: 0.95,
+      source: "pathologist_added",
+      excluded: false
+    };
+
+    setHotspotsList((prev) => [...prev, newHs]);
+    setActivePolygonPoints([]);
+    setIsAddingRoiMode(false);
+    setSelectedHotspotId(newId);
+    setPreviewHotspot(newHs);
+  };
+
+  const handleUpdateVertex = (hotspotId: string, vertexIndex: number, newX: number, newY: number) => {
+    setHotspotsList((prev) =>
+      prev.map((h) => {
+        if (h.id !== hotspotId) return h;
+        const newCoords = h.polygon_um.map((pt, idx) =>
+          idx === vertexIndex ? [Number(newX.toFixed(2)), Number(newY.toFixed(2))] : pt
+        );
+        if (vertexIndex === 0 && newCoords.length > 1) {
+          newCoords[newCoords.length - 1] = [newCoords[0][0], newCoords[0][1]];
+        }
+        const area = computePolygonAreaMm2(newCoords);
+        return {
+          ...h,
+          polygon_um: newCoords,
+          area_mm2: area > 0 ? area : h.area_mm2,
+          source: h.source === "pathologist_added" ? "pathologist_added" : "pathologist_modified"
+        };
+      })
+    );
+  };
+
+  const handleAddVertex = (hotspotId: string, afterIndex: number) => {
+    setHotspotsList((prev) =>
+      prev.map((h) => {
+        if (h.id !== hotspotId) return h;
+        const pts = [...h.polygon_um];
+        const nextIdx = (afterIndex + 1) % pts.length;
+        const midX = (pts[afterIndex][0] + pts[nextIdx][0]) / 2.0;
+        const midY = (pts[afterIndex][1] + pts[nextIdx][1]) / 2.0;
+        pts.splice(afterIndex + 1, 0, [Number(midX.toFixed(2)), Number(midY.toFixed(2))]);
+        const area = computePolygonAreaMm2(pts);
+        return {
+          ...h,
+          polygon_um: pts,
+          area_mm2: area > 0 ? area : h.area_mm2,
+          source: h.source === "pathologist_added" ? "pathologist_added" : "pathologist_modified"
+        };
+      })
+    );
+  };
+
+  const handleRemoveVertex = (hotspotId: string, vertexIndex: number) => {
+    setHotspotsList((prev) =>
+      prev.map((h) => {
+        if (h.id !== hotspotId) return h;
+        if (h.polygon_um.length <= 4) {
+          alert("Polygon must have at least 3 vertices (plus closing point).");
+          return h;
+        }
+        const pts = h.polygon_um.filter((_, idx) => idx !== vertexIndex);
+        if (vertexIndex === 0 && pts.length > 1) {
+          pts[pts.length - 1] = [pts[0][0], pts[0][1]];
+        }
+        const area = computePolygonAreaMm2(pts);
+        return {
+          ...h,
+          polygon_um: pts,
+          area_mm2: area > 0 ? area : h.area_mm2,
+          source: h.source === "pathologist_added" ? "pathologist_added" : "pathologist_modified"
+        };
+      })
+    );
+  };
+
+  const handleSaveDraftEdits = async (options?: { suppressSubmittingToggle?: boolean }) => {
+    if (!options?.suppressSubmittingToggle) {
       setSubmitting(true);
+    }
+    try {
+      const machineIds = (data?.machine_hotspots || []).map((m: any) => m.id);
+      const survivingIds = new Set(hotspotsList.map((h) => h.id));
+      const missingMachineIds = machineIds.filter((mid) => !survivingIds.has(mid));
+      const allDeletedIds = Array.from(new Set([...deletedHotspotIds, ...missingMachineIds]));
+
       const edits = [
-        ...deletedHotspotIds.map((id) => ({ op: "delete", id })),
+        ...allDeletedIds.map((id) => ({ op: "delete", id })),
         ...hotspotsList.map((h) => {
           if (h.excluded) {
             return { op: "exclude", id: h.id, reason: h.exclude_reason };
@@ -220,20 +352,27 @@ export function TriageViewer({
       });
 
       if (!res.ok) {
-        throw new Error("Failed to save draft edits");
+        const errJson = await res.json().catch(() => ({}));
+        throw new Error(errJson.detail || `Failed to save draft edits (Status: ${res.status})`);
       }
+      return true;
     } catch (err: any) {
-
-      alert(`Error saving edits: ${err.message}`);
+      if (!options?.suppressSubmittingToggle) {
+        alert(`Error saving edits: ${err.message}`);
+      }
+      throw err;
     } finally {
-      setSubmitting(false);
+      if (!options?.suppressSubmittingToggle) {
+        setSubmitting(false);
+      }
     }
   };
 
   const handleConfirmStage = async () => {
     try {
       setSubmitting(true);
-      await handleSaveDraftEdits();
+      setError(null);
+      await handleSaveDraftEdits({ suppressSubmittingToggle: true });
 
       const res = await fetch(`${API_BASE}/api/v1/stages/triage/confirm`, {
         method: "POST",
@@ -249,10 +388,14 @@ export function TriageViewer({
       });
 
       if (!res.ok) {
-        throw new Error("Failed to confirm stage execution");
+        const errJson = await res.json().catch(() => ({}));
+        throw new Error(errJson.detail || `Failed to confirm stage execution (Status: ${res.status})`);
       }
 
       const json = await res.json();
+      if (data) {
+        setData({ ...data, status: "confirmed" });
+      }
       if (onAdvanceToMitosis) {
         onAdvanceToMitosis();
       } else if (onRefreshCase) {
@@ -323,17 +466,52 @@ export function TriageViewer({
 
         {/* Interactive Click-to-Add ROI Floating Banner */}
         {isAddingRoiMode && (
-          <div className="absolute top-4 left-1/2 -translate-x-1/2 z-30 bg-sky-950/95 border-2 border-sky-400 rounded-full px-5 py-2.5 shadow-2xl flex items-center space-x-3 backdrop-blur animate-pulse">
-            <Crosshair className="w-4 h-4 text-sky-400 animate-spin" />
-            <span className="text-xs font-bold text-sky-100">
-              Click anywhere on the Whole Slide Image to add a custom 10× HPF candidate ROI
+          <div className="absolute top-4 left-1/2 -translate-x-1/2 z-30 bg-sky-950/95 border-2 border-sky-400 rounded-2xl px-5 py-2.5 shadow-2xl flex flex-col md:flex-row items-center space-y-2 md:space-y-0 md:space-x-3 backdrop-blur">
+            <div className="flex items-center space-x-2">
+              <Crosshair className="w-4 h-4 text-sky-400 animate-spin" />
+              <div className="flex items-center bg-slate-900 border border-slate-700 rounded-lg p-0.5 text-xs font-bold">
+                <button
+                  onClick={() => { setRoiDrawType("box"); setActivePolygonPoints([]); }}
+                  className={`px-2.5 py-1 rounded ${roiDrawType === "box" ? "bg-sky-600 text-white" : "text-slate-400 hover:text-white"}`}
+                >
+                  600µm Box
+                </button>
+                <button
+                  onClick={() => { setRoiDrawType("polygon"); }}
+                  className={`px-2.5 py-1 rounded flex items-center space-x-1 ${roiDrawType === "polygon" ? "bg-sky-600 text-white" : "text-slate-400 hover:text-white"}`}
+                >
+                  <PenTool className="w-3 h-3" />
+                  <span>Custom Polygon</span>
+                </button>
+              </div>
+            </div>
+
+            <span className="text-xs font-medium text-sky-100">
+              {roiDrawType === "box"
+                ? "Click anywhere on the slide to place a standardized 600×600 µm HPF box"
+                : `Click points on slide to outline focus (${activePolygonPoints.length} vertices added)`}
             </span>
-            <button
-              onClick={() => setIsAddingRoiMode(false)}
-              className="px-2.5 py-0.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-full text-xs font-bold transition border border-slate-700"
-            >
-              Cancel
-            </button>
+
+            <div className="flex items-center space-x-2">
+              {roiDrawType === "polygon" && activePolygonPoints.length >= 3 && (
+                <button
+                  onClick={handleFinishCustomPolygon}
+                  className="px-3 py-1 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-bold transition flex items-center space-x-1 shadow-md"
+                >
+                  <Check className="w-3 h-3" />
+                  <span>Finish Polygon</span>
+                </button>
+              )}
+              <button
+                onClick={() => {
+                  setIsAddingRoiMode(false);
+                  setActivePolygonPoints([]);
+                }}
+                className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg text-xs font-bold transition border border-slate-700"
+              >
+                Cancel
+              </button>
+            </div>
           </div>
         )}
 
@@ -511,21 +689,36 @@ export function TriageViewer({
 
                     <div className="flex items-center space-x-1.5">
                       {!hs.excluded && (
-                        <button
-                          onClick={() => {
-                            setSelectedHotspotId(null);
-                            setTimeout(() => setSelectedHotspotId(hs.id), 50);
-                          }}
-                          className={`px-2 py-0.5 rounded text-[11px] font-semibold flex items-center space-x-1 transition ${
-                            isSelected
-                              ? "bg-sky-600 text-white shadow-md shadow-sky-600/30"
-                              : "bg-slate-800 hover:bg-sky-600/30 text-sky-400 border border-slate-700"
-                          }`}
-                          title="Highlight hotspot location on slide with crosshair reticle"
-                        >
-                          <Crosshair className="w-3 h-3" />
-                          <span>Locate</span>
-                        </button>
+                        <>
+                          <button
+                            onClick={() => {
+                              setSelectedHotspotId(null);
+                              setTimeout(() => setSelectedHotspotId(hs.id), 50);
+                            }}
+                            className={`px-2 py-0.5 rounded text-[11px] font-semibold flex items-center space-x-1 transition ${
+                              isSelected
+                                ? "bg-sky-600 text-white shadow-md shadow-sky-600/30"
+                                : "bg-slate-800 hover:bg-sky-600/30 text-sky-400 border border-slate-700"
+                            }`}
+                            title="Highlight hotspot location on slide with crosshair reticle"
+                          >
+                            <Crosshair className="w-3 h-3" />
+                            <span>Locate</span>
+                          </button>
+
+                          <button
+                            onClick={() => setEditingVertexHotspotId(editingVertexHotspotId === hs.id ? null : hs.id)}
+                            className={`px-2 py-0.5 rounded text-[11px] font-semibold flex items-center space-x-1 transition ${
+                              editingVertexHotspotId === hs.id
+                                ? "bg-amber-600 text-white shadow-md shadow-amber-600/30"
+                                : "bg-slate-800 hover:bg-amber-600/30 text-amber-400 border border-slate-700"
+                            }`}
+                            title="Edit polygon boundary vertices"
+                          >
+                            <Edit3 className="w-3 h-3" />
+                            <span>Vertices</span>
+                          </button>
+                        </>
                       )}
 
                       {hs.excluded ? (
@@ -546,6 +739,51 @@ export function TriageViewer({
                       )}
                     </div>
                   </div>
+
+                  {/* Vertex Editor Panel */}
+                  {editingVertexHotspotId === hs.id && !hs.excluded && (
+                    <div className="p-2.5 bg-slate-950 border border-amber-500/40 rounded-lg mb-2 space-y-2">
+                      <div className="flex items-center justify-between text-[11px] font-bold text-amber-300">
+                        <span>Polygon Vertices ({hs.polygon_um?.length || 0} pts)</span>
+                        <button
+                          onClick={() => handleAddVertex(hs.id, 0)}
+                          className="px-1.5 py-0.5 bg-amber-950 hover:bg-amber-900 border border-amber-700 text-[10px] text-amber-200 rounded font-semibold"
+                        >
+                          + Add Vertex
+                        </button>
+                      </div>
+                      <div className="max-h-36 overflow-y-auto space-y-1.5 pr-1 font-mono text-[10px]">
+                        {(hs.polygon_um || []).map((pt, vIdx) => (
+                          <div key={vIdx} className="flex items-center space-x-1 bg-slate-900/90 p-1 rounded border border-slate-800">
+                            <span className="text-slate-500 w-4 text-center">#{vIdx}</span>
+                            <div className="flex-1 flex items-center space-x-1">
+                              <span className="text-slate-400">X:</span>
+                              <input
+                                type="number"
+                                value={pt[0]}
+                                onChange={(e) => handleUpdateVertex(hs.id, vIdx, parseFloat(e.target.value) || 0, pt[1])}
+                                className="w-16 bg-slate-950 border border-slate-700 rounded px-1 text-slate-200 text-[10px]"
+                              />
+                              <span className="text-slate-400">Y:</span>
+                              <input
+                                type="number"
+                                value={pt[1]}
+                                onChange={(e) => handleUpdateVertex(hs.id, vIdx, pt[0], parseFloat(e.target.value) || 0)}
+                                className="w-16 bg-slate-950 border border-slate-700 rounded px-1 text-slate-200 text-[10px]"
+                              />
+                            </div>
+                            <button
+                              onClick={() => handleRemoveVertex(hs.id, vIdx)}
+                              className="text-slate-600 hover:text-rose-400 p-0.5"
+                              title="Delete vertex"
+                            >
+                              <X className="w-3 h-3" />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
 
                   {/* 10x Microscopic Patch Preview */}
                   {!hs.excluded && (
@@ -643,16 +881,23 @@ export function TriageViewer({
 
             <button
               onClick={handleConfirmStage}
-              disabled={submitting || (activeHotspotsCount === 0 && !noInvasiveTumor)}
+              disabled={submitting || data?.status === "confirmed" || (activeHotspotsCount === 0 && !noInvasiveTumor)}
               className={`flex-1 py-2.5 rounded-lg text-xs font-bold flex items-center justify-center space-x-2 shadow-lg transition ${
-                activeHotspotsCount > 0 || noInvasiveTumor
+                data?.status === "confirmed"
+                  ? "bg-emerald-950/60 border border-emerald-800/80 text-emerald-300 cursor-not-allowed"
+                  : activeHotspotsCount > 0 || noInvasiveTumor
                   ? "bg-sky-600 hover:bg-sky-500 text-white shadow-sky-600/20"
                   : "bg-slate-800 text-slate-500 cursor-not-allowed"
               }`}
-              title="Confirm 10 High-Power Fields and advance to Stage 4 (Mitosis Counting)"
+              title={data?.status === "confirmed" ? "Stage already confirmed" : "Confirm 10 High-Power Fields and advance to Stage 4 (Mitosis Counting)"}
             >
               {submitting ? (
                 <Loader2 className="w-4 h-4 animate-spin" />
+              ) : data?.status === "confirmed" ? (
+                <>
+                  <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                  <span>Stage Confirmed</span>
+                </>
               ) : (
                 <>
                   <span>Confirm & Move to Stage 4</span>

@@ -286,8 +286,9 @@ def test_config_and_eval_doc_threshold_alignment():
     """
     Validates issue #129: configs/mitosis.yaml thresholds match documentation in models/detector/EVAL.md.
     """
-    config_path = "configs/mitosis.yaml"
-    eval_path = "models/detector/EVAL.md"
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+    config_path = os.path.join(repo_root, "configs/mitosis.yaml")
+    eval_path = os.path.join(repo_root, "models/detector/EVAL.md")
 
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
