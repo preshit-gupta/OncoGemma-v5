@@ -89,11 +89,28 @@ def read_region_srgb(
                 best_level = slide.get_best_level_for_downsample(target_downsample)
 
             level_ds = slide.level_downsamples[best_level] if hasattr(slide, "level_downsamples") else 1.0
-            w_px_lvl = max(1, int(round(w_px_0 / level_ds)))
-            h_px_lvl = max(1, int(round(h_px_0 / level_ds)))
 
             safe_x = max(0, min(dim_w - 1, x_px_0))
             safe_y = max(0, min(dim_h - 1, y_px_0))
+
+            # Clamp requested region to actual available slide dimensions at level 0
+            intersect_w_0 = max(1, min(w_px_0, dim_w - safe_x))
+            intersect_h_0 = max(1, min(h_px_0, dim_h - safe_y))
+
+            # Bound level pixels to level dimensions to prevent multi-gigabyte memory spikes
+            lvl_dim_w, lvl_dim_h = (dim_w, dim_h)
+            if hasattr(slide, "level_dimensions") and best_level < len(slide.level_dimensions):
+                lvl_dim_w, lvl_dim_h = slide.level_dimensions[best_level]
+
+            safe_x_lvl = int(round(safe_x / level_ds))
+            safe_y_lvl = int(round(safe_y / level_ds))
+            w_px_lvl = max(1, min(int(round(intersect_w_0 / level_ds)), max(1, lvl_dim_w - safe_x_lvl)))
+            h_px_lvl = max(1, min(int(round(intersect_h_0 / level_ds)), max(1, lvl_dim_h - safe_y_lvl)))
+
+            # Cap maximum raster buffer passed to OpenSlide (never allocate > 4096 px per dimension)
+            w_px_lvl = min(w_px_lvl, 4096)
+            h_px_lvl = min(h_px_lvl, 4096)
+
             pil_tile = slide.read_region((safe_x, safe_y), best_level, (w_px_lvl, h_px_lvl))
             if pil_tile.mode != "RGB":
                 pil_tile = pil_tile.convert("RGB")

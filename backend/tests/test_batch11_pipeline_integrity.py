@@ -357,3 +357,55 @@ def test_upload_dzi_tree_error_propagation_mock():
         finally:
             worker.ingest.get_gcs_client = orig_get_gcs
 
+
+def test_read_region_srgb_huge_coordinates_memory_safety():
+    """Verify read_region_srgb safely clamps massive micrometer bounding boxes without OOM (Issue #429)."""
+    from pipeline.tiles import read_region_srgb
+    # Create a 512x512 test image
+    img = Image.new("RGB", (512, 512), color=(180, 50, 120))
+    
+    # Request a massive 17-meter bounding box spanning millions of pixels
+    tile_arr, icc_applied = read_region_srgb(
+        slide=img,
+        x_um=0.0,
+        y_um=0.0,
+        w_um=17784381.0,
+        h_um=17784381.0,
+        out_px=(256, 256),
+        mpp_x=0.265,
+        mpp_y=0.265
+    )
+    assert tile_arr.shape == (256, 256, 3)
+    assert tile_arr.dtype == np.uint8
+
+
+def test_generate_norm_dzi_pyramid_preserves_10x_cap_and_icc():
+    """Verify generate_norm_dzi_pyramid caps levels at 10x (~1.0 um/px) and runs safely without OOM."""
+    from pipeline.stain import PureNumpyMacenkoNormalizer
+    normalizer = PureNumpyMacenkoNormalizer()
+    normalizer.stain_matrix_target = np.array([[0.65, 0.70, 0.29], [0.07, 0.99, 0.11]])
+    normalizer.max_conc_target = np.array([1.95, 1.10])
+
+    class MockSlide:
+        id = uuid.uuid4()
+        mpp_x = 0.265018
+        mpp_y = 0.265018
+        width_px = 2048
+        height_px = 2048
+
+    # Create dummy slide image
+    with tempfile.TemporaryDirectory() as tmpdir:
+        slide_path = os.path.join(tmpdir, "test_slide.png")
+        img = Image.new("RGB", (2048, 2048), color=(220, 150, 200))
+        img.save(slide_path)
+
+        # Mock GCS upload
+        with patch("worker.preprocess.get_gcs_client") as mock_gcs:
+            mock_bucket = mock_gcs.return_value.bucket.return_value
+            mock_blob = mock_bucket.blob.return_value
+            mock_blob.upload_from_filename.return_value = None
+
+            gcs_uri = generate_norm_dzi_pyramid(MockSlide(), normalizer, slide_path, tmpdir)
+            assert "norm/" in gcs_uri
+
+

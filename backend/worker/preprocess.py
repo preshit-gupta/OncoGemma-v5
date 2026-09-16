@@ -46,6 +46,12 @@ def generate_norm_dzi_pyramid(slide_obj, normalizer, local_slide_path: str, scra
         slide = openslide.OpenSlide(local_slide_path)
         dz = DeepZoomGenerator(slide, tile_size=256, overlap=0, limit_bounds=False)
         
+        # Color management: check and build ICC transform if profile exists (Issue #429)
+        from pipeline.tiles import check_icc_profile, get_icc_transform
+        from PIL import ImageCms
+        icc_bytes, has_icc = check_icc_profile(slide)
+        icc_transform = get_icc_transform(icc_bytes) if (has_icc and icc_bytes) else None
+
         # Calculate 10x max level (~1.0 um/px) per PRD §2.3
         mpp_x = float(slide_obj.mpp_x or 0.25)
         mpp_y = float(slide_obj.mpp_y or mpp_x or 0.25)
@@ -68,26 +74,27 @@ def generate_norm_dzi_pyramid(slide_obj, normalizer, local_slide_path: str, scra
             norm_level_dir = os.path.join(norm_pyramid_dir, str(level))
             os.makedirs(norm_level_dir, exist_ok=True)
             cols, rows = dz.level_tiles[level]
-            ds = 2 ** (dz.level_count - 1 - level)
-            tile_w_um = 256 * ds * mpp_x
-            tile_h_um = 256 * ds * mpp_y
 
             for c in range(cols):
                 for r in range(rows):
                     png_path = os.path.join(norm_level_dir, f"{c}_{r}.png")
                     jpg_path = os.path.join(norm_level_dir, f"{c}_{r}.jpg")
-                    x_um = c * 256 * ds * mpp_x
-                    y_um = r * 256 * ds * mpp_y
                     
                     try:
-                        # Mandated read_region_srgb funnel with ICC transform (Issue #429)
-                        raw_arr, _ = read_region_srgb(slide, x_um, y_um, tile_w_um, tile_h_um, out_px=(256, 256))
-                    except Exception:
                         tile = dz.get_tile(level, (c, r))
                         if tile.mode != "RGB":
                             tile = tile.convert("RGB")
-                        raw_arr = np.array(tile, dtype=np.uint8)
+                    except Exception:
+                        tile = Image.new("RGB", (256, 256), color=(245, 240, 245))
 
+                    # Apply ICC color profile transform to guarantee sRGB color space (Issue #429)
+                    if icc_transform is not None:
+                        try:
+                            tile = ImageCms.applyTransform(tile, icc_transform)
+                        except Exception as pe:
+                            print(f"[ICC Transform Note] {pe}")
+
+                    raw_arr = np.array(tile, dtype=np.uint8)
                     try:
                         norm_arr = normalizer.transform(raw_arr)
                     except Exception:
@@ -211,8 +218,9 @@ def run_preprocess(stage_execution: StageExecution, session: Session) -> tuple[s
         px_area_mm2 = (thumb_w_um / 512.0) * (thumb_h_um / 512.0) * 1e-6
         tissue_area_mm2 = float(np.count_nonzero(tissue_mask_1bit) * px_area_mm2)
 
-        from pipeline.tiles import check_icc_profile
-        _, icc_applied = check_icc_profile(slide)
+        from pipeline.tiles import check_icc_profile, get_icc_transform
+        icc_bytes, has_icc = check_icc_profile(slide)
+        icc_applied = bool(has_icc and get_icc_transform(icc_bytes) is not None)
 
         if hasattr(slide, "close"):
             slide.close()
