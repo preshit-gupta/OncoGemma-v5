@@ -502,7 +502,7 @@ def test_confirm_triage_gating_and_mitosis_attempt_monotonicity(client, db_sessi
     se_triage.status = "awaiting_review"
     db_session.commit()
 
-    with patch("app.routers.triage.download_blob_as_bytes", return_value=b'{"hotspots": []}'), \
+    with patch("app.routers.triage.download_blob_as_bytes", return_value=b'{"hotspots": [{"id": "hs_01", "polygon_um": [[10,10],[20,10],[20,20],[10,20]]}]}'), \
          patch("app.core.cloud_tasks.dispatch_stage_task"):
         res_ok = client.post(
             "/api/v1/stages/triage/confirm",

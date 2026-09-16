@@ -77,10 +77,13 @@ class VertexPathFoundationClient:
 
         try:
             from google.cloud import aiplatform
-            aiplatform.init(
-                project=self.project_id,
-                location=self.location
-            )
+            init_kwargs = {
+                "project": self.project_id,
+                "location": self.location,
+            }
+            if self.api_endpoint:
+                init_kwargs["api_endpoint"] = self.api_endpoint
+            aiplatform.init(**init_kwargs)
 
             endpoint = aiplatform.Endpoint(
                 endpoint_name=self.endpoint_id,
@@ -110,7 +113,22 @@ class VertexPathFoundationClient:
                 body = json.dumps(payload).encode("utf-8")
                 headers = {"Content-Type": "application/json"}
                 
-                resp = endpoint.raw_predict(body=body, headers=headers)
+                # Retry logic on transient 429/503 errors (#453, #571)
+                max_retries = 3
+                resp = None
+                for attempt_idx in range(max_retries + 1):
+                    try:
+                        resp = endpoint.raw_predict(body=body, headers=headers)
+                        break
+                    except Exception as exc:
+                        is_transient = any(code in str(exc) for code in ("429", "503", "ResourceExhausted", "ServiceUnavailable"))
+                        if is_transient and attempt_idx < max_retries:
+                            sleep_s = (1.5 ** attempt_idx) + (0.1 * (attempt_idx + 1))
+                            print(f"[Vertex AI Path Foundation Retry] Transient error ({exc}). Retrying in {sleep_s:.2f}s...")
+                            time.sleep(sleep_s)
+                        else:
+                            raise
+
                 resp_json = resp.json()
                 predictions = resp_json.get("predictions", [])
                 
@@ -229,6 +247,8 @@ def run_triage(stage_execution: StageExecution, session: Session) -> tuple[str, 
         raise ValueError(f"Slide not found for case {case_id}")
 
     slide_obj = session.get(Slide, str(slide_id))
+    if not slide_obj:
+        raise ValueError(f"Slide record '{slide_id}' not found in database for case '{case_id}'.")
     config_dir = "configs"
     triage_cfg, pricing_cfg = load_config(config_dir)
 
@@ -436,12 +456,13 @@ def run_triage(stage_execution: StageExecution, session: Session) -> tuple[str, 
             for ix, iy in tissue_coords:
                 prob_grid[iy, ix] = avg_path_prob
 
-        # Extract Hotspot ROIs
+        # Extract Hotspot ROIs (#82, #572)
         hotspots = extract_hotspots(
             prob_grid=prob_grid,
             grid_origin_um=grid_origin_um,
-            stride_um=stride_um,
-            cfg=triage_cfg["hotspot_extraction"]
+            stride_um=(stride_x_um, stride_y_um),
+            cfg=triage_cfg["hotspot_extraction"],
+            slide_dimensions_um=(width_um, height_um)
         )
 
         # Render Viridis heatmap overlay PNG
@@ -563,7 +584,7 @@ def run_triage(stage_execution: StageExecution, session: Session) -> tuple[str, 
                     )
 
             hs["thumbnail_uri"] = f"gs://{settings.GCS_ARTIFACTS_BUCKET}/cases/{case_id}/triage/patches/{hs_id}_10x_norm.png"
-            hs["thumbnail_url"] = get_gcs_artifact_direct_url(f"{settings.GCS_ARTIFACTS_BUCKET}/cases/{case_id}/triage/patches/{hs_id}_10x_norm.png")
+            hs["thumbnail_url"] = get_gcs_artifact_direct_url(f"cases/{case_id}/triage/patches/{hs_id}_10x_norm.png")
 
         if os_slide and hasattr(os_slide, "close"):
             os_slide.close()
@@ -574,11 +595,11 @@ def run_triage(stage_execution: StageExecution, session: Session) -> tuple[str, 
 
         output_result = {
             "heatmap_png_uri": f"gs://{settings.GCS_ARTIFACTS_BUCKET}/cases/{case_id}/triage/heatmap_triage.png",
-            "heatmap_direct_url": get_gcs_artifact_direct_url(f"{settings.GCS_ARTIFACTS_BUCKET}/cases/{case_id}/triage/heatmap_triage.png"),
+            "heatmap_direct_url": get_gcs_artifact_direct_url(f"cases/{case_id}/triage/heatmap_triage.png"),
             "prob_grid_uri": f"gs://{settings.GCS_ARTIFACTS_BUCKET}/cases/{case_id}/triage/prob_grid.npy",
             "grid": {
                 "origin_um": list(grid_origin_um),
-                "stride_um": stride_um,
+                "stride_um": [float(stride_x_um), float(stride_y_um)],
                 "nx": nx,
                 "ny": ny
             },
@@ -607,7 +628,7 @@ def run_triage(stage_execution: StageExecution, session: Session) -> tuple[str, 
         # Set status to awaiting_review for pathologist confirmation gate
         stage_execution.status = "awaiting_review"
 
-        # Audit log
+        # Audit log (#521, #522)
         audit_invoc = AuditEvent(
             case_id=str(case_id),
             actor="worker_triage",
@@ -615,6 +636,7 @@ def run_triage(stage_execution: StageExecution, session: Session) -> tuple[str, 
             stage="triage",
             payload={
                 "model_id": "path_foundation",
+                "endpoint": getattr(settings, "VERTEX_PATH_FOUNDATION_ENDPOINT_ID", "") or "path_foundation_mock",
                 "version": model_version,
                 "request_count": endpoint_calls_made,
                 "latency_ms": int(wall_time_s * 1000),

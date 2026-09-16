@@ -398,6 +398,9 @@ def get_gcs_artifact_direct_url(relative_gcs_path: str) -> str:
     Resolves a gs:// or relative artifact path to a direct Cloud CDN / GCS URL or API endpoint.
     """
     path = relative_gcs_path.replace("gs://", "").lstrip("/")
+    if settings.GCS_ARTIFACTS_BUCKET and path.startswith(f"{settings.GCS_ARTIFACTS_BUCKET}/"):
+        path = path[len(settings.GCS_ARTIFACTS_BUCKET)+1:]
+
     if settings.CDN_BASE_URL:
         return f"{settings.CDN_BASE_URL.rstrip('/')}/{path}"
     

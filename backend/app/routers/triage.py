@@ -6,7 +6,7 @@ import tempfile
 import shutil
 import threading
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Optional, Literal
 import numpy as np
 from PIL import Image
 from fastapi import APIRouter, Depends, HTTPException, status, Response, Query
@@ -45,9 +45,47 @@ def to_uuid(val: Any) -> uuid.UUID:
         return val
 
 
+def compute_polygon_area_mm2(coords: list[list[float]]) -> float:
+    """
+    Computes polygon area in square millimeters from micrometer coordinates [[x, y], ...].
+    Uses the Shoelace formula.
+    """
+    if not coords or len(coords) < 3:
+        return 0.0
+    pts = np.array(coords, dtype=float)
+    x = pts[:, 0]
+    y = pts[:, 1]
+    area_um2 = 0.5 * np.abs(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1)))
+    return round(float(area_um2 / 1e6), 4)
+
+
+def coordinates_differ(poly1: list[list[float]], poly2: list[list[float]], tol_um: float = 1.0) -> bool:
+    """
+    Checks if two polygon coordinate lists differ by more than tol_um.
+    """
+    try:
+        a1 = np.array(poly1, dtype=float)
+        a2 = np.array(poly2, dtype=float)
+        if a1.shape != a2.shape:
+            return True
+        return bool(np.max(np.abs(a1 - a2)) > tol_um)
+    except Exception:
+        return True
+
+
+class TriageEditOp(BaseModel):
+    op: Literal["add", "modify", "exclude", "delete"]
+    id: Optional[str] = None
+    polygon_um: Optional[list[list[float]]] = None
+    reason: Optional[str] = None
+    area_mm2: Optional[float] = None
+    prob_mean: Optional[float] = None
+    prob_max: Optional[float] = None
+
+
 class TriageEditsPayload(BaseModel):
     case_id: str
-    edits: list[dict[str, Any]] # RFC-6902 style edit operations
+    edits: list[TriageEditOp]
 
 
 class TriageConfirmPayload(BaseModel):
@@ -56,30 +94,54 @@ class TriageConfirmPayload(BaseModel):
     reviewed_by: str = "pathologist_01"
 
 
-def apply_edit_ops(machine_hotspots: list[dict], edits: list[dict]) -> list[dict]:
+def apply_edit_ops(machine_hotspots: list[dict], edits: list[Any]) -> list[dict]:
     """
     Applies RFC-6902 style diff operations to machine output hotspots.
-    Idempotent and order-stable.
+    Idempotent, order-stable, and collision-proof.
     """
     hotspots_dict = {h["id"]: dict(h) for h in machine_hotspots}
+    user_counter = 1
 
-    for op in edits:
+    for raw_op in edits:
+        op = raw_op.model_dump() if hasattr(raw_op, "model_dump") else (raw_op.dict() if hasattr(raw_op, "dict") else dict(raw_op))
         action = op.get("op")
         hid = op.get("id")
 
         if action == "modify" and hid in hotspots_dict:
-            if "polygon_um" in op:
-                hotspots_dict[hid]["polygon_um"] = op["polygon_um"]
-                hotspots_dict[hid]["source"] = "pathologist_modified"
+            new_poly = op.get("polygon_um")
+            if new_poly:
+                orig_poly = hotspots_dict[hid].get("polygon_um", [])
+                if coordinates_differ(orig_poly, new_poly):
+                    hotspots_dict[hid]["polygon_um"] = new_poly
+                    hotspots_dict[hid]["source"] = "pathologist_modified"
+                    hotspots_dict[hid]["area_mm2"] = compute_polygon_area_mm2(new_poly)
+                else:
+                    # Unchanged coordinates preserve original source (#75)
+                    hotspots_dict[hid]["polygon_um"] = new_poly
 
         elif action == "add":
-            new_id = hid or f"user_{len(hotspots_dict)+1:02d}"
+            poly = op.get("polygon_um", [])
+            # Reject degenerate/empty polygons (#95)
+            if not poly or len(poly) < 3:
+                continue
+
+            # Collision-proof ROI ID (#741, #714)
+            new_id = hid
+            if not new_id or new_id.startswith("hs_") or new_id in hotspots_dict:
+                while f"user_roi_{user_counter:02d}" in hotspots_dict:
+                    user_counter += 1
+                new_id = f"user_roi_{user_counter:02d}"
+                user_counter += 1
+
+            calc_area = compute_polygon_area_mm2(poly)
+            area_val = op.get("area_mm2") if op.get("area_mm2") is not None else calc_area
+
             hotspots_dict[new_id] = {
                 "id": new_id,
-                "polygon_um": op.get("polygon_um", []),
-                "area_mm2": op.get("area_mm2", 1.0),
-                "prob_mean": op.get("prob_mean", 1.0),
-                "prob_max": op.get("prob_max", 1.0),
+                "polygon_um": poly,
+                "area_mm2": area_val,
+                "prob_mean": op.get("prob_mean"),  # None for pathologist additions (#95)
+                "prob_max": op.get("prob_max"),    # None for pathologist additions (#95)
                 "source": "pathologist_added",
                 "excluded": False,
                 "exclude_reason": None
@@ -125,20 +187,30 @@ def get_triage_data(case_id: str, db: Session = Depends(get_db)):
     output_ref = stage_exec.output_ref or ""
     machine_output = {}
 
-    try:
-        if output_ref and output_ref.startswith("gs://"):
-            b_name, bl_name = parse_gcs_uri(output_ref)
-            out_bytes = download_blob_as_bytes(b_name, bl_name)
-            machine_output = json.loads(out_bytes.decode("utf-8"))
-        else:
-            out_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/triage/output.json")
-            machine_output = json.loads(out_bytes.decode("utf-8"))
-    except Exception as e:
-        print(f"[Triage Router Note] Could not fetch machine output from GCS: {e}")
+    if stage_exec.status in ("queued", "running"):
+        # Attempt isolation: do not read stale outputs from previous attempts (#568)
+        machine_hotspots = []
+        effective_hotspots = []
+        edits = stage_exec.review_edits or []
+    else:
+        try:
+            if output_ref and output_ref.startswith("gs://"):
+                b_name, bl_name = parse_gcs_uri(output_ref)
+                out_bytes = download_blob_as_bytes(b_name, bl_name)
+                machine_output = json.loads(out_bytes.decode("utf-8"))
+            else:
+                out_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/triage/output.json")
+                machine_output = json.loads(out_bytes.decode("utf-8"))
+        except Exception as e:
+            # Storage failure on completed/awaiting_review stage (#91)
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"Failed to load triage machine output from storage: {e}"
+            )
 
-    edits = stage_exec.review_edits or []
-    machine_hotspots = machine_output.get("hotspots", [])
-    effective_hotspots = apply_edit_ops(machine_hotspots, edits)
+        edits = stage_exec.review_edits or []
+        machine_hotspots = machine_output.get("hotspots", [])
+        effective_hotspots = apply_edit_ops(machine_hotspots, edits)
 
     heatmap_url = f"/api/v1/stages/triage/{case_id}/heatmap"
     if settings.CDN_BASE_URL:
@@ -282,8 +354,8 @@ def generate_synthetic_microscopic_patch(mag: str, stain: str, seed_str: str) ->
 def get_hotspot_thumbnail(
     case_id: str, 
     hotspot_id: str, 
-    mag: str = "10x",
-    stain: str = "norm",
+    mag: Literal["10x", "20x", "40x"] = "10x",
+    stain: Literal["norm", "orig"] = "norm",
     cx: Optional[float] = Query(None),
     cy: Optional[float] = Query(None),
     db: Session = Depends(get_db)
@@ -292,20 +364,10 @@ def get_hotspot_thumbnail(
     Extracts and streams a calibrated microscopic RGB patch centered on the specified hotspot.
     Supports real-time magnification switching (10x, 20x, 40x) and stain normalization toggling (norm, orig).
     """
-    patch_blob = f"cases/{case_id}/triage/patches/{hotspot_id}_{mag}_{stain}.png"
-    try:
-        thumb_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, patch_blob)
-        return Response(content=thumb_bytes, media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
-    except Exception:
-        pass
-
-    # Fast fallback for legacy 10x norm thumbnail
-    if mag == "10x" and stain == "norm":
-        try:
-            thumb_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/triage/patches/{hotspot_id}_thumb.png")
-            return Response(content=thumb_bytes, media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
-        except Exception:
-            pass
+    if mag not in ("10x", "20x", "40x"):
+        raise HTTPException(status_code=400, detail=f"Invalid mag '{mag}'. Must be '10x', '20x', or '40x'.")
+    if stain not in ("norm", "orig"):
+        raise HTTPException(status_code=400, detail=f"Invalid stain '{stain}'. Must be 'norm' or 'orig'.")
 
     # Lookup Case and Slide
     case_uid = to_uuid(case_id)
@@ -324,37 +386,68 @@ def get_hotspot_thumbnail(
 
     cx_um = None
     cy_um = None
+    is_user_edited = False
 
-    if cx is not None and cy is not None:
-        cx_um = float(cx)
-        cy_um = float(cy)
+    actual_cx = None if (cx is None or hasattr(cx, "default")) else cx
+    actual_cy = None if (cy is None or hasattr(cy, "default")) else cy
+
+    if actual_cx is not None and actual_cy is not None:
+        cx_um = float(actual_cx)
+        cy_um = float(actual_cy)
+        is_user_edited = True
     else:
-        try:
-            out_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/triage/output.json")
-            tdata = json.loads(out_bytes.decode("utf-8"))
-            target_hs = next((h for h in tdata.get("hotspots", []) if h["id"] == hotspot_id), None)
-            if target_hs and "polygon_um" in target_hs:
-                poly = np.array(target_hs["polygon_um"])
-                cx_um = float(poly[:, 0].mean())
-                cy_um = float(poly[:, 1].mean())
-        except Exception:
-            pass
+        # Check review edits FIRST (#573, #701)
+        st_obj = db.scalars(
+            select(StageExecution).where(
+                StageExecution.case_id == case_id,
+                StageExecution.stage == "triage"
+            ).order_by(StageExecution.attempt.desc())
+        ).first()
 
-    if (cx_um is None or cy_um is None) and case_obj and hasattr(case_obj, "stage_executions"):
-        st_obj = next((s for s in case_obj.stage_executions if s.stage == "triage"), None)
         if st_obj and st_obj.review_edits:
             for ed in st_obj.review_edits:
                 if ed.get("id") == hotspot_id and "polygon_um" in ed:
                     poly = np.array(ed["polygon_um"])
-                    cx_um = float(poly[:, 0].mean())
-                    cy_um = float(poly[:, 1].mean())
-                    break
+                    if len(poly) > 0:
+                        cx_um = float(poly[:, 0].mean())
+                        cy_um = float(poly[:, 1].mean())
+                        is_user_edited = True
+                        break
 
+        # If not in review_edits, check machine output
+        if cx_um is None or cy_um is None:
+            try:
+                out_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/triage/output.json")
+                tdata = json.loads(out_bytes.decode("utf-8"))
+                target_hs = next((h for h in tdata.get("hotspots", []) if h["id"] == hotspot_id), None)
+                if target_hs and "polygon_um" in target_hs:
+                    poly = np.array(target_hs["polygon_um"])
+                    if len(poly) > 0:
+                        cx_um = float(poly[:, 0].mean())
+                        cy_um = float(poly[:, 1].mean())
+            except Exception:
+                pass
+
+    # Unknown hotspot ID must return 404 (#734)
     if cx_um is None or cy_um is None:
-        width_px = float(getattr(slide_obj, "width_px", 20000) or 20000)
-        height_px = float(getattr(slide_obj, "height_px", 20000) or 20000)
-        cx_um = width_px * mpp_x * 0.5
-        cy_um = height_px * mpp_y * 0.5
+        raise HTTPException(status_code=404, detail=f"Hotspot {hotspot_id} not found on case {case_id}")
+
+    # If NOT user-edited, attempt fast path from pre-generated GCS static patch
+    patch_blob = f"cases/{case_id}/triage/patches/{hotspot_id}_{mag}_{stain}.png"
+    if not is_user_edited:
+        try:
+            thumb_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, patch_blob)
+            return Response(content=thumb_bytes, media_type="image/png", headers={"Cache-Control": "private, max-age=3600"})
+        except Exception:
+            pass
+
+        # Fast fallback for legacy 10x norm thumbnail
+        if mag == "10x" and stain == "norm":
+            try:
+                thumb_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/triage/patches/{hotspot_id}_thumb.png")
+                return Response(content=thumb_bytes, media_type="image/png", headers={"Cache-Control": "private, max-age=3600"})
+            except Exception:
+                pass
 
     cx_px = int(cx_um / mpp_x)
     cy_px = int(cy_um / mpp_y)
@@ -447,18 +540,19 @@ def get_hotspot_thumbnail(
     if extracted_bytes is None:
         extracted_bytes = generate_synthetic_microscopic_patch(mag, stain, f"{case_id}_{hotspot_id}_{mag}_{stain}")
 
-    # Cache to GCS for all future requests
-    try:
-        upload_blob_from_bytes(
-            settings.GCS_ARTIFACTS_BUCKET,
-            patch_blob,
-            extracted_bytes,
-            "image/png"
-        )
-    except Exception as up_e:
-        print(f"[Thumbnail GCS Cache Note] {up_e}")
+    # Cache to GCS if not user-edited
+    if not is_user_edited:
+        try:
+            upload_blob_from_bytes(
+                settings.GCS_ARTIFACTS_BUCKET,
+                patch_blob,
+                extracted_bytes,
+                "image/png"
+            )
+        except Exception as up_e:
+            print(f"[Thumbnail GCS Cache Note] {up_e}")
 
-    return Response(content=extracted_bytes, media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
+    return Response(content=extracted_bytes, media_type="image/png", headers={"Cache-Control": "private, max-age=3600"})
 
 
 @router.post("/edits")
@@ -479,10 +573,21 @@ def save_triage_edits(payload: TriageEditsPayload, db: Session = Depends(get_db)
             detail=f"Triage stage execution not found for case {payload.case_id}"
         )
 
-    stage_exec.review_edits = payload.edits
+    # Reject edits if stage is already confirmed (#93)
+    if stage_exec.status == "confirmed":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Triage stage for case {payload.case_id} is already confirmed and immutable."
+        )
+
+    edits_dict = [
+        e.model_dump() if hasattr(e, "model_dump") else (e.dict() if hasattr(e, "dict") else dict(e))
+        for e in payload.edits
+    ]
+    stage_exec.review_edits = edits_dict
     
     audit = AuditEvent(
-        case_id=payload.case_id,
+        case_id=str(payload.case_id),
         actor="pathologist",
         event_type="review_edit",
         stage="triage",
@@ -538,14 +643,22 @@ def confirm_triage(payload: TriageConfirmPayload, db: Session = Depends(get_db))
     edits = stage_exec.review_edits or []
     effective_hotspots = apply_edit_ops(machine_hotspots, edits)
 
-    # Delete any prior confirmed hotspots for this case
-    db.query(Hotspot).filter(Hotspot.case_id == payload.case_id).delete()
+    # Zero-tumor guardrail: if 0 active hotspots, must explicitly specify no_invasive_tumor=True (#92)
+    active_hotspots = [h for h in effective_hotspots if not h.get("excluded", False)]
+    if len(active_hotspots) == 0 and not payload.no_invasive_tumor:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="No active hotspots remaining. Pathologist must explicitly flag no_invasive_tumor=True to confirm zero tumor on this slide."
+        )
+
+    # Delete any prior confirmed hotspots for this case safely (#700)
+    db.query(Hotspot).filter(Hotspot.case_id == str(payload.case_id)).delete(synchronize_session=False)
 
     # Persist effective hotspots to DB
     for hs in effective_hotspots:
         hotspot_row = Hotspot(
             id=hs["id"],
-            case_id=payload.case_id,
+            case_id=str(payload.case_id),
             stage_execution_id=str(stage_exec.id),
             polygon_um=hs["polygon_um"],
             area_mm2=hs.get("area_mm2"),
@@ -590,9 +703,8 @@ def confirm_triage(payload: TriageConfirmPayload, db: Session = Depends(get_db))
     )
     db.add(next_exec)
 
-
     audit = AuditEvent(
-        case_id=payload.case_id,
+        case_id=str(payload.case_id),
         actor=payload.reviewed_by,
         event_type="stage_confirmed",
         stage="triage",

@@ -2,6 +2,7 @@ import os
 import uuid
 import tempfile
 import numpy as np
+from unittest.mock import patch
 from PIL import Image
 import pytest
 from fastapi.testclient import TestClient
@@ -51,75 +52,77 @@ def test_slide_upload_invalid_extension():
 
 def test_slide_finalize_cross_case_phi_isolation():
     """Verify slide finalize enforces strict URI prefix and blob existence (Issue #18)."""
-    with client:
-        resp_case = client.post("/api/v1/cases", headers={"X-User-Role": "pathologist"})
-        created_id = resp_case.json()["id"]
+    with patch("app.core.cloud_tasks.dispatch_stage_task"):
+        with client:
+            resp_case = client.post("/api/v1/cases", headers={"X-User-Role": "pathologist"})
+            created_id = resp_case.json()["id"]
 
-        # 1. Reject URI from other case
-        other_case_id = str(uuid.uuid4())
-        bad_uri = f"gs://{settings.GCS_RAW_BUCKET}/cases/{other_case_id}/slide.svs"
-        resp_bad = client.post(
-            f"/api/v1/cases/{created_id}/slide/finalize",
-            json={"gcs_uri": bad_uri},
-            headers={"X-User-Role": "pathologist"}
-        )
-        assert resp_bad.status_code == 400
-        assert "Invalid gcs_uri" in resp_bad.json()["detail"]
+            # 1. Reject URI from other case
+            other_case_id = str(uuid.uuid4())
+            bad_uri = f"gs://{settings.GCS_RAW_BUCKET}/cases/{other_case_id}/slide.svs"
+            resp_bad = client.post(
+                f"/api/v1/cases/{created_id}/slide/finalize",
+                json={"gcs_uri": bad_uri},
+                headers={"X-User-Role": "pathologist"}
+            )
+            assert resp_bad.status_code == 400
+            assert "Invalid gcs_uri" in resp_bad.json()["detail"]
 
-        # 2. Reject non-existent blob even if under correct case
-        fake_uri = f"gs://{settings.GCS_RAW_BUCKET}/cases/{created_id}/non_existent_slide.svs"
-        resp_missing = client.post(
-            f"/api/v1/cases/{created_id}/slide/finalize",
-            json={"gcs_uri": fake_uri},
-            headers={"X-User-Role": "pathologist"}
-        )
-        assert resp_missing.status_code == 404
-        assert "Raw slide object does not exist" in resp_missing.json()["detail"]
+            # 2. Reject non-existent blob even if under correct case
+            fake_uri = f"gs://{settings.GCS_RAW_BUCKET}/cases/{created_id}/non_existent_slide.svs"
+            resp_missing = client.post(
+                f"/api/v1/cases/{created_id}/slide/finalize",
+                json={"gcs_uri": fake_uri},
+                headers={"X-User-Role": "pathologist"}
+            )
+            assert resp_missing.status_code == 404
+            assert "Raw slide object does not exist" in resp_missing.json()["detail"]
 
-        # 3. Accept valid URI when blob actually exists
-        real_blob_name = f"cases/{created_id}/real_slide.svs"
-        upload_blob_from_bytes(settings.GCS_RAW_BUCKET, real_blob_name, b"FAKE_SVS_HEADER", "application/octet-stream")
-        valid_uri = f"gs://{settings.GCS_RAW_BUCKET}/{real_blob_name}"
+            # 3. Accept valid URI when blob actually exists
+            real_blob_name = f"cases/{created_id}/real_slide.svs"
+            upload_blob_from_bytes(settings.GCS_RAW_BUCKET, real_blob_name, b"FAKE_SVS_HEADER", "application/octet-stream")
+            valid_uri = f"gs://{settings.GCS_RAW_BUCKET}/{real_blob_name}"
 
-        resp_ok = client.post(
-            f"/api/v1/cases/{created_id}/slide/finalize",
-            json={"gcs_uri": valid_uri, "client_sha256": "fake_sha256"},
-            headers={"X-User-Role": "pathologist"}
-        )
-        assert resp_ok.status_code == 202
-        assert resp_ok.json()["status"] == "queued"
+            resp_ok = client.post(
+                f"/api/v1/cases/{created_id}/slide/finalize",
+                json={"gcs_uri": valid_uri, "client_sha256": "fake_sha256"},
+                headers={"X-User-Role": "pathologist"}
+            )
+            assert resp_ok.status_code == 202
+            assert resp_ok.json()["status"] == "queued"
 
 
 def test_tile_bounds_check_immediate_404():
     """Verify tile requests outside valid level or coordinates return immediate 404 (Issue #200, #636)."""
-    with client:
-        resp_case = client.post("/api/v1/cases", headers={"X-User-Role": "pathologist"})
-        case_id = resp_case.json()["id"]
+    with patch("app.core.cloud_tasks.dispatch_stage_task"):
+        with client:
+            resp_case = client.post("/api/v1/cases", headers={"X-User-Role": "pathologist"})
+            case_id = resp_case.json()["id"]
 
-        # Finalize a slide
-        blob_name = f"cases/{case_id}/slide_bounds.svs"
-        upload_blob_from_bytes(settings.GCS_RAW_BUCKET, blob_name, b"SVS_CONTENT", "application/octet-stream")
-        client.post(
-            f"/api/v1/cases/{case_id}/slide/finalize",
-            json={"gcs_uri": f"gs://{settings.GCS_RAW_BUCKET}/{blob_name}"},
-            headers={"X-User-Role": "pathologist"}
-        )
+            # Finalize a slide
+            blob_name = f"cases/{case_id}/slide_bounds.svs"
+            upload_blob_from_bytes(settings.GCS_RAW_BUCKET, blob_name, b"SVS_CONTENT", "application/octet-stream")
+            client.post(
+                f"/api/v1/cases/{case_id}/slide/finalize",
+                json={"gcs_uri": f"gs://{settings.GCS_RAW_BUCKET}/{blob_name}"},
+                headers={"X-User-Role": "pathologist"}
+            )
 
-        # 1. Level out of bounds (e.g. z = 2000)
-        resp_z = client.get(
-            f"/api/v1/cases/{case_id}/tiles/orig/2000/0_0.png",
-            headers={"X-User-Role": "pathologist"}
-        )
-        assert resp_z.status_code == 404
-        assert "out of bounds" in resp_z.json()["detail"]
+            # 1. Level out of bounds (e.g. z = 2000)
+            resp_z = client.get(
+                f"/api/v1/cases/{case_id}/tiles/orig/2000/0_0.png",
+                headers={"X-User-Role": "pathologist"}
+            )
+            assert resp_z.status_code == 404
+            assert "out of bounds" in resp_z.json()["detail"]
 
-        # 2. Coordinates out of bounds (e.g. c = 500, r = 500 at z = 2)
-        resp_cr = client.get(
-            f"/api/v1/cases/{case_id}/tiles/orig/2/500_500.png",
-            headers={"X-User-Role": "pathologist"}
-        )
-        assert resp_cr.status_code == 404
-        assert "out of bounds" in resp_cr.json()["detail"]
+            # 2. Coordinates out of bounds (e.g. c = 500, r = 500 at z = 2)
+            resp_cr = client.get(
+                f"/api/v1/cases/{case_id}/tiles/orig/2/500_500.png",
+                headers={"X-User-Role": "pathologist"}
+            )
+            assert resp_cr.status_code == 404
+            assert "out of bounds" in resp_cr.json()["detail"]
 
 
 def test_qc_pass_auto_chains_triage():

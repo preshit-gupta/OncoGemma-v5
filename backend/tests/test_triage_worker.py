@@ -33,7 +33,7 @@ def synthetic_triage_env(monkeypatch):
     return settings
 
 
-def test_run_triage_stage_e2e(db_session, tmp_path, synthetic_triage_env):
+def test_run_triage_stage_e2e(db_session, tmp_path, synthetic_triage_env, monkeypatch):
     case_id = "test_case_triage_123"
     slide_id = "test_slide_triage_456"
 
@@ -67,9 +67,11 @@ def test_run_triage_stage_e2e(db_session, tmp_path, synthetic_triage_env):
     assert model_versions["path_foundation"] == "v1"
     assert stage_exec.status == "awaiting_review"
 
-    # Verify second run uses cached parquet embeddings (0 new endpoint calls)
-    mock_client = MagicMock()
-    mock_client.get_embeddings.side_effect = Exception("Should not be called when cached!")
+    # Verify second run uses cached parquet embeddings (0 new endpoint calls) (#459)
+    def fail_if_endpoint_called(*args, **kwargs):
+        raise AssertionError("Vertex AI endpoint should NOT be invoked when embeddings are cached in parquet!")
+
+    monkeypatch.setattr("worker.triage.mock_vertex_ai_endpoint", fail_if_endpoint_called)
 
     stage_exec.status = "running"
     db_session.commit()
