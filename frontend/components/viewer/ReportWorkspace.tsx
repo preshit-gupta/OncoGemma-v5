@@ -380,6 +380,8 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
         <p className="text-sm font-medium">Loading CAP-Compliant Synoptic Report...</p>
       </div>
     );
+  }
+
   if (error || !data) {
     return (
       <div className="flex flex-col items-center justify-center h-full text-slate-400 space-y-3 bg-slate-950 p-8">
