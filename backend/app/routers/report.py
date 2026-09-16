@@ -9,7 +9,7 @@ import copy
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Literal
 from fastapi import APIRouter, Depends, HTTPException, status, Response
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -42,7 +42,7 @@ from pipeline.staging import (
     validate_narrative_consistency
 )
 from pipeline.medgemma import MedGemmaClient, load_prompt_template
-from pipeline.report_pdf import generate_clinical_cap_pdf
+from pipeline.report_pdf import generate_clinical_cap_pdf, render_report_html
 
 router = APIRouter(prefix="/api/v1/stages/report", tags=["report"])
 
@@ -172,6 +172,110 @@ def _ensure_report_record(case_uid: uuid.UUID, db: Session) -> Report:
     return report
 
 
+def _build_render_dict(case_id: str, report: Report, grading: Optional[Grading]) -> Dict[str, Any]:
+    ng_data = {
+        "grade": grading.grade if grading and grading.grade else None,
+        "tubule_score": grading.tubule_score if grading and grading.tubule_score else None,
+        "tubule_percent": grading.tubule_percent if grading and grading.tubule_percent is not None else None,
+        "pleo_score": grading.pleo_score if grading and grading.pleo_score else None,
+        "mitotic_score": grading.mitotic_score if grading and grading.mitotic_score else None,
+        "nottingham_sum": grading.nottingham_sum if grading and grading.nottingham_sum else None
+    }
+
+    return {
+        "case_id": str(case_id),
+        "procedure": report.procedure,
+        "laterality": report.laterality,
+        "tumor_site": report.tumor_site,
+        "histologic_type": report.histologic_type,
+        "tumor_size_mm": report.tumor_size_mm,
+        "lvi_status": report.lvi_status,
+        "dcis_present": report.dcis_present,
+        "margins": report.margins,
+        "lymph_nodes": report.lymph_nodes,
+        "biomarkers": report.biomarkers,
+        "staging": report.staging,
+        "nottingham_grade": ng_data,
+        "narrative": report.narrative,
+        "status": report.status,
+        "signed_by": report.signed_by,
+        "npi": report.npi,
+        "signed_at": report.signed_at.isoformat() if report.signed_at else None,
+        "integrity_hash": report.integrity_hash
+    }
+
+
+def _collect_evidence_artifacts(case_id: str, scratch_dir: str, db: Session):
+    evidence_paths = {}
+    for hm in [f"cases/{case_id}/triage/heatmap_triage.png", f"cases/{case_id}/triage/heatmap.png"]:
+        try:
+            data = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, hm)
+            p = os.path.join(scratch_dir, "heatmap.png")
+            with open(p, "wb") as f:
+                f.write(data)
+            evidence_paths["heatmap"] = p
+            break
+        except Exception:
+            pass
+
+    for hpf in [
+        f"cases/{case_id}/mitosis/hpfs/hpf_1_40x_norm.png",
+        f"cases/{case_id}/mitosis/hpfs/hpf_1_20x_norm.png",
+        f"cases/{case_id}/mitosis/hpfs/hpf_1_10x_norm.png",
+        f"cases/{case_id}/mitosis/crops/m_0001.png",
+        f"cases/{case_id}/mitosis/crops/m_0364.png"
+    ]:
+        try:
+            data = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, hpf)
+            p = os.path.join(scratch_dir, "mitotic_hpf.png")
+            with open(p, "wb") as f:
+                f.write(data)
+            evidence_paths["mitotic_hpf"] = p
+            break
+        except Exception:
+            pass
+
+    for gp in [
+        f"cases/{case_id}/triage/patches/hs_01_10x_norm.png",
+        f"cases/{case_id}/triage/patches/hs_01_20x_norm.png",
+        f"cases/{case_id}/triage/patches/hs_01_40x_norm.png",
+        f"cases/{case_id}/grading_patches/p_001.png"
+    ]:
+        try:
+            data = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, gp)
+            p = os.path.join(scratch_dir, "grading_patch.png")
+            with open(p, "wb") as f:
+                f.write(data)
+            evidence_paths["grading_patch"] = p
+            break
+        except Exception:
+            pass
+
+    case_uid = to_uuid(case_id)
+    hotspots = db.scalars(select(Hotspot).where(Hotspot.case_id == case_uid).order_by(Hotspot.id.asc())).all()
+    top_hpf = db.scalars(select(HpfSite).where(HpfSite.case_id == case_uid).order_by(HpfSite.mitotic_count.desc(), HpfSite.seq.asc())).first()
+
+    evidence_geometry = {
+        "hotspots": [
+            {
+                "id": h.id,
+                "seq": getattr(h, "seq", i + 1),
+                "polygon_coords_um": getattr(h, "polygon_um", getattr(h, "polygon_coords_um", None)),
+                "polygon_um": getattr(h, "polygon_um", None),
+                "center_um": getattr(h, "center_um", None)
+            }
+            for i, h in enumerate(hotspots)
+        ],
+        "top_hpf": {
+            "seq": top_hpf.seq,
+            "mitotic_count": top_hpf.mitotic_count,
+            "center_um": top_hpf.center_um,
+            "radius_um": getattr(top_hpf, "radius_um", 262.0)
+        } if top_hpf else None
+    }
+    return evidence_paths, evidence_geometry
+
+
 def render_and_upload_report_pdf(case_id: str, report: Report, grading: Optional[Grading], db: Session) -> str:
     """Renders CAP PDF via transient scratch directory and uploads directly to GCS."""
     scratch_dir = tempfile.mkdtemp(prefix="og_pdf_")
@@ -179,86 +283,14 @@ def render_and_upload_report_pdf(case_id: str, report: Report, grading: Optional
         pdf_filename = f"CAP_Report_{str(case_id)[:8]}.pdf"
         pdf_scratch_path = os.path.join(scratch_dir, pdf_filename)
 
-        ng_data = {
-            "grade": grading.grade if grading and grading.grade else None,
-            "tubule_score": grading.tubule_score if grading and grading.tubule_score else None,
-            "tubule_percent": grading.tubule_percent if grading and grading.tubule_percent is not None else None,
-            "pleo_score": grading.pleo_score if grading and grading.pleo_score else None,
-            "mitotic_score": grading.mitotic_score if grading and grading.mitotic_score else None,
-            "nottingham_sum": grading.nottingham_sum if grading and grading.nottingham_sum else None
-        }
-
-        render_dict = {
-            "case_id": str(case_id),
-            "procedure": report.procedure,
-            "laterality": report.laterality,
-            "tumor_site": report.tumor_site,
-            "histologic_type": report.histologic_type,
-            "tumor_size_mm": report.tumor_size_mm,
-            "lvi_status": report.lvi_status,
-            "dcis_present": report.dcis_present,
-            "margins": report.margins,
-            "lymph_nodes": report.lymph_nodes,
-            "biomarkers": report.biomarkers,
-            "staging": report.staging,
-            "nottingham_grade": ng_data,
-            "narrative": report.narrative,
-            "status": report.status,
-            "signed_by": report.signed_by,
-            "npi": report.npi,
-            "signed_at": report.signed_at.isoformat() if report.signed_at else None,
-            "integrity_hash": report.integrity_hash
-        }
-
-        evidence_paths = {}
-        for hm in [f"cases/{case_id}/triage/heatmap_triage.png", f"cases/{case_id}/triage/heatmap.png"]:
-            try:
-                data = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, hm)
-                p = os.path.join(scratch_dir, "heatmap.png")
-                with open(p, "wb") as f:
-                    f.write(data)
-                evidence_paths["heatmap"] = p
-                break
-            except Exception:
-                pass
-
-        for hpf in [
-            f"cases/{case_id}/mitosis/hpfs/hpf_1_40x_norm.png",
-            f"cases/{case_id}/mitosis/hpfs/hpf_1_20x_norm.png",
-            f"cases/{case_id}/mitosis/hpfs/hpf_1_10x_norm.png",
-            f"cases/{case_id}/mitosis/crops/m_0001.png",
-            f"cases/{case_id}/mitosis/crops/m_0364.png"
-        ]:
-            try:
-                data = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, hpf)
-                p = os.path.join(scratch_dir, "mitotic_hpf.png")
-                with open(p, "wb") as f:
-                    f.write(data)
-                evidence_paths["mitotic_hpf"] = p
-                break
-            except Exception:
-                pass
-
-        for gp in [
-            f"cases/{case_id}/triage/patches/hs_01_10x_norm.png",
-            f"cases/{case_id}/triage/patches/hs_01_20x_norm.png",
-            f"cases/{case_id}/triage/patches/hs_01_40x_norm.png",
-            f"cases/{case_id}/grading_patches/p_001.png"
-        ]:
-            try:
-                data = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, gp)
-                p = os.path.join(scratch_dir, "grading_patch.png")
-                with open(p, "wb") as f:
-                    f.write(data)
-                evidence_paths["grading_patch"] = p
-                break
-            except Exception:
-                pass
+        render_dict = _build_render_dict(case_id, report, grading)
+        evidence_paths, evidence_geometry = _collect_evidence_artifacts(str(case_id), scratch_dir, db)
 
         generate_clinical_cap_pdf(
             report_data=render_dict,
             output_path=pdf_scratch_path,
-            evidence_paths=evidence_paths
+            evidence_paths=evidence_paths,
+            evidence_geometry=evidence_geometry
         )
 
         with open(pdf_scratch_path, "rb") as f:
@@ -652,6 +684,32 @@ def get_report_json(case_id: str, db: Session = Depends(get_db)):
     return JSONResponse(content=data, headers=headers)
 
 
+@router.get("/{case_id}/html", response_class=HTMLResponse)
+def get_report_html(case_id: str, db: Session = Depends(get_db)):
+    """
+    Client-visible HTML preview of CAP synoptic report (#501).
+    Renders the report HTML with DRAFT watermark if unsigned.
+    """
+    case_uid = to_uuid(case_id)
+    report = _ensure_report_record(case_uid, db)
+    grading = db.scalars(select(Grading).where(Grading.case_id == case_uid)).first()
+
+    scratch_dir = tempfile.mkdtemp(prefix="og_html_")
+    try:
+        render_dict = _build_render_dict(case_id, report, grading)
+        evidence_paths, evidence_geometry = _collect_evidence_artifacts(str(case_id), scratch_dir, db)
+        is_draft = (report.status != "signed")
+        html_content = render_report_html(
+            report_data=render_dict,
+            evidence_paths=evidence_paths,
+            evidence_geometry=evidence_geometry,
+            is_draft=is_draft
+        )
+        return HTMLResponse(content=html_content)
+    finally:
+        shutil.rmtree(scratch_dir, ignore_errors=True)
+
+
 @router.post("/sign")
 def sign_final_report(
     payload: SignReportPayload,
@@ -778,48 +836,9 @@ def sign_final_report(
             "integrity_hash": "SEALING"
         }
 
-        evidence_paths = {}
-        for hm in [f"cases/{payload.case_id}/triage/heatmap_triage.png", f"cases/{payload.case_id}/triage/heatmap.png"]:
-            try:
-                data = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, hm)
-                p = os.path.join(scratch_dir, "heatmap.png")
-                with open(p, "wb") as f:
-                    f.write(data)
-                evidence_paths["heatmap"] = p
-                break
-            except Exception:
-                pass
+        evidence_paths, evidence_geometry = _collect_evidence_artifacts(str(payload.case_id), scratch_dir, db)
 
-        for hpf in [
-            f"cases/{payload.case_id}/mitosis/hpfs/hpf_1_40x_norm.png",
-            f"cases/{payload.case_id}/mitosis/hpfs/hpf_1_20x_norm.png",
-            f"cases/{payload.case_id}/mitosis/hpfs/hpf_1_10x_norm.png",
-            f"cases/{payload.case_id}/mitosis/crops/m_0001.png"
-        ]:
-            try:
-                data = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, hpf)
-                p = os.path.join(scratch_dir, "mitotic_hpf.png")
-                with open(p, "wb") as f:
-                    f.write(data)
-                evidence_paths["mitotic_hpf"] = p
-                break
-            except Exception:
-                pass
-
-        for gp in [
-            f"cases/{payload.case_id}/grading_patches/p_001.png"
-        ]:
-            try:
-                data = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, gp)
-                p = os.path.join(scratch_dir, "grading_patch.png")
-                with open(p, "wb") as f:
-                    f.write(data)
-                evidence_paths["grading_patch"] = p
-                break
-            except Exception:
-                pass
-
-        generate_clinical_cap_pdf(render_dict, pdf_scratch_path, evidence_paths=evidence_paths)
+        generate_clinical_cap_pdf(render_dict, pdf_scratch_path, evidence_paths=evidence_paths, evidence_geometry=evidence_geometry)
         with open(pdf_scratch_path, "rb") as f:
             pdf_bytes = f.read()
 

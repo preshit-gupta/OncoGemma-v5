@@ -1,0 +1,336 @@
+/* ==========================================================================
+   OncoGemma CAP Synoptic Pathology Report Print Stylesheet
+   Standard: College of American Pathologists (CAP) Protocol Checklist
+   ========================================================================== */
+
+@page {
+  size: letter;
+  margin: 15mm 12mm 15mm 12mm;
+  @bottom-right {
+    content: "Page " counter(page) " of " counter(pages);
+    font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+    font-size: 8pt;
+    color: #64748b;
+  }
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  color: #1e293b;
+  background-color: #ffffff;
+  margin: 0;
+  padding: 0;
+  font-size: 8.5pt;
+  line-height: 1.35;
+  -webkit-print-color-adjust: exact;
+  print-color-adjust: exact;
+}
+
+.report-container {
+  max-width: 800px;
+  margin: 0 auto;
+  padding: 10px 20px;
+  position: relative;
+}
+
+/* Watermark */
+.watermark {
+  position: fixed;
+  top: 40%;
+  left: 10%;
+  width: 80%;
+  text-align: center;
+  transform: rotate(-35deg);
+  font-size: 52pt;
+  font-weight: 900;
+  color: rgba(226, 232, 240, 0.45);
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+  pointer-events: none;
+  z-index: 1000;
+  border: 4px dashed rgba(203, 213, 225, 0.4);
+  padding: 20px;
+}
+
+/* Header */
+.header-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-bottom: 6px;
+}
+
+.lab-title {
+  font-size: 11pt;
+  font-weight: 800;
+  color: #0f172a;
+  letter-spacing: 0.02em;
+}
+
+.lab-subtitle {
+  font-size: 7.5pt;
+  color: #475569;
+  margin-top: 2px;
+}
+
+.report-type-badge {
+  text-align: right;
+  vertical-align: top;
+}
+
+.cap-badge {
+  font-size: 9.5pt;
+  font-weight: 800;
+  color: #0284c7;
+  text-transform: uppercase;
+}
+
+.report-date {
+  font-size: 7.5pt;
+  color: #64748b;
+  margin-top: 2px;
+}
+
+.divider {
+  height: 2px;
+  background: linear-gradient(90deg, #0284c7, #0ea5e9);
+  margin: 6px 0 10px 0;
+}
+
+/* Case Metadata Intake Bar */
+.case-intake-bar {
+  display: flex;
+  background-color: #f8fafc;
+  border: 1px solid #cbd5e1;
+  border-radius: 4px;
+  padding: 6px 10px;
+  margin-bottom: 10px;
+  font-size: 8pt;
+}
+
+.intake-item {
+  flex: 1;
+}
+
+.intake-label {
+  font-weight: 700;
+  color: #334155;
+}
+
+.status-badge-signed {
+  color: #059669;
+  font-weight: 800;
+}
+
+.status-badge-draft {
+  color: #d97706;
+  font-weight: 800;
+}
+
+/* Diagnosis Banner */
+.diagnosis-banner {
+  border-radius: 4px;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  border-left: 4px solid #10b981;
+  background-color: #f0fdf4;
+}
+
+.diagnosis-banner.benign {
+  border-left-color: #0284c7;
+  background-color: #f0f9ff;
+}
+
+.diagnosis-banner-title {
+  font-size: 8.5pt;
+  font-weight: 800;
+  color: #065f46;
+  text-transform: uppercase;
+  margin-bottom: 3px;
+}
+
+.diagnosis-banner.benign .diagnosis-banner-title {
+  color: #0369a1;
+}
+
+.diagnosis-banner-text {
+  font-size: 9.5pt;
+  font-weight: 700;
+  color: #0f172a;
+  line-height: 1.3;
+}
+
+/* Section Titles */
+.section-title {
+  font-size: 8.5pt;
+  font-weight: 800;
+  color: #0f172a;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin: 12px 0 6px 0;
+  padding-bottom: 2px;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+/* Synoptic Protocol Table */
+.synoptic-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-bottom: 12px;
+  font-size: 8pt;
+}
+
+.synoptic-table th {
+  background-color: #e2e8f0;
+  color: #1e293b;
+  font-weight: 700;
+  text-align: left;
+  padding: 4px 8px;
+  border: 1px solid #cbd5e1;
+}
+
+.synoptic-table td {
+  padding: 3px 8px;
+  border: 1px solid #cbd5e1;
+  vertical-align: middle;
+}
+
+.synoptic-table tr:nth-child(even) td {
+  background-color: #f8fafc;
+}
+
+.synoptic-table .elem-name {
+  font-weight: 700;
+  width: 38%;
+  color: #1e293b;
+}
+
+.synoptic-table .elem-sub {
+  padding-left: 18px;
+  color: #475569;
+}
+
+.synoptic-table .elem-val {
+  color: #0f172a;
+}
+
+/* Key Visual Evidence Grid */
+.evidence-grid {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 12px;
+  page-break-inside: avoid;
+}
+
+.evidence-card {
+  flex: 1;
+  border: 1px solid #cbd5e1;
+  border-radius: 4px;
+  padding: 6px;
+  background-color: #ffffff;
+  text-align: center;
+}
+
+.evidence-card-title {
+  font-size: 7.5pt;
+  font-weight: 700;
+  color: #1e293b;
+  margin-bottom: 4px;
+  text-transform: uppercase;
+}
+
+.evidence-img {
+  width: 100%;
+  height: 110px;
+  object-fit: cover;
+  border-radius: 2px;
+  border: 1px solid #e2e8f0;
+  background-color: #f1f5f9;
+}
+
+.evidence-caption {
+  font-size: 6.5pt;
+  color: #64748b;
+  margin-top: 4px;
+  line-height: 1.2;
+}
+
+.evidence-unavailable {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 110px;
+  background-color: #f8fafc;
+  color: #94a3b8;
+  font-size: 7.5pt;
+  font-weight: 600;
+  border: 1px dashed #cbd5e1;
+  border-radius: 2px;
+}
+
+/* Narrative Box */
+.narrative-box {
+  background-color: #ffffff;
+  border: 1px solid #cbd5e1;
+  border-radius: 4px;
+  padding: 8px 10px;
+  margin-bottom: 12px;
+  font-size: 8pt;
+  page-break-inside: avoid;
+}
+
+.narrative-para {
+  margin: 0 0 6px 0;
+  color: #334155;
+  line-height: 1.4;
+}
+
+.narrative-para:last-child {
+  margin-bottom: 0;
+}
+
+/* Attestation Block */
+.attestation-block {
+  border: 1px solid #cbd5e1;
+  background-color: #f8fafc;
+  border-radius: 4px;
+  padding: 8px 12px;
+  margin-top: 14px;
+  page-break-inside: avoid;
+}
+
+.attestation-title {
+  font-size: 7.5pt;
+  font-weight: 800;
+  color: #0f172a;
+  text-transform: uppercase;
+  margin-bottom: 4px;
+}
+
+.attestation-text {
+  font-size: 7.5pt;
+  color: #475569;
+  line-height: 1.35;
+  margin-bottom: 8px;
+}
+
+.signer-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 7.5pt;
+}
+
+.signer-table td {
+  padding: 2px 0;
+}
+
+.crypto-hash-box {
+  background-color: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 3px;
+  padding: 3px 6px;
+  font-family: 'Courier New', Courier, monospace;
+  font-size: 6.5pt;
+  color: #0f172a;
+  word-break: break-all;
+  margin-top: 4px;
+}

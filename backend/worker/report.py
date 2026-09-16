@@ -206,32 +206,49 @@ def run_report(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str, 
         
         # Download evidence files if available in GCS
         evidence_paths = {}
-        try:
-            hm_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/triage/heatmap_triage.png")
-            hm_path = os.path.join(scratch_dir, "heatmap.png")
-            with open(hm_path, "wb") as f:
-                f.write(hm_bytes)
-            evidence_paths["heatmap"] = hm_path
-        except Exception:
-            pass
+        for hm in [f"cases/{case_id}/triage/heatmap_triage.png", f"cases/{case_id}/triage/heatmap.png"]:
+            try:
+                hm_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, hm)
+                hm_path = os.path.join(scratch_dir, "heatmap.png")
+                with open(hm_path, "wb") as f:
+                    f.write(hm_bytes)
+                evidence_paths["heatmap"] = hm_path
+                break
+            except Exception:
+                pass
 
-        try:
-            hpf_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/mitosis/crops/m_0001.png")
-            hpf_path = os.path.join(scratch_dir, "mitotic_hpf.png")
-            with open(hpf_path, "wb") as f:
-                f.write(hpf_bytes)
-            evidence_paths["mitotic_hpf"] = hpf_path
-        except Exception:
-            pass
+        for hpf in [
+            f"cases/{case_id}/mitosis/hpfs/hpf_1_40x_norm.png",
+            f"cases/{case_id}/mitosis/hpfs/hpf_1_20x_norm.png",
+            f"cases/{case_id}/mitosis/hpfs/hpf_1_10x_norm.png",
+            f"cases/{case_id}/mitosis/crops/m_0001.png",
+            f"cases/{case_id}/mitosis/crops/m_0364.png"
+        ]:
+            try:
+                hpf_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, hpf)
+                hpf_path = os.path.join(scratch_dir, "mitotic_hpf.png")
+                with open(hpf_path, "wb") as f:
+                    f.write(hpf_bytes)
+                evidence_paths["mitotic_hpf"] = hpf_path
+                break
+            except Exception:
+                pass
 
-        try:
-            patch_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/grading_patches/p_001.png")
-            patch_path = os.path.join(scratch_dir, "grading_patch.png")
-            with open(patch_path, "wb") as f:
-                f.write(patch_bytes)
-            evidence_paths["grading_patch"] = patch_path
-        except Exception:
-            pass
+        for gp in [
+            f"cases/{case_id}/triage/patches/hs_01_10x_norm.png",
+            f"cases/{case_id}/triage/patches/hs_01_20x_norm.png",
+            f"cases/{case_id}/triage/patches/hs_01_40x_norm.png",
+            f"cases/{case_id}/grading_patches/p_001.png"
+        ]:
+            try:
+                patch_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, gp)
+                patch_path = os.path.join(scratch_dir, "grading_patch.png")
+                with open(patch_path, "wb") as f:
+                    f.write(patch_bytes)
+                evidence_paths["grading_patch"] = patch_path
+                break
+            except Exception:
+                pass
 
         report_render_dict = {
             "case_id": case_id,
@@ -255,10 +272,32 @@ def run_report(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str, 
             "integrity_hash": report_record.integrity_hash
         }
 
+        # Construct authentic evidence geometry for burn-in (#504)
+        top_hpf = max(hpfs, key=lambda h: h.mitotic_count) if hpfs else None
+        evidence_geometry = {
+            "hotspots": [
+                {
+                    "id": h.id,
+                    "seq": getattr(h, "seq", i + 1),
+                    "polygon_coords_um": getattr(h, "polygon_um", getattr(h, "polygon_coords_um", None)),
+                    "polygon_um": getattr(h, "polygon_um", None),
+                    "center_um": getattr(h, "center_um", None)
+                }
+                for i, h in enumerate(hotspots)
+            ],
+            "top_hpf": {
+                "seq": top_hpf.seq,
+                "mitotic_count": top_hpf.mitotic_count,
+                "center_um": top_hpf.center_um,
+                "radius_um": getattr(top_hpf, "radius_um", 262.0)
+            } if top_hpf else None
+        }
+
         generate_clinical_cap_pdf(
             report_data=report_render_dict,
             output_path=pdf_out_path,
-            evidence_paths=evidence_paths
+            evidence_paths=evidence_paths,
+            evidence_geometry=evidence_geometry
         )
 
         with open(pdf_out_path, "rb") as pdf_file:
