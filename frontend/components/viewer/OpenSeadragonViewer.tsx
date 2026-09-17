@@ -68,7 +68,7 @@ export function OpenSeadragonViewer({
   mppY = 0.25,
   imageWidthPx = 2048,
   imageHeightPx = 2048,
-  layer = "orig",
+  layer,
   overlayImageUri = null,
   overlayOpacity = 0.6,
   showOverlay = true,
@@ -96,7 +96,7 @@ export function OpenSeadragonViewer({
   const [isEditingZoom, setIsEditingZoom] = useState<boolean>(false);
   const [customZoomInput, setCustomZoomInput] = useState<string>("1.0");
   const [showDropdown, setShowDropdown] = useState<boolean>(false);
-  const [activeLayer, setActiveLayer] = useState<"orig" | "norm">(layer);
+  const [activeLayer, setActiveLayer] = useState<"orig" | "norm">(layer || "orig");
   const [svgPolygons, setSvgPolygons] = useState<
     Array<{ id: string; points: string; center: { x: number; y: number }; excluded?: boolean }>
   >([]);
@@ -316,20 +316,40 @@ export function OpenSeadragonViewer({
 
   // Smooth layer transition without destroying OSD instance
   useEffect(() => {
-    if (!viewerRef.current || !isBaseSlideOpenRef.current) return;
-    const currentBounds = viewerRef.current.viewport ? viewerRef.current.viewport.getBounds() : null;
+    const viewer = viewerRef.current;
+    if (!viewer) return;
+    const isReady = isBaseSlideOpenRef.current || (typeof viewer.isOpen === "function" && viewer.isOpen()) || (viewer.world && viewer.world.getItemCount() > 0);
+    if (!isReady) return;
+
+    const currentBounds = viewer.viewport ? viewer.viewport.getBounds() : null;
     const tileSource = getTileSource(activeLayer);
-    viewerRef.current.open(tileSource);
-    if (currentBounds && viewerRef.current.viewport) {
-      const onOpenHandler = () => {
-        try {
-          if (viewerRef.current?.viewport) {
-            viewerRef.current.viewport.fitBounds(currentBounds, true);
-          }
-        } catch (_) {}
-        viewerRef.current?.removeHandler("open", onOpenHandler);
-      };
-      viewerRef.current.addHandler("open", onOpenHandler);
+
+    // Reset overlay refs so syncOverlay will cleanly re-attach overlays to new layer
+    overlayItemRef.current = null;
+    currentOverlayUriRef.current = null;
+    isAddingOverlayRef.current = false;
+
+    const onLayerOpen = () => {
+      try {
+        if (viewer?.viewport && currentBounds) {
+          viewer.viewport.fitBounds(currentBounds, true);
+        }
+      } catch (_) {}
+      viewer?.removeHandler("open", onLayerOpen);
+    };
+
+    viewer.addHandler("open", onLayerOpen);
+    viewer.open(tileSource);
+    isBaseSlideOpenRef.current = true;
+
+    // Fast recovery if tileSource opens immediately without async dispatch
+    if (currentBounds && viewer.viewport) {
+      try {
+        viewer.viewport.fitBounds(currentBounds, true);
+      } catch (_) {}
+    }
+    if (typeof viewer.forceRedraw === "function") {
+      viewer.forceRedraw();
     }
   }, [activeLayer, getTileSource]);
 
@@ -346,7 +366,6 @@ export function OpenSeadragonViewer({
     const viewer = OpenSeadragon({
       element: containerRef.current,
       prefixUrl: "/images/osd/",
-      tileSources: tileSource,
       showNavigationControl: false,
       animationTime: 0.3,
       blendTime: 0.1,
@@ -358,12 +377,14 @@ export function OpenSeadragonViewer({
 
     viewerRef.current = viewer;
 
+    let isInitialOpen = true;
     viewer.addHandler("open", () => {
       isBaseSlideOpenRef.current = true;
       onViewportChangeImmediate();
-      if (viewer.viewport) {
+      if (isInitialOpen && viewer.viewport) {
         viewer.viewport.goHome(true);
         viewer.viewport.applyConstraints();
+        isInitialOpen = false;
       }
       syncOverlay();
     });
@@ -389,6 +410,12 @@ export function OpenSeadragonViewer({
       }
     });
 
+    // Open initial tileSource with handlers already attached
+    viewer.open(tileSource);
+    if ((typeof viewer.isOpen === "function" && viewer.isOpen()) || (viewer.world && viewer.world.getItemCount() > 0)) {
+      isBaseSlideOpenRef.current = true;
+    }
+
     return () => {
       if (rafPendingRef.current !== null) {
         cancelAnimationFrame(rafPendingRef.current);
@@ -413,7 +440,8 @@ export function OpenSeadragonViewer({
       const world = viewer.world;
 
       // Base slide MUST be open and present in world before attaching overlays
-      if (world.getItemCount() === 0 || !isBaseSlideOpenRef.current) {
+      const isReady = isBaseSlideOpenRef.current || (typeof viewer.isOpen === "function" && viewer.isOpen()) || world.getItemCount() > 0;
+      if (world.getItemCount() === 0 || !isReady) {
         return;
       }
 
@@ -435,8 +463,10 @@ export function OpenSeadragonViewer({
       }
 
       // Check if we need to load or reload the overlay
+      const isOverlayInWorld = overlayItemRef.current && typeof world.getIndexOfItem === "function" && world.getIndexOfItem(overlayItemRef.current) !== -1;
       const needsLoad =
         overlayImageUri !== currentOverlayUriRef.current ||
+        !isOverlayInWorld ||
         (!overlayItemRef.current && !isAddingOverlayRef.current);
 
       if (needsLoad) {
