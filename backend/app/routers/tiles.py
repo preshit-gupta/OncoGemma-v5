@@ -158,7 +158,7 @@ def stream_slide_tile(slide: Slide, layer: str, z: int, filename: str, case_id: 
     target_z = z
 
     no_cache_headers = {
-        "Cache-Control": "public, max-age=86400, immutable",
+        "Cache-Control": "public, max-age=3600",
         "X-Tile-Layer": target_layer,
         "X-Tile-Zoom": str(target_z)
     }

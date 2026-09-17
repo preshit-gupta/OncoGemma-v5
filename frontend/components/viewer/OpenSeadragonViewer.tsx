@@ -137,6 +137,8 @@ export function OpenSeadragonViewer({
     updateMarkers(detectionMarkers);
   }, [detectionMarkers]);
 
+  const origItemRef = useRef<any>(null);
+  const normItemRef = useRef<any>(null);
   const overlayItemRef = useRef<any>(null);
   const currentOverlayUriRef = useRef<string | null>(null);
   const isAddingOverlayRef = useRef<boolean>(false);
@@ -297,71 +299,47 @@ export function OpenSeadragonViewer({
       getTileUrl: (level: number, x: number, y: number) => {
         // Beyond 10x level (level > maxLevel - 2), normalized pyramid falls back to original colors
         const effectiveLayer = (layerName === "norm" && level > maxLevel - 2) ? "orig" : layerName;
+        let url = "";
         if (tileUrlTemplate) {
-          let url = tileUrlTemplate;
+          url = tileUrlTemplate;
           if (url.includes("{layer}")) {
             url = url.replace("{layer}", effectiveLayer);
           } else {
             url = url.replace("/orig/", `/${effectiveLayer}/`).replace("/norm/", `/${effectiveLayer}/`);
           }
-          return url
+          url = url
             .replace("{z}", level.toString())
             .replace("{x}", x.toString())
             .replace("{y}", y.toString());
+        } else {
+          url = `${API_BASE}/api/v1/cases/${caseId}/tiles/${effectiveLayer}/${level}/${x}_${y}.png`;
         }
-        return `${API_BASE}/api/v1/cases/${caseId}/tiles/${effectiveLayer}/${level}/${x}_${y}.png`;
+        // Append cache-busting layer tag so browser disk cache never conflates layers
+        const sep = url.includes("?") ? "&" : "?";
+        return `${url}${sep}layer=${effectiveLayer}`;
       }
     };
   }, [caseId, imageWidthPx, imageHeightPx, tileUrlTemplate]);
 
-  // Smooth layer transition using OpenSeadragon's native addTiledImage API
+  // Synchronously update opacities between Original and Normalized 10x layers
+  const updateLayerOpacities = useCallback(() => {
+    const is10xExceeded = currentMag > 10.0;
+    const showNorm = activeLayer === "norm" && !is10xExceeded;
+
+    if (origItemRef.current && typeof origItemRef.current.setOpacity === "function") {
+      origItemRef.current.setOpacity(showNorm ? 0.0 : 1.0);
+    }
+    if (normItemRef.current && typeof normItemRef.current.setOpacity === "function") {
+      normItemRef.current.setOpacity(showNorm ? 1.0 : 0.0);
+    }
+    if (viewerRef.current && typeof viewerRef.current.forceRedraw === "function") {
+      viewerRef.current.forceRedraw();
+    }
+  }, [activeLayer, currentMag]);
+
   useEffect(() => {
-    const viewer = viewerRef.current;
-    if (!viewer || !viewer.world) return;
-    if (!isBaseSlideOpenRef.current && viewer.world.getItemCount() === 0) return;
-
-    const tileSource = getTileSource(activeLayer);
-
-    viewer.addTiledImage({
-      tileSource: tileSource,
-      index: 0,
-      success: (event: any) => {
-        const newImage = event.item;
-        isBaseSlideOpenRef.current = true;
-        const world = viewer.world;
-        if (world) {
-          // Remove old base slide items while strictly preserving overlays
-          const toRemove: any[] = [];
-          for (let i = 0; i < world.getItemCount(); i++) {
-            const item = world.getItemAt(i);
-            if (item && item !== newImage && item !== overlayItemRef.current) {
-              toRemove.push(item);
-            }
-          }
-          toRemove.forEach((item) => {
-            try {
-              world.removeItem(item);
-            } catch (_) {}
-          });
-          // Ensure new base slide sits at index 0 beneath any overlays
-          if (typeof world.setItemIndex === "function") {
-            world.setItemIndex(newImage, 0);
-          }
-        }
-        if (viewer.tileCache && typeof viewer.tileCache.clear === "function") {
-          try {
-            viewer.tileCache.clear();
-          } catch (_) {}
-        }
-        if (typeof viewer.forceRedraw === "function") {
-          viewer.forceRedraw();
-        }
-      },
-      error: (err: any) => {
-        console.error("[OpenSeadragonViewer Layer Switch Error]", err);
-      }
-    });
-  }, [activeLayer, getTileSource]);
+    updateLayerOpacities();
+  }, [activeLayer, currentMag, updateLayerOpacities]);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -371,7 +349,8 @@ export function OpenSeadragonViewer({
       viewerRef.current = null;
     }
 
-    const tileSource = getTileSource(activeLayer);
+    const origSource = getTileSource("orig");
+    const normSource = getTileSource("norm");
 
     const viewer = OpenSeadragon({
       element: containerRef.current,
@@ -388,14 +367,18 @@ export function OpenSeadragonViewer({
     viewerRef.current = viewer;
 
     let isInitialOpen = true;
-    viewer.addHandler("open", () => {
-      isBaseSlideOpenRef.current = true;
-      onViewportChangeImmediate();
+    const checkInitialCenter = () => {
       if (isInitialOpen && viewer.viewport) {
         viewer.viewport.goHome(true);
         viewer.viewport.applyConstraints();
         isInitialOpen = false;
       }
+    };
+
+    viewer.addHandler("open", () => {
+      isBaseSlideOpenRef.current = true;
+      onViewportChangeImmediate();
+      checkInitialCenter();
       syncOverlay();
     });
 
@@ -420,22 +403,41 @@ export function OpenSeadragonViewer({
       }
     });
 
-    // Add initial base tiled image using native addTiledImage
+    // 1. Add Original slide layer at index 0
     viewer.addTiledImage({
-      tileSource: tileSource,
+      tileSource: origSource,
       index: 0,
+      opacity: activeLayer === "orig" || isNormFallbackToOrig ? 1.0 : 0.0,
       success: (event: any) => {
+        origItemRef.current = event.item;
         isBaseSlideOpenRef.current = true;
-        if (isInitialOpen && viewer.viewport) {
-          viewer.viewport.goHome(true);
-          viewer.viewport.applyConstraints();
-          isInitialOpen = false;
-        }
+        checkInitialCenter();
         onViewportChangeImmediate();
+        updateLayerOpacities();
         syncOverlay();
       },
       error: (err: any) => {
-        console.error("[OpenSeadragonViewer Initial Load Error]", err);
+        console.error("[OpenSeadragonViewer Orig Load Error]", err);
+      }
+    });
+
+    // 2. Add Normalized slide layer at index 1
+    viewer.addTiledImage({
+      tileSource: normSource,
+      index: 1,
+      opacity: activeLayer === "norm" && !isNormFallbackToOrig ? 1.0 : 0.0,
+      success: (event: any) => {
+        normItemRef.current = event.item;
+        isBaseSlideOpenRef.current = true;
+        checkInitialCenter();
+        onViewportChangeImmediate();
+        updateLayerOpacities();
+        syncOverlay();
+      },
+      error: (err: any) => {
+        console.warn("[OpenSeadragonViewer Norm Load Note]", err);
+        normItemRef.current = null;
+        updateLayerOpacities();
       }
     });
 
@@ -445,6 +447,8 @@ export function OpenSeadragonViewer({
         rafPendingRef.current = null;
       }
       isBaseSlideOpenRef.current = false;
+      origItemRef.current = null;
+      normItemRef.current = null;
       overlayItemRef.current = null;
       currentOverlayUriRef.current = null;
       isAddingOverlayRef.current = false;
@@ -500,13 +504,6 @@ export function OpenSeadragonViewer({
           overlayItemRef.current = null;
         }
 
-        // Purge any orphan overlays, keeping only the primary slide at index 0
-        try {
-          while (world.getItemCount() > 1) {
-            world.removeItem(world.getItemAt(1));
-          }
-        } catch (_) {}
-
         isAddingOverlayRef.current = true;
         const uriToLoad = overlayImageUri;
 
@@ -543,7 +540,7 @@ export function OpenSeadragonViewer({
               overlayItemRef.current = event.item;
               currentOverlayUriRef.current = uriToLoad;
 
-              // Ensure the overlay is placed strictly ON TOP of the base slide
+              // Ensure the overlay is placed strictly ON TOP of all base slide layers
               const count = world.getItemCount();
               if (count > 1 && typeof world.setItemIndex === "function") {
                 world.setItemIndex(event.item, count - 1);
@@ -567,20 +564,11 @@ export function OpenSeadragonViewer({
           }
         });
       } else {
-        // Overlay already loaded: smoothly update opacity on all overlay items and trigger redraw
+        // Overlay already loaded: smoothly update overlay item opacity and trigger redraw
         if (overlayItemRef.current && typeof overlayItemRef.current.setOpacity === "function") {
           try {
             overlayItemRef.current.setOpacity(targetOpacity);
           } catch (_) {}
-        }
-        const count = world.getItemCount();
-        for (let i = 1; i < count; i++) {
-          const item = world.getItemAt(i);
-          if (item && item !== world.getItemAt(0) && typeof item.setOpacity === "function") {
-            try {
-              item.setOpacity(targetOpacity);
-            } catch (_) {}
-          }
         }
         if (typeof viewer.forceRedraw === "function") {
           viewer.forceRedraw();
