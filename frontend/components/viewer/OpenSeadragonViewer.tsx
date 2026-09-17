@@ -314,43 +314,53 @@ export function OpenSeadragonViewer({
     };
   }, [caseId, imageWidthPx, imageHeightPx, tileUrlTemplate]);
 
-  // Smooth layer transition without destroying OSD instance
+  // Smooth layer transition using OpenSeadragon's native addTiledImage API
   useEffect(() => {
     const viewer = viewerRef.current;
-    if (!viewer) return;
-    const isReady = isBaseSlideOpenRef.current || (typeof viewer.isOpen === "function" && viewer.isOpen()) || (viewer.world && viewer.world.getItemCount() > 0);
-    if (!isReady) return;
+    if (!viewer || !viewer.world) return;
+    if (!isBaseSlideOpenRef.current && viewer.world.getItemCount() === 0) return;
 
-    const currentBounds = viewer.viewport ? viewer.viewport.getBounds() : null;
     const tileSource = getTileSource(activeLayer);
 
-    // Reset overlay refs so syncOverlay will cleanly re-attach overlays to new layer
-    overlayItemRef.current = null;
-    currentOverlayUriRef.current = null;
-    isAddingOverlayRef.current = false;
-
-    const onLayerOpen = () => {
-      try {
-        if (viewer?.viewport && currentBounds) {
-          viewer.viewport.fitBounds(currentBounds, true);
+    viewer.addTiledImage({
+      tileSource: tileSource,
+      index: 0,
+      success: (event: any) => {
+        const newImage = event.item;
+        isBaseSlideOpenRef.current = true;
+        const world = viewer.world;
+        if (world) {
+          // Remove old base slide items while strictly preserving overlays
+          const toRemove: any[] = [];
+          for (let i = 0; i < world.getItemCount(); i++) {
+            const item = world.getItemAt(i);
+            if (item && item !== newImage && item !== overlayItemRef.current) {
+              toRemove.push(item);
+            }
+          }
+          toRemove.forEach((item) => {
+            try {
+              world.removeItem(item);
+            } catch (_) {}
+          });
+          // Ensure new base slide sits at index 0 beneath any overlays
+          if (typeof world.setItemIndex === "function") {
+            world.setItemIndex(newImage, 0);
+          }
         }
-      } catch (_) {}
-      viewer?.removeHandler("open", onLayerOpen);
-    };
-
-    viewer.addHandler("open", onLayerOpen);
-    viewer.open(tileSource);
-    isBaseSlideOpenRef.current = true;
-
-    // Fast recovery if tileSource opens immediately without async dispatch
-    if (currentBounds && viewer.viewport) {
-      try {
-        viewer.viewport.fitBounds(currentBounds, true);
-      } catch (_) {}
-    }
-    if (typeof viewer.forceRedraw === "function") {
-      viewer.forceRedraw();
-    }
+        if (viewer.tileCache && typeof viewer.tileCache.clear === "function") {
+          try {
+            viewer.tileCache.clear();
+          } catch (_) {}
+        }
+        if (typeof viewer.forceRedraw === "function") {
+          viewer.forceRedraw();
+        }
+      },
+      error: (err: any) => {
+        console.error("[OpenSeadragonViewer Layer Switch Error]", err);
+      }
+    });
   }, [activeLayer, getTileSource]);
 
   useEffect(() => {
@@ -410,11 +420,24 @@ export function OpenSeadragonViewer({
       }
     });
 
-    // Open initial tileSource with handlers already attached
-    viewer.open(tileSource);
-    if ((typeof viewer.isOpen === "function" && viewer.isOpen()) || (viewer.world && viewer.world.getItemCount() > 0)) {
-      isBaseSlideOpenRef.current = true;
-    }
+    // Add initial base tiled image using native addTiledImage
+    viewer.addTiledImage({
+      tileSource: tileSource,
+      index: 0,
+      success: (event: any) => {
+        isBaseSlideOpenRef.current = true;
+        if (isInitialOpen && viewer.viewport) {
+          viewer.viewport.goHome(true);
+          viewer.viewport.applyConstraints();
+          isInitialOpen = false;
+        }
+        onViewportChangeImmediate();
+        syncOverlay();
+      },
+      error: (err: any) => {
+        console.error("[OpenSeadragonViewer Initial Load Error]", err);
+      }
+    });
 
     return () => {
       if (rafPendingRef.current !== null) {
