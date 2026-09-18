@@ -5,7 +5,7 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-009688.svg)](https://fastapi.tiangolo.com)
 [![Next.js](https://img.shields.io/badge/Next.js-14.2+-black.svg)](https://nextjs.org)
 [![Google Cloud](https://img.shields.io/badge/GCP-Cloud%20Run%20%7C%20Vertex%20AI%20%7C%20GCS-4285F4.svg)](https://cloud.google.com)
-[![Tests](https://img.shields.io/badge/Tests-226%2F226%20Passing-brightgreen.svg)](backend/tests/)
+[![Tests](https://img.shields.io/badge/Tests-234%2F234%20Passing-brightgreen.svg)](backend/tests/)
 
 **OncoGemma v5** is a cloud-native clinical AI platform and diagnostic copilot for digital breast pathology. Designed for surgical pathologists analyzing gigapixel Whole-Slide Images (WSIs) of invasive breast carcinoma, OncoGemma automates slide ingestion, quality control, tumor bed triage, mitotic figure quantification, Nottingham Histologic Grading (Elston-Ellis modification), and College of American Pathologists (CAP) synoptic cancer reporting with AJCC 8th/9th Edition staging.
 
@@ -36,9 +36,9 @@ flowchart TD
     subgraph S3["Stage 3: Tumor Bed Triage & Hybrid Hotspot Referee"]
         D2 --> A3["Smart Scout: 2,048 Non-Overlapping Patches (80% Cellularity-Guided)"]
         A3 --> B3["Vertex AI Path Foundation ViT Embeddings (384-Dim)"]
-        B3 --> C3["Calibrated Linear Probe & Smooth 3-NN IDW Probability Grid"]
-        C3 --> D3["Candidate ROI Extraction (Top 15 Peaks)"]
-        D3 --> E3["MedGemma 1.5 Multimodal Referee (Invasive Carcinoma Adjudication)"]
+        B3 --> C3["Linear Probe + Nuclear OD Fusion with Margin Depth Penalization"]
+        C3 --> D3["Candidate ROI Extraction (Edge-Damped Smoothing, Top 20 Peaks)"]
+        D3 --> E3["MedGemma 1.5 Multimodal Referee (Strict Nuclear/Stroma Gating)"]
         E3 --> F3["Interactive Hotspot Workspace & DB Handoff (hs_01 - hs_10)"]
     end
 
@@ -126,15 +126,18 @@ flowchart TD
 ```mermaid
 flowchart TD
     A["Approved Slide & Stain Profile (Stage 2)"] --> B["Stage 3 Worker: Hotspot Triage (worker/triage.py)"]
-    B -->|"Smart Scout: 2,048 Non-Overlapping 224x224 µm Tiles"| C["Cellularity-Guided Sampling (80% Dense / 20% Context)"]
-    C -->|"Batched Inference (batch_size=32/64)"| D["Vertex AI Path Foundation ViT Endpoint (asia-south1)"]
+    B -->|"1. Morphological Opening & Component Pruning (>= 25 cells)"| C1["Sanitized Tissue Mask (Prune Debris & Borders)"]
+    C1 -->|"2. Euclidean Distance Transform"| C2["Margin Depth Map dist_from_edge"]
+    C1 -->|"3. Smart Scout: 2,048 Non-Overlapping 224x224 µm Tiles"| C3["Cellularity-Guided Sampling (80% Dense / 20% Context)"]
+    C3 -->|"4. Batched Inference (batch_size=32/64)"| D["Vertex AI Path Foundation ViT Endpoint (asia-south1)"]
     D -->|"384-Dim Representation Embeddings"| E["GCS Parquet Cache (Resolution Guarded)"]
-    E -->|"Calibrated Linear Probe Classifier"| F["Per-Tile Invasive Tumor Probability P(tumor)"]
-    F -->|"Smooth 3-NN Inverse Distance Weighting (IDW)"| G["Continuous 2D Probability Grid & Viridis Heatmap"]
-    G -->|"Contour & Peak Finding (max_hotspots=15)"| H["Candidate Hotspot ROIs (Up to 15 Candidates)"]
-    H -->|"Extract 10x Optical Crops (512x512 µm)"| I["MedGemma 1.5 Multimodal Visual Referee"]
-    I -->|"Adjudicate Invasive Carcinoma vs. Stroma/Adipose"| J["Histological Rationale, Cellularity & Confidence"]
-    J -->|"Prioritize Confirmed Invasive Carcinoma"| K["Top 10 Hotspots Ranked (hs_01 to hs_10)"]
+    E -->|"Linear Probe Classifier"| F1["Raw Representation Probabilities P_probe"]
+    F1 & C2 -->|"5. Fused with Normalized Optical Density OD_norm & Margin Factor"| F2["Fused Tumor Probability Field P_tumor"]
+    F2 -->|"6. Smooth 3-NN IDW Spatial Interpolation"| G["Continuous 2D Probability Grid & Viridis Heatmap"]
+    G -->|"7. Edge-Damped Smoothing & Margin-Weighted Peaks (max=20)"| H["Candidate Hotspot ROIs (Anchored in Core Centers)"]
+    H -->|"8. Extract 10x Optical Crops (512x512 µm)"| I["MedGemma 1.5 Multimodal Visual Referee"]
+    I -->|"Strict Gating: Reject Stroma (n_ratio<5%) & Margin Glass (<40% tissue)"| J["Histological Rationale, Cellularity & Confidence"]
+    J -->|"9. Prioritize Confirmed Invasive Carcinoma"| K["Top 10 Hotspots Ranked (hs_01 to hs_10)"]
     K -->|"Persist to GCS output.json & Sync to PostgreSQL"| L["Database Hotspots Table"]
     K --> M["Pathologist Interactive Triage Workspace (TriageViewer.tsx)"]
     M -->|"Independent Floating Controls (No Overlap)"| N["Fluid Viridis WSI Heatmap Overlay Toggle"]
@@ -144,10 +147,13 @@ flowchart TD
     Q -->|"Yes: Malignant Pathway"| R["Confirm Hotspots -> Queue Stage 4 Mitosis (10 HPFs Forwarded)"]
     Q -->|"No + no_invasive_tumor=True"| S["Benign Protocol -> Skip to Stage 6 Report"]
 ```
+* **Tissue Mask Opening & Debris Pruning**: Applies morphological opening (`scipy.ndimage.binary_opening`) and component size thresholding ($\ge 25$ cells) to prune isolated dust specks, glass margin shearing, and mechanical slide artifacts before patch placement.
 * **Smart Scout Non-Overlapping Grid**: Partitions slide into discrete $224 \times 224\,\mu\text{m}$ ($887 \times 887\,\text{px}$) tiles with strict zero geometric overlap ($\text{Intersection} = \emptyset$). Samples up to 2,048 patches with 80% cellularity-guided allocation targeting dense epithelial carcinoma nests and 20% slide-wide spatial context.
-* **Live Google Path Foundation Integration**: Connected to dedicated Vertex AI Vision Transformer (ViT) endpoint (`asia-south1`), streaming optical patches to produce 384-dimensional representation vectors. Automatically invalidates cached parquet if requested resolution increases.
-* **Smooth 3-NN IDW Probability Grid**: Decoupled from raw optical stain density, utilizing 3-Nearest Neighbor Inverse Distance Weighting (IDW) KDTree spatial interpolation to yield continuous, artifact-free tumor probability contours.
-* **MedGemma 1.5 Multimodal Visual Referee**: Evaluates $10\times$ candidate crops ($512 \times 512\,\mu\text{m}$) using visual pathology prompting to confirm `invasive_carcinoma` vs. `benign_stroma` / `adipose_tissue`, generating confidence scores and detailed histological justifications.
+* **Google Path Foundation & Cellularity ($OD$) Fusion**: Queries dedicated Vertex AI Vision Transformer (ViT) endpoint (`asia-south1`) to extract 384-dimensional representation vectors. Fuses representation probe probabilities ($35\%$) with authentic histological nuclear cellularity ($OD_{\text{norm}}$, $65\%$) and Euclidean margin distance transforms ($dist\_from\_edge$), elevating dense interior tumor nests to $0.75 - 0.95$ while penalizing border specks and acellular stroma.
+* **Edge-Damped Candidate Extraction**: Replaces bare division smoothing with edge-damped confidence weighting:
+  $$\text{smoothed} = \left(\frac{\text{smoothed\_prob}}{\max(\text{smoothed\_weight}, 0.35)}\right) \cdot \text{clip}\left(\frac{\text{smoothed\_weight}}{0.50}, 0.0, 1.0\right)$$
+  and ranks candidates by distance from tissue margin, anchoring hotspot centers within cohesive biopsy core interiors rather than on fragile shearing margins.
+* **Strict MedGemma 1.5 Multimodal Visual Referee**: Evaluates $10\times$ candidate crops ($512 \times 512\,\mu\text{m}$) using visual pathology prompting with strict morphological gating: immediately rejects peripheral edge crops ($<40\%$ tissue coverage) as `adipose` / background and hypocellular collagen ($<5\%$ basophilic nuclei) as `benign_stroma`, safeguarding that only bona fide invasive carcinoma nests are retained.
 * **Prioritized Top 10 Hotspots & DB Synchronization**: Ranks verified invasive carcinoma first, assigns standardized identifiers `hs_01` through `hs_10` with attached `medgemma_rationale`, and syncs GCS artifacts with PostgreSQL `hotspots` table to unblock Stage 4 Mitosis.
 * **Ergonomic UI & Fluid Heatmap**: Non-overlapping floating controls ensure heatmap toggles, hotspot visibility, and layer switchers remain unobstructed. Heatmap toggle reliably flushes canvas overlay; Microscopic Morphology Inspector modal exposes referee diagnostics.
 

@@ -325,6 +325,19 @@ def run_triage(stage_execution: StageExecution, session: Session) -> tuple[str, 
                     tissue_mask_overview = ~is_glass
                 od = np.maximum(0, -np.log10(np.clip(arr / 255.0, 1e-4, 1.0)))
                 stain_map = od.sum(axis=-1)
+
+                # Morphological sanitization: remove dust specks, glass borders, and isolated noise
+                from scipy import ndimage
+                opened_tissue = ndimage.binary_opening(tissue_mask_overview, structure=np.ones((3, 3)))
+                lbl_t, n_comp_t = ndimage.label(opened_tissue)
+                if n_comp_t > 0:
+                    comp_sizes = ndimage.sum(tissue_mask_overview, lbl_t, range(1, n_comp_t + 1))
+                    clean_tissue = np.zeros_like(tissue_mask_overview)
+                    for c_idx, c_sz in enumerate(comp_sizes, 1):
+                        if c_sz >= 25:  # Keep coherent tissue structures (biopsy cores / fragments >= 25 cells)
+                            clean_tissue[lbl_t == c_idx] = True
+                    if np.any(clean_tissue):
+                        tissue_mask_overview = clean_tissue
             except Exception:
                 tissue_mask_overview = tissue_mask if (tissue_mask is not None and tissue_mask.sum() > 0) else np.ones((ny, nx), dtype=bool)
                 stain_map = np.full((ny, nx), 0.5)
@@ -336,10 +349,23 @@ def run_triage(stage_execution: StageExecution, session: Session) -> tuple[str, 
         if tissue_mask_overview.sum() == 0:
             tissue_mask_overview[int(ny*0.2):int(ny*0.8), int(nx*0.2):int(nx*0.8)] = True
 
+        from scipy import ndimage
+        dist_from_edge = ndimage.distance_transform_edt(tissue_mask_overview)
+        margin_factor = np.clip(dist_from_edge / 2.0, 0.15, 1.0)
+
+        # Normalized histological cellularity across valid tissue
+        tissue_coords = [(ix, iy) for iy in range(ny) for ix in range(nx) if tissue_mask_overview[iy, ix]]
+        if tissue_coords:
+            stain_vals = [float(stain_map[iy, ix]) for (ix, iy) in tissue_coords]
+            p10 = float(np.percentile(stain_vals, 10))
+            p90 = float(np.percentile(stain_vals, 90))
+            norm_cellularity = np.clip((stain_map - p10) / max(p90 - p10, 1e-4), 0.0, 1.0)
+        else:
+            norm_cellularity = np.full((ny, nx), 0.5, dtype=np.float32)
+
         # 2. Smart Scout: High-resolution, cellularity-guided non-overlapping patch sampling
         sample_patches = []
         sampled_cells = []
-        tissue_coords = [(ix, iy) for iy in range(ny) for ix in range(nx) if tissue_mask_overview[iy, ix]]
 
         max_sample_patches = int(triage_cfg.get("max_sample_patches", 2048))
         if os_slide and tissue_coords:
@@ -488,14 +514,18 @@ def run_triage(stage_execution: StageExecution, session: Session) -> tuple[str, 
         avg_path_prob = float(np.mean(raw_probs)) if len(raw_probs) > 0 else 0.60
         print(f"[Triage Worker] Path Foundation embeddings shape: {embeddings.shape}, Mean Tumor Probe Prob: {avg_path_prob:.3f}")
 
-        # 5. Build 2D probability grid [ny, nx] by mapping raw_probs directly back onto the (ix, iy) grid
+        # 5. Build 2D probability grid [ny, nx] by fusing probe predictions with cellularity and margin depth
         prob_grid = np.full((ny, nx), np.nan, dtype=np.float32)
 
         n_match = min(len(sampled_cells), len(raw_probs))
         if n_match > 0:
             for k in range(n_match):
                 ix, iy = sampled_cells[k]
-                prob_grid[iy, ix] = float(np.clip(raw_probs[k], 0.05, 0.98))
+                base_prob = float(raw_probs[k])
+                cell_score = float(norm_cellularity[iy, ix])
+                m_factor = float(margin_factor[iy, ix])
+                fused_prob = (0.35 * base_prob + 0.65 * cell_score) * (0.40 + 0.60 * m_factor) * 1.25
+                prob_grid[iy, ix] = float(np.clip(fused_prob, 0.05, 0.98))
 
             matched_cells = sampled_cells[:n_match]
             unsampled_tissue = [(ix, iy) for (ix, iy) in tissue_coords if np.isnan(prob_grid[iy, ix])]
@@ -511,14 +541,20 @@ def run_triage(stage_execution: StageExecution, session: Session) -> tuple[str, 
                 weights /= np.sum(weights, axis=1, keepdims=True)
                 for idx, (ux, uy) in enumerate(unsampled_tissue):
                     interp_p = float(np.sum(weights[idx] * raw_probs[nn_indices[idx]]))
-                    prob_grid[uy, ux] = float(np.clip(interp_p, 0.05, 0.98))
+                    cell_score = float(norm_cellularity[uy, ux])
+                    m_factor = float(margin_factor[uy, ux])
+                    fused_interp = (0.35 * interp_p + 0.65 * cell_score) * (0.40 + 0.60 * m_factor) * 1.25
+                    prob_grid[uy, ux] = float(np.clip(fused_interp, 0.05, 0.98))
         elif tissue_coords:
             for ix, iy in tissue_coords:
-                prob_grid[iy, ix] = avg_path_prob
+                cell_score = float(norm_cellularity[iy, ix])
+                m_factor = float(margin_factor[iy, ix])
+                fused_prob = (0.35 * avg_path_prob + 0.65 * cell_score) * (0.40 + 0.60 * m_factor) * 1.25
+                prob_grid[iy, ix] = float(np.clip(fused_prob, 0.05, 0.98))
 
-        # Extract Candidate Hotspot ROIs (up to 15 candidates for referee screening)
+        # Extract Candidate Hotspot ROIs (up to 20 candidates for referee screening)
         candidate_cfg = dict(triage_cfg.get("hotspot_extraction", {}))
-        candidate_cfg["max_hotspots"] = 15
+        candidate_cfg["max_hotspots"] = 20
         raw_candidates = extract_hotspots(
             prob_grid=prob_grid,
             grid_origin_um=grid_origin_um,

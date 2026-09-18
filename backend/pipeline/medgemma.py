@@ -663,6 +663,14 @@ class MedGemmaClient:
                     confidence="high",
                     rationale="Acellular or lipid-depleted field predominantly consisting of mature adipose tissue or slide background."
                 )
+            elif tissue_frac < 0.40:
+                return TumorVerificationResponse(
+                    tumor_present=False,
+                    lesion_type="adipose",
+                    cellularity="low",
+                    confidence="high",
+                    rationale="Peripheral slide margin or acellular background with insufficient tissue coverage (<40%)."
+                )
 
             # Detect basophilic / hyperchromatic epithelial nuclei
             nuclear_mask = (g < 145) & (r < 185) & (b > 95) & (b > g * 0.88) & tissue_mask
@@ -673,7 +681,7 @@ class MedGemmaClient:
             stroma_mask = (r > g) & ((r - g) >= 15) & tissue_mask & ~nuclear_mask
             stroma_ratio = np.count_nonzero(stroma_mask) / max(tissue_count, 1)
 
-            if n_ratio >= 0.12:
+            if n_ratio >= 0.10:
                 return TumorVerificationResponse(
                     tumor_present=True,
                     lesion_type="invasive_carcinoma",
@@ -681,7 +689,7 @@ class MedGemmaClient:
                     confidence="high",
                     rationale="High cellular density with cohesive infiltrative epithelial nests and nuclear hyperchromasia, diagnostic of invasive carcinoma."
                 )
-            elif n_ratio >= 0.06:
+            elif n_ratio >= 0.05:
                 return TumorVerificationResponse(
                     tumor_present=True,
                     lesion_type="invasive_carcinoma",
@@ -689,29 +697,29 @@ class MedGemmaClient:
                     confidence="medium",
                     rationale="Moderate cellularity with infiltrating malignant epithelial nests amidst supportive desmoplastic stroma."
                 )
-            elif stroma_ratio > 0.65 and n_ratio < 0.04:
+            elif n_ratio < 0.05:
                 return TumorVerificationResponse(
                     tumor_present=False,
                     lesion_type="benign_stroma",
                     cellularity="low",
                     confidence="high",
-                    rationale="Hypocellular dense fibrous connective tissue and hyalinized stroma lacking malignant epithelial infiltration."
+                    rationale="Hypocellular fibrous connective tissue and collagen stroma lacking malignant epithelial infiltration (nuclear ratio < 5%)."
                 )
             else:
                 return TumorVerificationResponse(
-                    tumor_present=True,
-                    lesion_type="invasive_carcinoma",
+                    tumor_present=False,
+                    lesion_type="benign_stroma",
                     cellularity="low",
-                    confidence="low",
-                    rationale="Low epithelial cellularity with sparse atypical cells; retained as candidate for manual review."
+                    confidence="medium",
+                    rationale="Insufficient epithelial cellularity for invasive carcinoma."
                 )
         except Exception as e:
             return TumorVerificationResponse(
-                tumor_present=True,
+                tumor_present=False,
                 lesion_type="unassessed",
-                cellularity="medium",
+                cellularity="low",
                 confidence="low",
-                rationale=f"Automated verification fallback defaulted to retained candidate: {e}"
+                rationale=f"Automated verification fallback defaulted to rejected candidate: {e}"
             )
 
 

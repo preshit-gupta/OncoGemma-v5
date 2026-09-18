@@ -51,22 +51,48 @@ def extract_hotspots(
     if np.nanmax(prob_grid) < prob_threshold:
         return []
 
+    # Prune isolated specks (< 15 cells) to eliminate dust/scan perimeter artifacts
+    from scipy import ndimage
+    opened_mask = ndimage.binary_opening(valid_mask, structure=np.ones((3, 3)))
+    labeled_mask, num_c = ndimage.label(opened_mask)
+    if num_c > 0:
+        c_sizes = ndimage.sum(valid_mask, labeled_mask, range(1, num_c + 1))
+        for comp_i, comp_size in enumerate(c_sizes, 1):
+            if comp_size < 15:
+                valid_mask[labeled_mask == comp_i] = False
+
     prob_filled = np.nan_to_num(prob_grid, nan=0.0)
+    prob_filled[~valid_mask] = 0.0
+
     smoothed_prob = gaussian_filter(prob_filled, sigma=sigma)
     smoothed_weight = gaussian_filter(valid_mask.astype(float), sigma=sigma)
 
+    # Edge-damped smoothing: prevents isolated pixels or boundary fringes from retaining 100% of raw noise
     with np.errstate(divide="ignore", invalid="ignore"):
-        smoothed = np.where(smoothed_weight > 1e-5, smoothed_prob / smoothed_weight, 0.0)
+        smoothed = np.where(
+            smoothed_weight > 1e-4,
+            (smoothed_prob / np.maximum(smoothed_weight, 0.35)) * np.clip(smoothed_weight / 0.50, 0.0, 1.0),
+            0.0
+        )
 
     smoothed[~valid_mask] = 0.0
+
+    dist_from_edge = ndimage.distance_transform_edt(valid_mask)
+    has_interior = np.any(dist_from_edge >= 1.5)
+
+    def _coord_score(r: int, c: int) -> float:
+        base_s = float(smoothed[r, c])
+        if not has_interior or dist_from_edge[r, c] >= 1.5:
+            return base_s
+        return base_s * float(np.clip(dist_from_edge[r, c] / 1.5, 0.3, 1.0))
 
     # 1. Detect local maxima in probability across tissue
     footprint = np.ones((5, 5))
     local_max = (maximum_filter(smoothed, footprint=footprint) == smoothed) & (smoothed >= prob_threshold)
     max_coords = np.argwhere(local_max)
 
-    # Sort coordinates by smoothed probability descending
-    max_coords = sorted(max_coords, key=lambda c: smoothed[c[0], c[1]], reverse=True)
+    # Sort coordinates by interior-weighted score descending
+    max_coords = sorted(max_coords, key=lambda c: _coord_score(c[0], c[1]), reverse=True)
 
     hotspots = []
     origin_x, origin_y = grid_origin_um
@@ -145,7 +171,7 @@ def extract_hotspots(
     if len(hotspots) < max_hotspots:
         tissue_coords = np.argwhere(valid_mask)
         valid_coords = [c for c in tissue_coords if smoothed[c[0], c[1]] >= secondary_threshold]
-        valid_coords = sorted(valid_coords, key=lambda c: smoothed[c[0], c[1]], reverse=True)
+        valid_coords = sorted(valid_coords, key=lambda c: _coord_score(c[0], c[1]), reverse=True)
 
         for r, c in valid_coords:
             if len(hotspots) >= max_hotspots:
