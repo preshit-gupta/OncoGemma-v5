@@ -34,6 +34,11 @@ interface HotspotItem {
   excluded: boolean;
   exclude_reason?: string | null;
   thumbnail_url?: string | null;
+  medgemma_tumor_present?: boolean;
+  medgemma_lesion_type?: string;
+  medgemma_cellularity?: string;
+  medgemma_confidence?: string;
+  medgemma_rationale?: string;
 }
 
 interface TriageData {
@@ -836,6 +841,14 @@ export function TriageViewer({
                     <div>Max: <span className="text-slate-200">{hs.prob_max}</span></div>
                   </div>
 
+                  {hs.medgemma_rationale && (
+                    <div className="text-[10px] text-sky-300 bg-sky-950/40 p-1.5 rounded border border-sky-800/40 mb-2 leading-relaxed">
+                      <span className="font-semibold text-sky-400">Referee: </span>
+                      <span className="font-mono text-slate-200 uppercase text-[9px] mr-1">[{hs.medgemma_lesion_type?.replace('_', ' ') || 'TUMOR'}]</span>
+                      <span>{hs.medgemma_rationale}</span>
+                    </div>
+                  )}
+
                   {!hs.excluded && (
                     <div className="flex items-center space-x-2 pt-2 border-t border-slate-800/80">
                       <input
@@ -1024,10 +1037,30 @@ export function TriageViewer({
                 </div>
               </div>
 
+              {previewHotspot.medgemma_rationale && (
+                <div className="w-full text-xs text-slate-300 bg-sky-950/40 p-3 rounded-lg border border-sky-800/60 flex items-start space-x-2.5">
+                  <Activity className="w-4 h-4 text-sky-400 shrink-0 mt-0.5" />
+                  <div className="space-y-1">
+                    <div className="flex items-center space-x-2">
+                      <span className="font-semibold text-sky-300">MedGemma Referee Verdict:</span>
+                      <span className="font-mono text-[10px] uppercase px-1.5 py-0.5 rounded bg-sky-900/60 text-sky-200 border border-sky-700/60">
+                        {previewHotspot.medgemma_lesion_type?.replace('_', ' ')}
+                      </span>
+                      {previewHotspot.medgemma_cellularity && (
+                        <span className="text-[10px] text-slate-400">
+                          ({previewHotspot.medgemma_cellularity} cellularity)
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-slate-200 leading-relaxed text-[11px]">{previewHotspot.medgemma_rationale}</p>
+                  </div>
+                </div>
+              )}
+
               <div className="w-full text-[11px] text-slate-400 bg-slate-950/40 p-2.5 rounded-lg border border-slate-800/80 flex items-start space-x-2">
                 <Info className="w-3.5 h-3.5 text-sky-400 shrink-0 mt-0.5" />
                 <p>
-                  Screened via Vertex AI Path Foundation model. This ROI will be transferred to <strong>Stage 4 (Mitosis Counting)</strong> for high-power mitotic figure enumeration.
+                  Screened via Vertex AI Path Foundation and verified by MedGemma 1.5. This ROI will be transferred to <strong>Stage 4 (Mitosis Counting)</strong> for high-power mitotic figure enumeration.
                 </p>
               </div>
             </div>

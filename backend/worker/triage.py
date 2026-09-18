@@ -336,24 +336,71 @@ def run_triage(stage_execution: StageExecution, session: Session) -> tuple[str, 
         if tissue_mask_overview.sum() == 0:
             tissue_mask_overview[int(ny*0.2):int(ny*0.8), int(nx*0.2):int(nx*0.8)] = True
 
-        # 2. Sample real 224px @ 1.0 mpp patches from tissue locations for Google Path Foundation
+        # 2. Smart Scout: High-resolution, cellularity-guided non-overlapping patch sampling
         sample_patches = []
         sampled_cells = []
         tissue_coords = [(ix, iy) for iy in range(ny) for ix in range(nx) if tissue_mask_overview[iy, ix]]
 
+        max_sample_patches = int(triage_cfg.get("max_sample_patches", 2048))
         if os_slide and tissue_coords:
-            step = max(1, len(tissue_coords) // 128)
-            candidate_cells = tissue_coords[::step][:128]
             patch_dim_px = int(round(224.0 / mpp_x))
-            for ix, iy in candidate_cells:
+            cols = width_px // patch_dim_px
+            rows = height_px // patch_dim_px
+
+            # Enumerate strictly non-overlapping patch tile slots across the whole slide
+            candidate_slots = []
+            for r in range(rows):
+                for c in range(cols):
+                    x0 = c * patch_dim_px
+                    y0 = r * patch_dim_px
+                    cx_px = x0 + patch_dim_px // 2
+                    cy_px = y0 + patch_dim_px // 2
+                    ix = min(nx - 1, max(0, int(cx_px / (width_px / nx))))
+                    iy = min(ny - 1, max(0, int(cy_px / (height_px / ny))))
+
+                    if tissue_mask_overview[iy, ix]:
+                        cellularity_score = float(stain_map[iy, ix])
+                        candidate_slots.append({
+                            "c": c,
+                            "r": r,
+                            "x0": x0,
+                            "y0": y0,
+                            "cx_px": cx_px,
+                            "cy_px": cy_px,
+                            "ix": ix,
+                            "iy": iy,
+                            "score": cellularity_score
+                        })
+
+            # Smart Scout Selection: Prioritize high-cellularity tumor nests while maintaining slide coverage
+            if len(candidate_slots) <= max_sample_patches:
+                selected_slots = candidate_slots
+            else:
+                candidate_slots.sort(key=lambda s: s["score"], reverse=True)
+                # 80% budget for highest cellularity (dense tumor/epithelial regions)
+                n_cellular = int(round(0.80 * max_sample_patches))
+                dense_slots = candidate_slots[:n_cellular]
+                dense_keys = set((s["c"], s["r"]) for s in dense_slots)
+
+                # 20% budget spread evenly across remaining tissue (stroma/margins/background)
+                remaining_slots = [s for s in candidate_slots if (s["c"], s["r"]) not in dense_keys]
+                n_context = max_sample_patches - len(dense_slots)
+                if remaining_slots and n_context > 0:
+                    step_ctx = max(1, len(remaining_slots) // n_context)
+                    context_slots = remaining_slots[::step_ctx][:n_context]
+                else:
+                    context_slots = []
+
+                selected_slots = dense_slots + context_slots
+
+            print(f"[Triage Smart Scout] Selected {len(selected_slots)} non-overlapping patches (from {len(candidate_slots)} tissue slots, max budget {max_sample_patches})")
+
+            # Extract strictly non-overlapping patches
+            for s in selected_slots:
                 try:
-                    cx_px = int((ix + 0.5) * (width_px / nx))
-                    cy_px = int((iy + 0.5) * (height_px / ny))
-                    x0 = max(0, min(width_px - patch_dim_px, cx_px - patch_dim_px // 2))
-                    y0 = max(0, min(height_px - patch_dim_px, cy_px - patch_dim_px // 2))
-                    p_img = os_slide.read_region((x0, y0), 0, (patch_dim_px, patch_dim_px)).convert("RGB").resize((224, 224), Image.Resampling.BILINEAR)
+                    p_img = os_slide.read_region((s["x0"], s["y0"]), 0, (patch_dim_px, patch_dim_px)).convert("RGB").resize((224, 224), Image.Resampling.BILINEAR)
                     sample_patches.append(p_img)
-                    sampled_cells.append((ix, iy))
+                    sampled_cells.append((s["ix"], s["iy"]))
                 except Exception as pe:
                     print(f"[Triage Patch Extract Note] {pe}")
         elif not os_slide and tissue_coords:
@@ -374,8 +421,15 @@ def run_triage(stage_execution: StageExecution, session: Session) -> tuple[str, 
                 cached_embeddings = np.stack(df["emb"].values).astype(np.float32)
             else:
                 cached_embeddings = df.values.astype(np.float32)
-            endpoint_calls_made = 0
-            print(f"[Triage Worker] Loaded cached Path Foundation embeddings from GCS ({cached_embeddings.shape})")
+
+            # Invalidate cache if previous run had lower sampling resolution than current Smart Scout request
+            if sample_patches and len(cached_embeddings) < len(sample_patches):
+                print(f"[Triage Worker] Cached embeddings count ({len(cached_embeddings)}) < requested Smart Scout count ({len(sample_patches)}). Re-computing high-density embeddings.")
+                cached_embeddings = None
+                cached_cells = None
+            else:
+                endpoint_calls_made = 0
+                print(f"[Triage Worker] Loaded cached Path Foundation embeddings from GCS ({cached_embeddings.shape})")
         except Exception:
             cached_embeddings = None
             cached_cells = None
@@ -448,21 +502,91 @@ def run_triage(stage_execution: StageExecution, session: Session) -> tuple[str, 
             if unsampled_tissue:
                 from scipy.spatial import KDTree
                 kdtree = KDTree(matched_cells)
-                _, nn_indices = kdtree.query(unsampled_tissue)
-                for (ux, uy), nn_idx in zip(unsampled_tissue, nn_indices):
-                    prob_grid[uy, ux] = float(np.clip(raw_probs[nn_idx], 0.05, 0.98))
+                k_val = min(3, len(matched_cells))
+                dists, nn_indices = kdtree.query(unsampled_tissue, k=k_val)
+                if k_val == 1 or dists.ndim == 1:
+                    dists = dists[:, np.newaxis]
+                    nn_indices = nn_indices[:, np.newaxis]
+                weights = 1.0 / np.maximum(dists, 1.0)
+                weights /= np.sum(weights, axis=1, keepdims=True)
+                for idx, (ux, uy) in enumerate(unsampled_tissue):
+                    interp_p = float(np.sum(weights[idx] * raw_probs[nn_indices[idx]]))
+                    prob_grid[uy, ux] = float(np.clip(interp_p, 0.05, 0.98))
         elif tissue_coords:
             for ix, iy in tissue_coords:
                 prob_grid[iy, ix] = avg_path_prob
 
-        # Extract Hotspot ROIs (#82, #572)
-        hotspots = extract_hotspots(
+        # Extract Candidate Hotspot ROIs (up to 15 candidates for referee screening)
+        candidate_cfg = dict(triage_cfg.get("hotspot_extraction", {}))
+        candidate_cfg["max_hotspots"] = 15
+        raw_candidates = extract_hotspots(
             prob_grid=prob_grid,
             grid_origin_um=grid_origin_um,
             stride_um=(stride_x_um, stride_y_um),
-            cfg=triage_cfg["hotspot_extraction"],
+            cfg=candidate_cfg,
             slide_dimensions_um=(width_um, height_um)
         )
+
+        # MedGemma 1.5 Multimodal Verification of Candidate Hotspots
+        from pipeline.medgemma import MedGemmaClient
+        medgemma_client = MedGemmaClient()
+        mpp_x = float(slide_obj.mpp_x)
+        mpp_y = float(slide_obj.mpp_y)
+
+        verified_candidates = []
+        for cand in raw_candidates:
+            poly = np.array(cand["polygon_um"])
+            cx_um = float(poly[:, 0].mean())
+            cy_um = float(poly[:, 1].mean())
+            cx_px = int(cx_um / mpp_x)
+            cy_px = int(cy_um / mpp_y)
+
+            crop_w_px = max(1, int(round(512.0 / mpp_x)))
+            crop_h_px = max(1, int(round(512.0 / mpp_y)))
+            patch_10x = None
+            if os_slide:
+                try:
+                    dim_w, dim_h = os_slide.dimensions
+                    x0 = max(0, min(dim_w - crop_w_px, cx_px - crop_w_px // 2))
+                    y0 = max(0, min(dim_h - crop_h_px, cy_px - crop_h_px // 2))
+                    patch_10x = os_slide.read_region((x0, y0), 0, (crop_w_px, crop_h_px)).convert("RGB").resize((512, 512), Image.Resampling.BILINEAR)
+                except Exception as ce:
+                    print(f"[Triage Candidate Crop Note] {ce}")
+
+            if patch_10x is None:
+                patch_10x = Image.new("RGB", (512, 512), (238, 218, 222))
+
+            crop_buf = io.BytesIO()
+            patch_10x.save(crop_buf, "PNG")
+            crop_bytes = crop_buf.getvalue()
+
+            v_res = medgemma_client.evaluate_tumor_verification_sync(crop_bytes)
+            cand_copy = dict(cand)
+            cand_copy["medgemma_tumor_present"] = bool(v_res.tumor_present)
+            cand_copy["medgemma_lesion_type"] = str(v_res.lesion_type)
+            cand_copy["medgemma_cellularity"] = str(v_res.cellularity)
+            cand_copy["medgemma_confidence"] = str(v_res.confidence)
+            cand_copy["medgemma_rationale"] = str(v_res.rationale)
+            verified_candidates.append(cand_copy)
+
+        # Prioritize confirmed tumor regions, ranking by prob_mean descending
+        confirmed_tumors = [c for c in verified_candidates if c.get("medgemma_tumor_present")]
+        confirmed_tumors.sort(key=lambda c: c.get("prob_mean", 0.0), reverse=True)
+
+        unconfirmed = [c for c in verified_candidates if not c.get("medgemma_tumor_present")]
+        unconfirmed.sort(key=lambda c: c.get("prob_mean", 0.0), reverse=True)
+
+        selected = confirmed_tumors[:10]
+        if len(selected) < 10 and unconfirmed:
+            needed = 10 - len(selected)
+            selected.extend(unconfirmed[:needed])
+
+        # Finalize top 10 hotspots with clean IDs
+        hotspots = []
+        for idx, item in enumerate(selected):
+            item_copy = dict(item)
+            item_copy["id"] = f"hs_{idx + 1:02d}"
+            hotspots.append(item_copy)
 
         # Render Viridis heatmap overlay PNG
         heatmap_png_path = os.path.join(scratch_dir, "heatmap_triage.png")

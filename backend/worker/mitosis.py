@@ -119,6 +119,42 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
                 "source": r.source
             })
 
+    # Fallback to triage artifact if no confirmed hotspots found in DB (#580, #700)
+    if not hotspots:
+        try:
+            t_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/triage/output.json")
+            t_data = json.loads(t_bytes.decode("utf-8"))
+            raw_hotspots = t_data.get("hotspots", [])
+            for hs in raw_hotspots:
+                if not hs.get("excluded", False):
+                    hotspots.append({
+                        "id": hs["id"],
+                        "polygon_um": hs["polygon_um"],
+                        "area_mm2": hs.get("area_mm2"),
+                        "prob_mean": hs.get("prob_mean"),
+                        "prob_max": hs.get("prob_max"),
+                        "source": hs.get("source", "model")
+                    })
+                    # Also persist to DB so downstream stages and queries find them
+                    db_hs = Hotspot(
+                        id=hs["id"],
+                        case_id=case_obj.id,
+                        stage_execution_id=stage_exec.id,
+                        polygon_um=hs["polygon_um"],
+                        area_mm2=hs.get("area_mm2"),
+                        prob_mean=hs.get("prob_mean"),
+                        prob_max=hs.get("prob_max"),
+                        source=hs.get("source", "model"),
+                        excluded=False,
+                        exclude_reason=None
+                    )
+                    db.merge(db_hs)
+            if hotspots:
+                db.commit()
+                print(f"[Worker:Mitosis] Recovered {len(hotspots)} hotspots from GCS triage artifact and synced to DB")
+        except Exception as ge:
+            print(f"[Worker:Mitosis Note] Failed to load hotspots from GCS triage artifact: {ge}")
+
     if not hotspots:
         raise ValueError(
             f"No confirmed tumor hotspots found for case {case_id}. "

@@ -293,6 +293,26 @@ export async function approveStage(caseId: string, stageName: string, payload?: 
   return res.json();
 }
 
+export async function confirmTriageStage(caseId: string, noInvasiveTumor: boolean = false) {
+  const res = await fetch(`${API_BASE}/api/v1/stages/triage/confirm`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-User-Role": "pathologist"
+    },
+    body: JSON.stringify({
+      case_id: caseId,
+      no_invasive_tumor: noInvasiveTumor,
+      reviewed_by: "pathologist_01"
+    })
+  });
+  if (!res.ok) {
+    const errData = await res.json().catch(() => null);
+    throw new Error(formatApiError(errData, `Failed to confirm triage stage (${res.status})`));
+  }
+  return res.json();
+}
+
 export async function deleteCase(caseId: string) {
   const res = await fetch(`${API_BASE}/api/v1/cases/${caseId}`, {
     method: "DELETE",

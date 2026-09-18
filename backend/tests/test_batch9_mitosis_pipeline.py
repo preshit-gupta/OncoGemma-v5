@@ -9,6 +9,7 @@ Validates fixes for:
   - #129: Threshold alignment between configs/mitosis.yaml and models/detector/EVAL.md
 """
 import os
+import json
 import uuid
 import yaml
 from unittest.mock import patch
@@ -306,3 +307,58 @@ def test_config_and_eval_doc_threshold_alignment():
     assert f"det_threshold: {det_thresh}" in eval_md or f"{det_thresh}" in eval_md
     assert f"{ver_thresh}" in eval_md
     assert f"{nms_radius}" in eval_md
+
+
+# =========================================================================
+# GCS Triage Artifact Fallback Test
+# =========================================================================
+def test_worker_recovers_hotspots_from_triage_artifact():
+    """
+    Validates that when Hotspot table has 0 rows, run_mitosis recovers
+    hotspots from cases/{case_id}/triage/output.json in GCS and populates DB.
+    """
+    db = TestingSessionLocal()
+    case_id = uuid.uuid4()
+    case = Case(id=case_id, created_by="test_pathologist", status="open")
+    slide = Slide(
+        id=uuid.uuid4(),
+        case_id=case_id,
+        gcs_uri_original="gs://raw/slide.svs",
+        width_px=10000,
+        height_px=10000,
+        mpp_x=0.25,
+        mpp_y=0.25
+    )
+    stage_exec = StageExecution(id=uuid.uuid4(), case_id=case_id, stage="mitosis", attempt=1, status="queued")
+    db.add_all([case, slide, stage_exec])
+    db.commit()
+
+    mock_triage_output = json.dumps({
+        "hotspots": [
+            {
+                "id": "hs_01",
+                "polygon_um": [[100.0, 100.0], [700.0, 100.0], [700.0, 700.0], [100.0, 700.0], [100.0, 100.0]],
+                "area_mm2": 0.36,
+                "prob_mean": 0.479,
+                "prob_max": 0.479,
+                "source": "model",
+                "excluded": False
+            }
+        ]
+    }).encode("utf-8")
+
+    with patch("worker.mitosis.download_blob_as_bytes", return_value=mock_triage_output):
+        # Even if downstream slide extraction fails later, the hotspot check must succeed and persist to DB
+        try:
+            run_mitosis(stage_exec, db)
+        except Exception as e:
+            # Must NOT be "No confirmed tumor hotspots found"
+            assert "No confirmed tumor hotspots found" not in str(e)
+
+    # Verify hotspot was persisted into the DB
+    recovered = db.scalars(select(Hotspot).where(Hotspot.case_id == case_id)).all()
+    assert len(recovered) == 1
+    assert recovered[0].id == "hs_01"
+    assert recovered[0].area_mm2 == 0.36
+    db.close()
+

@@ -30,18 +30,20 @@ flowchart TD
         C1 --> A2["Otsu Tissue Segmentation & Area Analysis"]
         A2 --> B2["5-Check Automated Pre-Flight QC Engine"]
         B2 --> C2["Calibrated Optical Density Macenko Normalization"]
-        C2 --> D2["Pathologist QC Gate & Confirmation"]
+        C2 --> D2["Pathologist QC Review & Explicit Confirmation Gate"]
     end
 
-    subgraph S3["Stage 3: Tumor Bed Triage"]
-        D2 --> A3["10x Tissue Patch Grid Generation"]
-        A3 --> B3["Vertex AI Path Foundation ViT Embeddings"]
-        B3 --> C3["Calibrated Linear Probe & Viridis Heatmap"]
-        C3 --> D3["Interactive Hotspot ROI Review Workspace"]
+    subgraph S3["Stage 3: Tumor Bed Triage & Hybrid Hotspot Referee"]
+        D2 --> A3["Smart Scout: 2,048 Non-Overlapping Patches (80% Cellularity-Guided)"]
+        A3 --> B3["Vertex AI Path Foundation ViT Embeddings (384-Dim)"]
+        B3 --> C3["Calibrated Linear Probe & Smooth 3-NN IDW Probability Grid"]
+        C3 --> D3["Candidate ROI Extraction (Top 15 Peaks)"]
+        D3 --> E3["MedGemma 1.5 Multimodal Referee (Invasive Carcinoma Adjudication)"]
+        E3 --> F3["Interactive Hotspot Workspace & DB Handoff (hs_01 - hs_10)"]
     end
 
     subgraph S4["Stage 4: Mitosis Detection & Virtual HPFs"]
-        D3 --> A4["True 40x Optical Candidate Sweep"]
+        F3 --> A4["True 40x Optical Candidate Sweep"]
         A4 --> B4["Van Diest Morphological Mimic Filtering & MedGemma Referee"]
         B4 --> C4["Density-Conscious 10-HPF Spatial Convolution"]
         C4 --> D4["Pathologist Mitosis Studio (Score 1/2/3)"]
@@ -103,9 +105,10 @@ flowchart TD
     F -->|"Tissue Coverage + Focus Variance + Pen Marks + Folds + Stain Sanity"| G{"QC Checks Pass?"}
     G -->|"PASS"| H["Status: open / awaiting_review"]
     G -->|"FAIL"| I["Status: needs_rescan / warn"]
-    H & I --> J["Pathologist QC Review Workspace"]
+    H & I --> J["Pathologist QC Review Workspace (Dual-Layer Viewer)"]
+    J -->|"Inspect Original vs. Macenko Normalized Slide"| K["Verify Color Fidelity & Tissue Masks"]
+    K -->|"Explicit Confirmation Gate (confirm_stage API)"| L["Confirm Stage 2 -> Advance & Queue Stage 3 Triage"]
     J -->|"Override QC or Re-Process"| B
-    J -->|"Approve Slide"| K["Queue Stage 3: Hotspot Triage"]
 ```
 * **Tissue Segmentation**: Otsu thresholding in HSV color space differentiates cellular tissue parenchyma from background glass and empty lumina.
 * **5-Check Automated Pre-Flight QC**:
@@ -115,6 +118,7 @@ flowchart TD
   * **Tissue Folds & Tears**: Morphological skeleton analysis identifies mechanical fold ridges.
   * **Stain Sanity**: Assesses Hematoxylin-to-Eosin optical density balance and concentration boundaries.
 * **Fitted Macenko Stain Normalization**: Transforms slide optical density using fitted source stain matrices and calibrated reference targets (`W_target`: Hematoxylin `[0.644, 0.717, 0.267]`, Eosin `[0.093, 0.954, 0.283]`), ensuring consistent color fidelity across scanners.
+* **Pathologist Confirmation Gate & Protected Layers**: Eliminates race conditions and unprompted auto-advancement; requires explicit review and confirmation before advancing to Stage 3. Independent OpenSeadragon tiled layers preserve normalized slide tiles without overlay purges.
 
 ---
 
@@ -122,22 +126,30 @@ flowchart TD
 ```mermaid
 flowchart TD
     A["Approved Slide & Stain Profile (Stage 2)"] --> B["Stage 3 Worker: Hotspot Triage (worker/triage.py)"]
-    B -->|"Extract 10x 224x224 Optical Patches"| C["Vertex AI Path Foundation ViT Endpoint (asia-south1)"]
-    C -->|"384-Dim Representation Embeddings"| D["GCS Parquet Cache (oncogemma-dev-artifacts)"]
-    D -->|"Calibrated Linear Probe Classifier"| E["Per-Tile Invasive Tumor Probability P(tumor)"]
-    E -->|"Spatial KDE & Viridis Colormap"| F["2D Probability Grid & Dynamic RGBA Heatmap Overlay"]
-    F -->|"DBSCAN Spatial ROI Contouring"| G["Automated Tumor Bed Hotspots (hs_01 to hs_10)"]
-    G --> H["Pathologist Interactive Triage Workspace (TriageViewer.tsx)"]
-    H -->|"Non-Destructive Opacity Slider (10% - 100%)"| I["Fluid Viridis WSI Heatmap Overlay"]
-    H -->|"Add / Delete / Exclude ROIs"| J["Pathologist Hotspot Polygon Review"]
-    H -->|"Zero-Tumor Confirmation Gate"| K{"Active Hotspots > 0?"}
-    K -->|"Yes: Malignant Pathway"| L["Confirm Hotspots -> Queue Stage 4 Mitosis"]
-    K -->|"No + no_invasive_tumor=True"| M["Benign Protocol -> Skip to Stage 6 Report"]
+    B -->|"Smart Scout: 2,048 Non-Overlapping 224x224 µm Tiles"| C["Cellularity-Guided Sampling (80% Dense / 20% Context)"]
+    C -->|"Batched Inference (batch_size=32/64)"| D["Vertex AI Path Foundation ViT Endpoint (asia-south1)"]
+    D -->|"384-Dim Representation Embeddings"| E["GCS Parquet Cache (Resolution Guarded)"]
+    E -->|"Calibrated Linear Probe Classifier"| F["Per-Tile Invasive Tumor Probability P(tumor)"]
+    F -->|"Smooth 3-NN Inverse Distance Weighting (IDW)"| G["Continuous 2D Probability Grid & Viridis Heatmap"]
+    G -->|"Contour & Peak Finding (max_hotspots=15)"| H["Candidate Hotspot ROIs (Up to 15 Candidates)"]
+    H -->|"Extract 10x Optical Crops (512x512 µm)"| I["MedGemma 1.5 Multimodal Visual Referee"]
+    I -->|"Adjudicate Invasive Carcinoma vs. Stroma/Adipose"| J["Histological Rationale, Cellularity & Confidence"]
+    J -->|"Prioritize Confirmed Invasive Carcinoma"| K["Top 10 Hotspots Ranked (hs_01 to hs_10)"]
+    K -->|"Persist to GCS output.json & Sync to PostgreSQL"| L["Database Hotspots Table"]
+    K --> M["Pathologist Interactive Triage Workspace (TriageViewer.tsx)"]
+    M -->|"Independent Floating Controls (No Overlap)"| N["Fluid Viridis WSI Heatmap Overlay Toggle"]
+    M -->|"Inspect Referee Diagnostics & Rationale"| O["Microscopic Morphology Inspector Modal"]
+    M -->|"Add / Delete / Exclude ROIs"| P["Pathologist Hotspot Polygon Review"]
+    M -->|"Zero-Tumor Confirmation Gate"| Q{"Active Hotspots > 0?"}
+    Q -->|"Yes: Malignant Pathway"| R["Confirm Hotspots -> Queue Stage 4 Mitosis (10 HPFs Forwarded)"]
+    Q -->|"No + no_invasive_tumor=True"| S["Benign Protocol -> Skip to Stage 6 Report"]
 ```
-* **Live Google Path Foundation Integration**: Connected to a dedicated Vertex AI Vision Transformer (ViT) endpoint (`asia-south1`), streaming optical patches to produce 384-dimensional representation vectors.
-* **Calibrated Linear Probe**: Predicts tumor probability scores P(invasive carcinoma) per tile to localize active tumor margins.
-* **Fluid Viridis Heatmap Overlay**: High-resolution RGBA probability overlay registered with slide coordinates. Pathologists adjust opacity dynamically (10%–100%) with non-destructive client-side rendering.
-* **Interactive Hotspot Workspace**: Allows pathologists to inspect candidate regions of interest (ROIs), adjust contour thresholds, manually add/delete ROIs, or confirm benign slides via explicit zero-tumor verification.
+* **Smart Scout Non-Overlapping Grid**: Partitions slide into discrete $224 \times 224\,\mu\text{m}$ ($887 \times 887\,\text{px}$) tiles with strict zero geometric overlap ($\text{Intersection} = \emptyset$). Samples up to 2,048 patches with 80% cellularity-guided allocation targeting dense epithelial carcinoma nests and 20% slide-wide spatial context.
+* **Live Google Path Foundation Integration**: Connected to dedicated Vertex AI Vision Transformer (ViT) endpoint (`asia-south1`), streaming optical patches to produce 384-dimensional representation vectors. Automatically invalidates cached parquet if requested resolution increases.
+* **Smooth 3-NN IDW Probability Grid**: Decoupled from raw optical stain density, utilizing 3-Nearest Neighbor Inverse Distance Weighting (IDW) KDTree spatial interpolation to yield continuous, artifact-free tumor probability contours.
+* **MedGemma 1.5 Multimodal Visual Referee**: Evaluates $10\times$ candidate crops ($512 \times 512\,\mu\text{m}$) using visual pathology prompting to confirm `invasive_carcinoma` vs. `benign_stroma` / `adipose_tissue`, generating confidence scores and detailed histological justifications.
+* **Prioritized Top 10 Hotspots & DB Synchronization**: Ranks verified invasive carcinoma first, assigns standardized identifiers `hs_01` through `hs_10` with attached `medgemma_rationale`, and syncs GCS artifacts with PostgreSQL `hotspots` table to unblock Stage 4 Mitosis.
+* **Ergonomic UI & Fluid Heatmap**: Non-overlapping floating controls ensure heatmap toggles, hotspot visibility, and layer switchers remain unobstructed. Heatmap toggle reliably flushes canvas overlay; Microscopic Morphology Inspector modal exposes referee diagnostics.
 
 ---
 

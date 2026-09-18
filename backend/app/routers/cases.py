@@ -477,6 +477,37 @@ def approve_case_stage(
     current_stage.reviewed_by = user.id
     current_stage.reviewed_at = now_utc
 
+    # Ensure Hotspot DB records exist so Stage 4 Mitosis detection can proceed (#580, #700)
+    if stage_name == "triage":
+        existing_hs_count = db.query(Hotspot).filter(Hotspot.case_id == case_id).count()
+        if existing_hs_count == 0:
+            try:
+                import json
+                from app.core.gcs import download_blob_as_bytes
+                from app.routers.triage import apply_edit_ops
+                out_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/triage/output.json")
+                machine_hotspots = json.loads(out_bytes.decode("utf-8")).get("hotspots", [])
+                edits = current_stage.review_edits or []
+                effective_hotspots = apply_edit_ops(machine_hotspots, edits)
+                for hs in effective_hotspots:
+                    hs_row = Hotspot(
+                        id=hs["id"],
+                        case_id=case_id,
+                        stage_execution_id=current_stage.id,
+                        polygon_um=hs["polygon_um"],
+                        area_mm2=hs.get("area_mm2"),
+                        prob_mean=hs.get("prob_mean"),
+                        prob_max=hs.get("prob_max"),
+                        source=hs.get("source", "model"),
+                        excluded=hs.get("excluded", False),
+                        exclude_reason=hs.get("exclude_reason")
+                    )
+                    db.add(hs_row)
+                db.flush()
+                print(f"[Cases Router] Synced {len(effective_hotspots)} hotspots from triage artifact into DB for case {case_id}")
+            except Exception as e:
+                print(f"[Cases Router Note] Could not sync hotspots from triage output.json: {e}")
+
     # Determine next stage name
     next_stage_map = {
         "preprocess": "triage",

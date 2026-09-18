@@ -2,6 +2,7 @@
 mpp_target: 1.0 # 10x magnification (~1.0 µm/px)
 patch_size_px: 224 # 224x224 patch grid
 tissue_threshold_pct: 0.25 # Keep patch if >= 25% tissue mask coverage
+max_sample_patches: 2048 # High-resolution Smart Scout tissue sampling for Path Foundation (non-overlapping)
 
 vertex_ai:
   batch_size: 64 # Batched embedding request size

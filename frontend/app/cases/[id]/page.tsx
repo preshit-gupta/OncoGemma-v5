@@ -3,7 +3,7 @@
 import React, { useEffect, useState, useRef } from "react";
 import Link from "next/link";
 import { ArrowLeft, RefreshCcw, Info, X, Microscope, AlertTriangle, CheckCircle2, RotateCcw } from "lucide-react";
-import { fetchCaseDetail, CaseDetail, retryStage, approveStage, updateSlideMpp } from "@/lib/api";
+import { fetchCaseDetail, CaseDetail, retryStage, approveStage, confirmTriageStage, updateSlideMpp } from "@/lib/api";
 import { formatISTDateTime } from "@/lib/utils";
 import dynamic from "next/dynamic";
 import { StageRail } from "@/components/viewer/StageRail";
@@ -222,7 +222,12 @@ export default function CaseWorkspacePage({ params }: { params: { id: string } }
     setActionLoading(true);
     setActionError(null);
     try {
-      await approveStage(caseId, "triage");
+      try {
+        await confirmTriageStage(caseId, false);
+      } catch (confirmErr) {
+        console.warn("confirmTriageStage returned error, falling back to approveStage:", confirmErr);
+        await approveStage(caseId, "triage");
+      }
       setHasUserNavigated(true);
       setActiveStage("mitosis");
       await loadData();
