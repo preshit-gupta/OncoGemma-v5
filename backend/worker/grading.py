@@ -19,22 +19,19 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple, Optional
 import numpy as np
 from PIL import Image
-from sqlalchemy import select, delete
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.gcs import (
-    get_gcs_client,
     parse_gcs_uri,
     upload_blob_from_bytes,
     download_blob_as_bytes,
     download_blob_to_filename,
-    get_gcs_artifact_direct_url,
     resolve_slide_raw_uri
 )
 from app.core.openslide_lock import OPENSLIDE_GLOBAL_LOCK
 from app.models.case import Case
-from app.models.slide import Slide
 from app.models.stage_execution import StageExecution
 from app.models.hotspot import Hotspot
 from app.models.hpf_site import HpfSite
@@ -44,8 +41,7 @@ from app.models.audit import AuditEvent
 from pipeline.stain import MacenkoNormalizer
 from pipeline.grading import (
     aggregate_grading_findings,
-    load_scoring_config,
-    validate_grading_invariants
+    load_scoring_config
 )
 from pipeline.medgemma import (
     MedGemmaClient,
@@ -75,8 +71,9 @@ def extract_10x_patch(
     crop_w_l0 = int(patch_size_px * downsample)
     crop_h_l0 = int(patch_size_px * downsample)
     
-    top_left_x = max(0, int(center_x - crop_w_l0 / 2))
-    top_left_y = max(0, int(center_y - crop_h_l0 / 2))
+    dims = slide_obj.dimensions
+    top_left_x = max(0, min(dims[0] - crop_w_l0, int(center_x - crop_w_l0 / 2)))
+    top_left_y = max(0, min(dims[1] - crop_h_l0, int(center_y - crop_h_l0 / 2)))
     
     with OPENSLIDE_GLOBAL_LOCK:
         rgba = slide_obj.read_region((top_left_x, top_left_y), 0, (crop_w_l0, crop_h_l0))
@@ -98,7 +95,8 @@ def select_max_density_hotspot_patches(
     patch_size_um: float = 512.0,
     min_dist_um: float = 384.0,
     min_density: float = 0.50,
-    checksum_sha256: Optional[str] = None
+    checksum_sha256: Optional[str] = None,
+    mpp_y: Optional[float] = None
 ) -> List[Dict[str, Any]]:
     """
     Selects n_patches (24) 10x evidence patches ensuring:
@@ -107,9 +105,12 @@ def select_max_density_hotspot_patches(
     3. Additional non-overlapping high-density sites inside hotspots or on invasive tumor margins are selected
        until exactly n_patches are obtained.
     4. Deterministic sampling is seeded by slide checksum (Issue #145).
+    5. Centroid is calculated via true polygon area centroid and supports anisotropic mpp_y (Issue #765).
     """
     from scipy.ndimage import uniform_filter
     from shapely.geometry import Polygon, Point
+
+    eff_mpp_y = mpp_y if mpp_y and mpp_y > 0 else base_mpp
 
     seed_int = int(checksum_sha256[:8], 16) if checksum_sha256 and checksum_sha256 != "default_checksum" else 42
     rng = np.random.default_rng(seed_int)
@@ -165,8 +166,13 @@ def select_max_density_hotspot_patches(
                     all_internal_cands.append((x, y, d, hs_id, prob, "hotspot_subregion"))
 
         if not cand_points:
-            cx_um = float(poly_arr[:, 0].mean())
-            cy_um = float(poly_arr[:, 1].mean())
+            if poly_geom.is_valid and not poly_geom.is_empty:
+                centroid = poly_geom.centroid
+                cx_um = float(centroid.x)
+                cy_um = float(centroid.y)
+            else:
+                cx_um = float(poly_arr[:, 0].mean())
+                cy_um = float(poly_arr[:, 1].mean())
             pmx = int(np.clip(round(cx_um * s_x), 0, W_m - 1))
             pmy = int(np.clip(round(cy_um * s_y), 0, H_m - 1))
             d = float(density_map[pmy, pmx])
@@ -190,7 +196,7 @@ def select_max_density_hotspot_patches(
                     "hotspot_id": h["id"],
                     "center_um": [round(float(x), 2), round(float(y), 2)],
                     "center_x_px": int(round(x / base_mpp)),
-                    "center_y_px": int(round(y / base_mpp)),
+                    "center_y_px": int(round(y / eff_mpp_y)),
                     "tissue_density": round(d, 4),
                     "tumor_probability": round(h["prob"], 4),
                     "source": "hotspot_peak"
@@ -208,7 +214,7 @@ def select_max_density_hotspot_patches(
                 "hotspot_id": hs_id,
                 "center_um": [round(float(x), 2), round(float(y), 2)],
                 "center_x_px": int(round(x / base_mpp)),
-                "center_y_px": int(round(y / base_mpp)),
+                "center_y_px": int(round(y / eff_mpp_y)),
                 "tissue_density": round(d, 4),
                 "tumor_probability": round(prob, 4),
                 "source": src
@@ -240,7 +246,7 @@ def select_max_density_hotspot_patches(
                     "hotspot_id": hs_id,
                     "center_um": [round(float(x), 2), round(float(y), 2)],
                     "center_x_px": int(round(x / base_mpp)),
-                    "center_y_px": int(round(y / base_mpp)),
+                    "center_y_px": int(round(y / eff_mpp_y)),
                     "tissue_density": round(d, 4),
                     "tumor_probability": round(prob * 0.95, 4),
                     "source": "hotspot_margin"
@@ -257,7 +263,7 @@ def select_max_density_hotspot_patches(
                     "hotspot_id": hs_id,
                     "center_um": [round(float(x), 2), round(float(y), 2)],
                     "center_x_px": int(round(x / base_mpp)),
-                    "center_y_px": int(round(y / base_mpp)),
+                    "center_y_px": int(round(y / eff_mpp_y)),
                     "tissue_density": round(d, 4),
                     "tumor_probability": round(prob, 4),
                     "source": src
@@ -398,7 +404,8 @@ def run_grading(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str,
             case_id=case_id,
             n_patches=n_patches,
             patch_size_um=patch_size_um,
-            checksum_sha256=getattr(slide, "checksum_sha256", None)
+            checksum_sha256=getattr(slide, "checksum_sha256", None),
+            mpp_y=float(slide.mpp_y) if getattr(slide, "mpp_y", None) else None
         )
 
         normalizer = MacenkoNormalizer()
@@ -567,12 +574,15 @@ def run_grading(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str,
         hpfs_output = []
         for h in sorted(hpf_sites, key=lambda x: getattr(x, "seq", 0)):
             cnt = getattr(h, "mitotic_count", getattr(h, "mitotic_figure_count", 0))
+            r_um = float(getattr(h, "radius_um", 262.0) or 262.0)
+            hpf_area_mm2 = math.pi * (r_um / 1000.0) ** 2
+            density = round(cnt / hpf_area_mm2, 1) if hpf_area_mm2 > 0 else 0.0
             hpfs_output.append({
                 "seq": h.seq,
                 "center_um": h.center_um if isinstance(h.center_um, list) else [0, 0],
-                "radius_um": getattr(h, "radius_um", 262.0),
+                "radius_um": r_um,
                 "mitotic_count": cnt,
-                "density_mm2": round(cnt / 0.2157, 1),
+                "density_mm2": density,
                 "review_status": "suggested"
             })
 
@@ -605,6 +615,7 @@ def run_grading(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str,
             "slide_id": slide_id,
             "patches": patches_output,
             "hpfs": hpfs_output,
+            "evidence": {"morphometry": None},
             "aggregate": aggregate_res,
             "histologic_type": type_response.model_dump(),
             "narrative": narrative_text,

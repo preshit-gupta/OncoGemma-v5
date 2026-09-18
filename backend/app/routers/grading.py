@@ -9,26 +9,26 @@ patch image streaming, and clinical confirmation gate with mandatory dual-level 
 import os
 import io
 import json
+import math
 import uuid
 import tempfile
 import shutil
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Literal
 import numpy as np
+import yaml
 from PIL import Image
-from fastapi import APIRouter, Depends, HTTPException, status, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, status, Response
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.auth import get_current_user, CurrentUser
 from app.core.openslide_lock import OPENSLIDE_GLOBAL_LOCK
 from app.core.gcs import (
-    get_gcs_client,
     parse_gcs_uri,
     download_blob_as_bytes,
-    download_blob_to_filename,
     resolve_slide_raw_uri
 )
 from app.core.db import get_db
@@ -59,9 +59,28 @@ router = APIRouter(prefix="/api/v1/stages/grading", tags=["grading"])
 # ---------------------------------------------------------------------------
 
 VALID_OVERRIDE_COMPONENTS = {"tubule", "pleo", "mitotic", "patches", "hpfs"}
-VALID_HISTOLOGIC_TYPES = {
-    "IDC-NST", "ILC", "mucinous", "tubular", "papillary", "metaplastic", "other"
-}
+ALLOWED_CONFIRM_OVERRIDE_COMPONENTS = {"tubule", "pleo", "mitotic"}
+
+
+def load_cap_histologic_types() -> set[str]:
+    """Load authorized CAP histologic type IDs from configs/cap_elements.yaml."""
+    cap_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../configs/cap_elements.yaml"))
+    if os.path.exists(cap_path):
+        try:
+            with open(cap_path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+                types = {t["id"] for t in data.get("histologic_types", []) if "id" in t}
+                if types:
+                    return types
+        except Exception:
+            pass
+    return {
+        "IDC-NST", "ILC", "mucinous", "tubular", "papillary",
+        "micropapillary", "metaplastic", "apocrine", "medullary_features", "other"
+    }
+
+
+VALID_HISTOLOGIC_TYPES = load_cap_histologic_types()
 
 class ScoreOverrideItem(BaseModel):
     score: Optional[int] = Field(None, ge=1, le=3)
@@ -73,9 +92,7 @@ class ScoreOverrideItem(BaseModel):
 
 class ConfirmHistologicTypePayload(BaseModel):
     case_id: str
-    histologic_type: Literal[
-        "IDC-NST", "ILC", "mucinous", "tubular", "papillary", "metaplastic", "other"
-    ]
+    histologic_type: str
     justification: Optional[str] = None
     reviewed_by: Optional[str] = "user_pathologist_001"
 
@@ -137,12 +154,13 @@ class ConfirmGradingPayload(BaseModel):
         if not isinstance(v, dict):
             raise ValueError("Overrides must be a dictionary.")
         for k, item in v.items():
-            if k not in VALID_OVERRIDE_COMPONENTS:
-                raise ValueError(f"Unknown override component '{k}'. Must be one of {sorted(VALID_OVERRIDE_COMPONENTS)}.")
-            if k in ("tubule", "pleo", "mitotic"):
-                if not isinstance(item, dict):
-                    raise ValueError(f"Override for '{k}' must be a dictionary.")
-                ScoreOverrideItem.model_validate(item)
+            if k not in ALLOWED_CONFIRM_OVERRIDE_COMPONENTS:
+                raise ValueError(
+                    f"Unknown or unauthorized override component '{k}'. Confirmation overrides are restricted to {sorted(ALLOWED_CONFIRM_OVERRIDE_COMPONENTS)} to protect stored patch and HPF reviews."
+                )
+            if not isinstance(item, dict):
+                raise ValueError(f"Override for '{k}' must be a dictionary.")
+            ScoreOverrideItem.model_validate(item)
         return v
 
 
@@ -273,17 +291,19 @@ def _build_grading_stage_data_dict(
     if not raw_hpfs:
         db_hpfs = list(db.scalars(select(HpfSite).where(HpfSite.case_id == case_uid)).all())
         if db_hpfs:
-            raw_hpfs = [
-                {
+            raw_hpfs = []
+            for h in sorted(db_hpfs, key=lambda x: getattr(x, "seq", 0)):
+                cnt = getattr(h, "mitotic_count", getattr(h, "mitotic_figure_count", 0))
+                r_um = float(getattr(h, "radius_um", 262.0) or 262.0)
+                h_area = math.pi * (r_um / 1000.0) ** 2
+                raw_hpfs.append({
                     "seq": h.seq,
                     "center_um": h.center_um if isinstance(h.center_um, list) else [0, 0],
-                    "radius_um": getattr(h, "radius_um", 262.0),
-                    "mitotic_count": getattr(h, "mitotic_count", getattr(h, "mitotic_figure_count", 0)),
-                    "density_mm2": round(getattr(h, "mitotic_count", getattr(h, "mitotic_figure_count", 0)) / 0.2157, 1),
+                    "radius_um": r_um,
+                    "mitotic_count": cnt,
+                    "density_mm2": round(cnt / h_area, 1) if h_area > 0 else 0.0,
                     "review_status": "suggested"
-                }
-                for h in sorted(db_hpfs, key=lambda x: getattr(x, "seq", 0))
-            ]
+                })
         else:
             raw_hpfs = []
 
@@ -294,13 +314,11 @@ def _build_grading_stage_data_dict(
         ovr = hpf_overrides.get(h_seq_key) or hpf_overrides.get(h["seq"])
         if ovr:
             h_copy["review_status"] = ovr.get("status", "approved")
-            h_copy["user_mitotic_count"] = ovr.get("mitotic_count")
             h_copy["user_notes"] = ovr.get("notes")
             h_copy["reviewed_by"] = ovr.get("reviewed_by")
             h_copy["reviewed_at"] = ovr.get("reviewed_at")
         else:
             h_copy["review_status"] = h.get("review_status", "suggested")
-            h_copy["user_mitotic_count"] = None
             h_copy["user_notes"] = None
             h_copy["reviewed_by"] = None
             h_copy["reviewed_at"] = None
@@ -374,7 +392,10 @@ def _build_grading_stage_data_dict(
     eff_pleo_score = _safe_override_score("pleo", dyn_agg["pleo_score"])
     eff_mitotic_score = _safe_override_score("mitotic", calc_mitotic_score)
 
-    eff_sum, eff_grade = calculate_nottingham_grade(eff_tubule_score, eff_pleo_score, eff_mitotic_score, scoring_cfg)
+    if eff_tubule_score is not None and eff_pleo_score is not None and eff_mitotic_score is not None:
+        eff_sum, eff_grade = calculate_nottingham_grade(eff_tubule_score, eff_pleo_score, eff_mitotic_score, scoring_cfg)
+    else:
+        eff_sum, eff_grade = None, None
 
     report_status = _get_case_report_status(db, case_uid)
     is_signed = report_status in ("signed", "amended") if report_status else False
@@ -489,11 +510,30 @@ def review_grading_patches(payload: PatchReviewPayload, db: Session = Depends(ge
     if not grading_record:
         raise HTTPException(status_code=404, detail="Grading record for case not found")
 
+    stage_exec = db.scalars(
+        select(StageExecution)
+        .where(StageExecution.case_id == case_uid, StageExecution.stage == "grading")
+        .order_by(StageExecution.attempt.desc())
+    ).first()
+
+    if stage_exec and stage_exec.status == "confirmed":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cannot modify patch reviews: Grading stage is already confirmed."
+        )
+
+    if _is_case_report_signed(db, case_uid):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cannot modify patch reviews for a signed or amended case report."
+        )
+
     current_overrides = dict(grading_record.overrides or {})
     patch_overrides = dict(current_overrides.get("patches", {}))
     machine_patches = grading_record.machine.get("patches", [])
 
     now_iso = datetime.now(timezone.utc).isoformat()
+    edits = list(stage_exec.review_edits or []) if stage_exec else []
 
     if payload.action == "approve_all":
         # Bulk approve all patches
@@ -506,8 +546,22 @@ def review_grading_patches(payload: PatchReviewPayload, db: Session = Depends(ge
                 "reviewed_by": payload.reviewed_by,
                 "reviewed_at": now_iso
             }
+        edits.append({
+            "op": "replace",
+            "path": "/patches",
+            "value": "approve_all",
+            "timestamp": now_iso,
+            "actor": payload.reviewed_by
+        })
     elif payload.action == "reset_all":
         patch_overrides = {}
+        edits.append({
+            "op": "replace",
+            "path": "/patches",
+            "value": {},
+            "timestamp": now_iso,
+            "actor": payload.reviewed_by
+        })
     elif payload.action == "update":
         for r in payload.reviews:
             p_id = r.patch_id
@@ -520,17 +574,27 @@ def review_grading_patches(payload: PatchReviewPayload, db: Session = Depends(ge
                 "reviewed_by": payload.reviewed_by,
                 "reviewed_at": now_iso
             }
+            edits.append({
+                "op": "replace",
+                "path": f"/patches/{p_id}",
+                "value": patch_overrides[p_id],
+                "timestamp": now_iso,
+                "actor": payload.reviewed_by
+            })
 
     current_overrides["patches"] = patch_overrides
     grading_record.overrides = current_overrides
+    if stage_exec:
+        stage_exec.review_edits = edits
 
     # Record Audit Event
     audit_evt = AuditEvent(
         case_id=str(payload.case_id),
         actor=payload.reviewed_by,
-        event_type="patches_reviewed",
+        event_type="review_edit",
         stage="grading",
         payload={
+            "scope": "patches",
             "action": payload.action,
             "reviewed_count": len(payload.reviews) if payload.action == "update" else len(machine_patches)
         }
@@ -539,12 +603,6 @@ def review_grading_patches(payload: PatchReviewPayload, db: Session = Depends(ge
     db.commit()
     db.refresh(grading_record)
 
-    stage_exec = db.scalars(
-        select(StageExecution)
-        .where(StageExecution.case_id == case_uid, StageExecution.stage == "grading")
-        .order_by(StageExecution.attempt.desc())
-    ).first()
-
     return _build_grading_stage_data_dict(payload.case_id, case, stage_exec, grading_record, db)
 
 
@@ -552,8 +610,8 @@ def review_grading_patches(payload: PatchReviewPayload, db: Session = Depends(ge
 def review_grading_hpfs(payload: HpfReviewPayload, db: Session = Depends(get_db)):
     """
     Explicit HPF-Level Review endpoint:
-    Allows approving individual HPF fields, modifying per-HPF mitotic counts,
-    or 1-click bulk approving all 10 HPFs. Dynamically recomputes Mitotic Score.
+    Allows approving individual HPF fields or 1-click bulk approving all 10 HPFs.
+    Mitotic counts are read-only in Stage 5; revisions must be performed via Stage 4 Mitosis.
     """
     case_uid = to_uuid(payload.case_id)
     case = db.scalars(select(Case).where(Case.id == case_uid)).first()
@@ -563,6 +621,24 @@ def review_grading_hpfs(payload: HpfReviewPayload, db: Session = Depends(get_db)
     grading_record = db.scalars(select(Grading).where(Grading.case_id == case_uid)).first()
     if not grading_record:
         raise HTTPException(status_code=404, detail="Grading record for case not found")
+
+    stage_exec = db.scalars(
+        select(StageExecution)
+        .where(StageExecution.case_id == case_uid, StageExecution.stage == "grading")
+        .order_by(StageExecution.attempt.desc())
+    ).first()
+
+    if stage_exec and stage_exec.status == "confirmed":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cannot modify HPF reviews: Grading stage is already confirmed."
+        )
+
+    if _is_case_report_signed(db, case_uid):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cannot modify HPF reviews for a signed or amended case report."
+        )
 
     current_overrides = dict(grading_record.overrides or {})
     hpf_overrides = dict(current_overrides.get("hpfs", {}))
@@ -580,8 +656,8 @@ def review_grading_hpfs(payload: HpfReviewPayload, db: Session = Depends(get_db)
             detail="Cannot review HPFs: No HPF sites found for this case. Stage 4 Mitosis must be completed first."
         )
 
-
     now_iso = datetime.now(timezone.utc).isoformat()
+    edits = list(stage_exec.review_edits or []) if stage_exec else []
 
     if payload.action == "approve_all":
         # Bulk approve all HPFs
@@ -594,29 +670,59 @@ def review_grading_hpfs(payload: HpfReviewPayload, db: Session = Depends(get_db)
                 "reviewed_by": payload.reviewed_by,
                 "reviewed_at": now_iso
             }
+        edits.append({
+            "op": "replace",
+            "path": "/hpfs",
+            "value": "approve_all",
+            "timestamp": now_iso,
+            "actor": payload.reviewed_by
+        })
     elif payload.action == "reset_all":
         hpf_overrides = {}
+        edits.append({
+            "op": "replace",
+            "path": "/hpfs",
+            "value": {},
+            "timestamp": now_iso,
+            "actor": payload.reviewed_by
+        })
     elif payload.action == "update":
         for r in payload.reviews:
+            if r.mitotic_count is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Mitotic figure counts cannot be modified directly in Stage 5. Please reopen Stage 4 Mitosis review to adjust mitotic counts."
+                )
             h_seq = str(r.seq)
+            existing = hpf_overrides.get(h_seq, {})
             hpf_overrides[h_seq] = {
+                **existing,
                 "status": r.status,
-                "mitotic_count": r.mitotic_count,
                 "notes": r.notes,
                 "reviewed_by": payload.reviewed_by,
                 "reviewed_at": now_iso
             }
+            edits.append({
+                "op": "replace",
+                "path": f"/hpfs/{h_seq}",
+                "value": hpf_overrides[h_seq],
+                "timestamp": now_iso,
+                "actor": payload.reviewed_by
+            })
 
     current_overrides["hpfs"] = hpf_overrides
     grading_record.overrides = current_overrides
+    if stage_exec:
+        stage_exec.review_edits = edits
 
     # Record Audit Event
     audit_evt = AuditEvent(
         case_id=str(payload.case_id),
         actor=payload.reviewed_by,
-        event_type="hpfs_reviewed",
+        event_type="review_edit",
         stage="grading",
         payload={
+            "scope": "hpfs",
             "action": payload.action,
             "reviewed_count": len(payload.reviews) if payload.action == "update" else len(machine_hpfs)
         }
@@ -625,12 +731,6 @@ def review_grading_hpfs(payload: HpfReviewPayload, db: Session = Depends(get_db)
     db.commit()
     db.refresh(grading_record)
 
-    stage_exec = db.scalars(
-        select(StageExecution)
-        .where(StageExecution.case_id == case_uid, StageExecution.stage == "grading")
-        .order_by(StageExecution.attempt.desc())
-    ).first()
-
     return _build_grading_stage_data_dict(payload.case_id, case, stage_exec, grading_record, db)
 
 
@@ -638,7 +738,7 @@ def review_grading_hpfs(payload: HpfReviewPayload, db: Session = Depends(get_db)
 def get_patch_image(case_id: str, patch_id: str, db: Session = Depends(get_db)):
     """
     Stream the 512x512 normalized evidence patch PNG directly from GCS.
-    Guarantees reliable high-speed streaming with on-demand extraction and fallback.
+    Worker is the authoritative producer of evidence patches (#147).
     """
     blob_name = f"cases/{case_id}/grading_patches/{patch_id}.png"
     try:
@@ -646,92 +746,6 @@ def get_patch_image(case_id: str, patch_id: str, db: Session = Depends(get_db)):
         return Response(content=patch_bytes, media_type="image/png")
     except Exception:
         pass
-
-    # Dynamic On-Demand Extraction from WSI via transient scratch dir
-    scratch_dir = tempfile.mkdtemp(prefix="og_grading_patch_")
-    try:
-        from worker.grading import extract_10x_patch
-        from pipeline.stain import PureNumpyMacenkoNormalizer
-        import openslide
-
-        case_uid = to_uuid(case_id)
-        slide = db.scalars(select(Slide).where(Slide.case_id == case_uid)).first()
-        slide_id = str(slide.id) if slide else "slide"
-        gcs_uri_original = resolve_slide_raw_uri(case_id, slide) or getattr(slide, "gcs_uri_original", None) or f"gs://{settings.GCS_RAW_BUCKET}/cases/{case_id}/{slide_id}.svs"
-        raw_bucket_name, slide_blob = parse_gcs_uri(gcs_uri_original)
-        ext = os.path.splitext(slide_blob)[1] or ".svs"
-        local_slide_path = os.path.join(scratch_dir, f"slide{ext}")
-
-        download_blob_to_filename(raw_bucket_name, slide_blob, local_slide_path)
-
-        if os.path.exists(local_slide_path):
-            cx_px, cy_px = None, None
-            grading_rec = db.scalars(select(Grading).where(Grading.case_id == case_uid)).first()
-            if grading_rec and grading_rec.machine:
-                for p in grading_rec.machine.get("patches", []):
-                    if p.get("id") == patch_id and "center_x_px" in p:
-                        cx_px = p["center_x_px"]
-                        cy_px = p["center_y_px"]
-                        break
-
-            if cx_px is None or cy_px is None:
-                p_idx = 0
-                if patch_id.startswith("p_") and patch_id[2:].isdigit():
-                    p_idx = int(patch_id[2:]) - 1
-
-                if not slide or not slide.mpp_x:
-                    raise HTTPException(status_code=400, detail="Slide is missing valid MPP (status='needs_mpp'). Cannot extract grading patch.")
-                mpp_x = float(slide.mpp_x)
-
-                hotspots = list(db.scalars(select(Hotspot).where(Hotspot.case_id == case_uid).order_by(Hotspot.prob_mean.desc())).all())
-                if hotspots and p_idx < len(hotspots):
-                    hs = hotspots[p_idx]
-                    poly = hs.polygon_um
-                    if isinstance(poly, str):
-                        poly = json.loads(poly)
-                    if poly:
-                        cx_px = int(np.mean([pt[0] for pt in poly]) / mpp_x)
-                        cy_px = int(np.mean([pt[1] for pt in poly]) / mpp_x)
-                    else:
-                        cx_px, cy_px = 25000, 20000
-                else:
-                    row = p_idx // 6
-                    col = p_idx % 6
-                    cx_px = 20000 + col * 3000
-                    cy_px = 18000 + row * 3000
-            else:
-                if not slide or not slide.mpp_x:
-                    raise HTTPException(status_code=400, detail="Slide is missing valid MPP (status='needs_mpp'). Cannot extract grading patch.")
-                mpp_x = float(slide.mpp_x)
-
-            with OPENSLIDE_GLOBAL_LOCK:
-                oslide = openslide.OpenSlide(local_slide_path)
-                raw_img = extract_10x_patch(
-                    slide_obj=oslide,
-                    center_x=cx_px,
-                    center_y=cy_px,
-                    patch_size_px=512,
-                    target_mpp=1.0,
-                    base_mpp=mpp_x
-                )
-                oslide.close()
-
-            normalizer = PureNumpyMacenkoNormalizer()
-            raw_np = np.array(raw_img)
-            try:
-                norm_np = normalizer.transform(raw_np)
-            except Exception:
-                normalizer.fit(raw_np)
-                norm_np = normalizer.transform(raw_np)
-
-            norm_img = Image.fromarray(norm_np)
-            buf = io.BytesIO()
-            norm_img.save(buf, format="PNG")
-            return Response(content=buf.getvalue(), media_type="image/png")
-    except Exception as e:
-        print(f"[On-Demand Patch Extract Note for {case_id}/{patch_id}] {e}")
-    finally:
-        shutil.rmtree(scratch_dir, ignore_errors=True)
 
     raise HTTPException(
         status_code=status.HTTP_404_NOT_FOUND,
@@ -801,6 +815,18 @@ def confirm_histologic_type(
     case = db.scalars(select(Case).where(Case.id == case_uid)).first()
     if not case:
         raise HTTPException(status_code=404, detail=f"Case {payload.case_id} not found")
+
+    stage_exec = db.scalars(
+        select(StageExecution)
+        .where(StageExecution.case_id == case_uid, StageExecution.stage == "grading")
+        .order_by(StageExecution.attempt.desc())
+    ).first()
+
+    if stage_exec and stage_exec.status == "confirmed":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cannot modify histologic subtype: Grading stage is already confirmed."
+        )
 
     if _is_case_report_signed(db, case_uid):
         raise HTTPException(
@@ -926,6 +952,20 @@ def confirm_grading_stage(
             grading_record.histologic_type = payload.histologic_type
             grading_record.type_confirmed_by = actor
 
+    # 1.5 Validate consistency between tubule_percent and tubule_score (#613)
+    scoring_cfg = load_scoring_config()
+    eff_tubule_pct = payload.tubule_percent
+    if eff_tubule_pct is None and isinstance(payload.overrides.get("tubule"), dict):
+        eff_tubule_pct = payload.overrides["tubule"].get("percent")
+
+    if eff_tubule_pct is not None:
+        expected_tubule_score = calculate_tubule_score(eff_tubule_pct, scoring_cfg)
+        if expected_tubule_score != payload.tubule_score:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Inconsistent tubule parameters: tubule_percent {eff_tubule_pct}% calculates to score {expected_tubule_score}, which contradicts provided tubule_score {payload.tubule_score}."
+            )
+
     # Build current review state to verify review gates and server-derived subscores
     current_data = _build_grading_stage_data_dict(case_id, case, stage_exec, grading_record, db)
     rev_summary = current_data["review_summary"]
@@ -998,15 +1038,27 @@ def confirm_grading_stage(
             pleo_score=payload.pleo_score,
             mitotic_score=payload.mitotic_score,
             nottingham_sum=computed_sum,
-            grade=computed_grade
+            grade=computed_grade,
+            cfg=scoring_cfg
         )
     except ValueError as ve:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
 
-    # 6. Update Database Grading Record
+    # 6. Update Database Grading Record with Tubule Consistency Validation (#613)
     grading_record.tubule_score = payload.tubule_score
     if payload.tubule_percent is not None:
+        expected_tubule_score = calculate_tubule_score(payload.tubule_percent, scoring_cfg)
+        if expected_tubule_score != payload.tubule_score:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Inconsistent tubule parameters: tubule_percent {payload.tubule_percent}% calculates to score {expected_tubule_score}, which contradicts provided tubule_score {payload.tubule_score}."
+            )
         grading_record.tubule_percent = payload.tubule_percent
+    else:
+        # If tubule_score diverges from machine-derived score and no percent is provided, null out tubule_percent
+        if grading_record.tubule_score != payload.tubule_score:
+            grading_record.tubule_percent = None
+
     grading_record.pleo_score = payload.pleo_score
     grading_record.mitotic_score = payload.mitotic_score
     grading_record.nottingham_sum = computed_sum
@@ -1014,15 +1066,31 @@ def confirm_grading_stage(
     grading_record.histologic_type = payload.histologic_type
     grading_record.type_confirmed_by = actor
     
-    # Merge overrides ensuring patch and HPF reviews are preserved
+    # Merge overrides ensuring patch and HPF reviews are preserved (#602)
     merged_overrides = dict(grading_record.overrides or {})
-    merged_overrides.update(payload.overrides)
+    for comp in ALLOWED_CONFIRM_OVERRIDE_COMPONENTS:
+        if comp in payload.overrides:
+            merged_overrides[comp] = payload.overrides[comp]
     grading_record.overrides = merged_overrides
 
     # 7. Mark Stage 5 as Confirmed
     stage_exec.status = "confirmed"
     stage_exec.reviewed_at = datetime.now(timezone.utc)
     stage_exec.reviewed_by = actor
+
+    edits = list(stage_exec.review_edits or [])
+    edits.append({
+        "op": "replace",
+        "path": "/stage_confirmed",
+        "value": {
+            "grade": computed_grade,
+            "nottingham_sum": computed_sum,
+            "histologic_type": payload.histologic_type
+        },
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "actor": actor
+    })
+    stage_exec.review_edits = edits
 
     # 8. Queue Stage 6 (Report Generation) - Guarded against overwriting signed reports
     next_exec = db.scalars(
@@ -1051,7 +1119,7 @@ def confirm_grading_stage(
     audit_confirm = AuditEvent(
         case_id=str(case_id),
         actor=actor,
-        event_type="stage_5_grading_confirmed",
+        event_type="stage_confirmed",
         stage="grading",
         payload={
             "nottingham_sum": computed_sum,

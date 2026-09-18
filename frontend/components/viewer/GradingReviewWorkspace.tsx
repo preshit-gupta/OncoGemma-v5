@@ -381,6 +381,18 @@ export function GradingReviewWorkspace({
   // Read-only state when stage is confirmed or case report is signed
   const isConfirmed = data?.status === "confirmed" || Boolean((data as any)?.is_signed);
 
+  // Dynamically compute evaluated HPF area from Mitotic Summary or HPF list
+  const evaluatedHpfAreaMm2 = useMemo(() => {
+    if (data?.mitotic_summary?.area_mm2) return data.mitotic_summary.area_mm2;
+    if (data?.hpfs && data.hpfs.length > 0) {
+      return data.hpfs.reduce((acc, h) => {
+        const r = h.radius_um || 262.0;
+        return acc + Math.PI * Math.pow(r / 1000.0, 2);
+      }, 0);
+    }
+    return 2.157;
+  }, [data?.mitotic_summary?.area_mm2, data?.hpfs]);
+
   const isTubuleOverridden = tubuleOverrideScore !== null && tubuleOverrideScore !== data?.machine?.tubule_score;
   const isPleoOverridden = pleoOverrideScore !== null && pleoOverrideScore !== data?.machine?.pleo_score;
 
@@ -579,13 +591,18 @@ export function GradingReviewWorkspace({
         </div>
       </header>
 
-      {/* Read-Only Status Banner when Confirmed */}
+      {/* Read-Only Status Banner when Confirmed or Signed */}
       {isConfirmed && (
         <div className="mx-6 mt-4 p-3 bg-emerald-950/40 border border-emerald-500/50 rounded-lg flex items-center justify-between gap-3 text-emerald-200 text-xs">
           <div className="flex items-center gap-2">
             <ShieldCheck className="w-5 h-5 text-emerald-400 shrink-0" />
             <div>
-              <span className="font-bold">Stage 5 Nottingham Grading Confirmed:</span> Pathologist review is complete and grade scores are permanently locked.
+              <span className="font-bold">
+                {Boolean((data as any)?.is_signed)
+                  ? "Case Report Signed & Finalized:"
+                  : "Stage 5 Nottingham Grading Confirmed:"}
+              </span>{" "}
+              Pathologist review is complete and grade scores are permanently locked.
             </div>
           </div>
           {onAdvanceToReport && (
@@ -1037,19 +1054,19 @@ export function GradingReviewWorkspace({
                 <div className="flex justify-between">
                   <span>Standard Evaluated Area:</span>
                   <span className="text-slate-200 font-mono">
-                    {data.mitotic_summary?.area_mm2 ? data.mitotic_summary.area_mm2.toFixed(3) : "2.157"} mm²
+                    {evaluatedHpfAreaMm2.toFixed(3)} mm²
                   </span>
                 </div>
                 <div className="flex justify-between">
                   <span>Standardized Density:</span>
                   <span className="text-slate-200 font-mono">
-                    {(data.mitotic_summary?.mitoses_per_mm2 ?? ((data.mitotic_summary?.total_mitoses ?? 0) / (data.mitotic_summary?.area_mm2 || 2.157))).toFixed(1)} mitoses/mm²
+                    {(data.mitotic_summary?.mitoses_per_mm2 ?? ((data.mitotic_summary?.total_mitoses ?? 0) / (evaluatedHpfAreaMm2 || 2.157))).toFixed(1)} mitoses/mm²
                   </span>
                 </div>
                 <div className="flex justify-between text-[11px] text-slate-500 pt-0.5">
                   <span>Classic 10 HPF Equiv:</span>
                   <span className="font-mono">
-                    {(data.mitotic_summary?.classic_per_10hpf ?? ((data.mitotic_summary?.total_mitoses ?? 0) * (2.74 / (data.mitotic_summary?.area_mm2 || 2.157)))).toFixed(0)} mitoses
+                    {(data.mitotic_summary?.classic_per_10hpf ?? ((data.mitotic_summary?.total_mitoses ?? 0) * (2.74 / (evaluatedHpfAreaMm2 || 2.157)))).toFixed(0)} mitoses
                   </span>
                 </div>
               </div>
@@ -1254,7 +1271,7 @@ export function GradingReviewWorkspace({
               <div className="flex items-center gap-2">
                 <Layers className="w-5 h-5 text-emerald-400" />
                 <h2 className="text-base font-bold text-white">
-                  HPF-Level Field Review (10 Standardized Fields • 2.157 mm²)
+                  HPF-Level Field Review ({data?.hpfs?.length ?? 10} Standardized Fields • {evaluatedHpfAreaMm2.toFixed(3)} mm²)
                 </h2>
               </div>
               <p className="text-xs text-slate-400 mt-1">

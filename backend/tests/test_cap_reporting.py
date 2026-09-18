@@ -84,23 +84,29 @@ def test_ajcc_pt_staging_cutoffs():
     # pT1a: > 1.0 mm to <= 5.0 mm
     assert calculate_ajcc_pt_stage(1.1) == "pT1a"
     assert calculate_ajcc_pt_stage(5.0) == "pT1a"
+    assert calculate_ajcc_pt_stage(5.4) == "pT1a"
     
     # pT1b: > 5.0 mm to <= 10.0 mm
-    assert calculate_ajcc_pt_stage(5.1) == "pT1b"
+    assert calculate_ajcc_pt_stage(5.5) == "pT1b"
     assert calculate_ajcc_pt_stage(10.0) == "pT1b"
+    assert calculate_ajcc_pt_stage(10.4) == "pT1b"
     
     # pT1c: > 10.0 mm to <= 20.0 mm
-    assert calculate_ajcc_pt_stage(10.1) == "pT1c"
+    assert calculate_ajcc_pt_stage(10.5) == "pT1c"
     assert calculate_ajcc_pt_stage(18.0) == "pT1c"
     assert calculate_ajcc_pt_stage(20.0) == "pT1c"
+    assert calculate_ajcc_pt_stage(20.1) == "pT1c"
+    assert calculate_ajcc_pt_stage(20.4) == "pT1c"
     
     # pT2: > 20.0 mm to <= 50.0 mm
-    assert calculate_ajcc_pt_stage(20.1) == "pT2"
+    assert calculate_ajcc_pt_stage(20.5) == "pT2"
     assert calculate_ajcc_pt_stage(35.0) == "pT2"
     assert calculate_ajcc_pt_stage(50.0) == "pT2"
+    assert calculate_ajcc_pt_stage(50.1) == "pT2"
+    assert calculate_ajcc_pt_stage(50.4) == "pT2"
     
     # pT3: > 50.0 mm
-    assert calculate_ajcc_pt_stage(50.1) == "pT3"
+    assert calculate_ajcc_pt_stage(50.5) == "pT3"
     assert calculate_ajcc_pt_stage(75.0) == "pT3"
     
     # pT4: Chest wall / Skin extension

@@ -8,6 +8,8 @@ any numbers or aggregates.
 
 from typing import List, Dict, Any, Tuple, Optional
 import os
+import json
+import hashlib
 import yaml
 
 # Default configuration parameters
@@ -30,11 +32,18 @@ def load_scoring_config() -> Dict[str, Any]:
     cfg_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../configs/scoring.yaml"))
     if os.path.exists(cfg_path):
         try:
-            with open(cfg_path, "r") as f:
+            with open(cfg_path, "r", encoding="utf-8") as f:
                 return yaml.safe_load(f) or {}
         except Exception:
             pass
     return {}
+
+
+def get_grading_config_hash() -> str:
+    """Compute deterministic SHA-256 hash of active scoring configuration."""
+    cfg = load_scoring_config()
+    raw = json.dumps(cfg, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
 
 
 def weighted_median(values: List[float], weights: List[float]) -> float:
@@ -73,7 +82,7 @@ def weighted_median(values: List[float], weights: List[float]) -> float:
     return float(paired[-1][0])
 
 
-def weighted_mode(values: List[int], weights: List[float], tie_breaker=max) -> Tuple[int, float]:
+def weighted_mode(values: List[int], weights: List[float], tie_breaker=max) -> Tuple[Optional[int], float]:
     """
     Compute deterministic weighted mode for discrete categories (e.g. pleomorphism scores 1, 2, 3).
     Ties resolve via tie_breaker (default max: conservative clinical rule favoring worse grade).
@@ -84,10 +93,10 @@ def weighted_mode(values: List[int], weights: List[float], tie_breaker=max) -> T
         tie_breaker: Function to resolve ties among candidate scores with equal max weight.
         
     Returns:
-        Tuple of (winning_score, disagreement_ratio).
+        Tuple of (winning_score, disagreement_ratio). If values is empty, returns (None, 1.0).
     """
     if not values:
-        return 2, 1.0  # Default to moderate score if empty
+        return None, 1.0
         
     weight_totals: Dict[int, float] = {}
     for val, w in zip(values, weights):
@@ -170,10 +179,12 @@ def validate_grading_invariants(
     pleo_score: int,
     mitotic_score: int,
     nottingham_sum: int,
-    grade: int
+    grade: int,
+    cfg: Optional[Dict[str, Any]] = None
 ) -> None:
     """
     The v3/v4 Guard: Ensure all mathematical invariants hold strictly before DB write.
+    Dynamically respects configured Nottingham boundaries.
     Raises ValueError if any invariant is violated.
     """
     for name, val in [("tubule_score", tubule_score), ("pleo_score", pleo_score), ("mitotic_score", mitotic_score)]:
@@ -184,7 +195,14 @@ def validate_grading_invariants(
     if nottingham_sum != expected_sum:
         raise ValueError(f"Invariant Violation: nottingham_sum ({nottingham_sum}) != sum of sub-scores ({expected_sum})")
         
-    expected_grade = 1 if expected_sum <= 5 else (2 if expected_sum <= 7 else 3)
+    g1_max = DEFAULT_GRADE1_MAX_SUM
+    g2_max = DEFAULT_GRADE2_MAX_SUM
+    if cfg:
+        ng_cfg = cfg.get("nottingham_grading", cfg)
+        g1_max = ng_cfg.get("grade1_max_sum", DEFAULT_GRADE1_MAX_SUM)
+        g2_max = ng_cfg.get("grade2_max_sum", DEFAULT_GRADE2_MAX_SUM)
+
+    expected_grade = 1 if expected_sum <= g1_max else (2 if expected_sum <= g2_max else 3)
     if grade != expected_grade:
         raise ValueError(f"Invariant Violation: grade ({grade}) does not match expected Nottingham Grade ({expected_grade}) for sum {expected_sum}")
 
@@ -251,6 +269,7 @@ def aggregate_grading_findings(
 ) -> Dict[str, Any]:
     """
     Full end-to-end pure code aggregation pipeline.
+    Handles empty evidence sets gracefully with needs_human flag rather than fabricating scores.
     
     Args:
         tubule_responses: List of per-patch dicts with {tubule_percent, tumor_present, confidence, [user_tubule_percent], [user_tumor_present]}
@@ -270,6 +289,22 @@ def aggregate_grading_findings(
     min_tumor_patches = cfg.get("grading", {}).get("min_tumor_patches", DEFAULT_MIN_TUMOR_PATCHES)
     max_disp = cfg.get("grading", {}).get("max_disp", DEFAULT_MAX_DISP)
     
+    # 0. Gracefully handle empty evidence sets without fabricating scores (#366)
+    if not tubule_responses or not pleo_responses:
+        return {
+            "tubule_percent": None,
+            "tubule_score": None,
+            "pleo_score": None,
+            "mitotic_score": mitotic_score,
+            "nottingham_sum": None,
+            "grade": None,
+            "flags": ["empty_evidence_set", "needs_human"],
+            "tumor_patch_count": 0,
+            "total_patch_count": max(len(tubule_responses), len(pleo_responses)),
+            "pleo_dispersion": 1.0,
+            "needs_human": True
+        }
+
     # 1. Filter tumor-containing patches for Tubule assessment (accounting for pathologist overrides)
     tumor_tubule = []
     for r in tubule_responses:
@@ -288,11 +323,11 @@ def aggregate_grading_findings(
             for r in tumor_tubule
         ]
         derived_tubule_percent = round(weighted_median(tubule_vals, tubule_w), 1)
+        tubule_score = calculate_tubule_score(derived_tubule_percent, cfg)
     else:
-        derived_tubule_percent = 0.0
+        derived_tubule_percent = None
+        tubule_score = None
         
-    tubule_score = calculate_tubule_score(derived_tubule_percent, cfg)
-    
     # 2. Pleomorphism mode calculation across all valid responses (accounting for pathologist overrides)
     pleo_vals = [
         int(r.get("user_pleo_score") if r.get("user_pleo_score") is not None else r.get("pleomorphism_score", 2))
@@ -305,10 +340,34 @@ def aggregate_grading_findings(
     
     pleo_score, pleo_dispersion = weighted_mode(pleo_vals, pleo_w, tie_breaker=max)
     
-    # 3. Overall Nottingham Grade Calculation
+    # 3. If no tumor patches exist or pleo could not be assessed, flag for human review
+    if tubule_score is None or pleo_score is None:
+        flags: List[str] = ["needs_human"]
+        if len(tumor_tubule) == 0:
+            flags.append("no_tumor_patches")
+        elif len(tumor_tubule) < min_tumor_patches:
+            flags.append("insufficient_tumor_patches")
+        if pleo_dispersion > max_disp:
+            flags.append("pleo_high_variance")
+
+        return {
+            "tubule_percent": derived_tubule_percent,
+            "tubule_score": tubule_score,
+            "pleo_score": pleo_score,
+            "mitotic_score": mitotic_score,
+            "nottingham_sum": None,
+            "grade": None,
+            "flags": flags,
+            "tumor_patch_count": len(tumor_tubule),
+            "total_patch_count": max(len(tubule_responses), len(pleo_responses)),
+            "pleo_dispersion": round(pleo_dispersion, 3),
+            "needs_human": True
+        }
+
+    # 4. Overall Nottingham Grade Calculation
     nottingham_sum, grade = calculate_nottingham_grade(tubule_score, pleo_score, mitotic_score, cfg)
     
-    # 4. Quality & Consistency Flags
+    # 5. Quality & Consistency Flags
     flags: List[str] = []
     if len(tumor_tubule) < min_tumor_patches:
         flags.append("insufficient_tumor_patches")
@@ -316,7 +375,7 @@ def aggregate_grading_findings(
         flags.append("pleo_high_variance")
         
     # Validate invariants before returning
-    validate_grading_invariants(tubule_score, pleo_score, mitotic_score, nottingham_sum, grade)
+    validate_grading_invariants(tubule_score, pleo_score, mitotic_score, nottingham_sum, grade, cfg=cfg)
     
     return {
         "tubule_percent": derived_tubule_percent,
@@ -330,4 +389,3 @@ def aggregate_grading_findings(
         "total_patch_count": max(len(tubule_responses), len(pleo_responses)),
         "pleo_dispersion": round(pleo_dispersion, 3)
     }
-

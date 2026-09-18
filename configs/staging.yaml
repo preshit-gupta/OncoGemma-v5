@@ -1,0 +1,46 @@
+# OncoGemma AJCC 8th/9th Edition Breast Cancer Staging Configuration
+# Aligned with AJCC Cancer Staging Manual 8th Edition (Breast Chapter 48) and CAP Protocols
+
+edition: "8th/9th Edition"
+rounding_rule: "ajcc_8th_half_up_mm"
+
+pt_cutoffs:
+  pT1mi_max_mm: 1.0
+  pT1a_max_mm: 5.0
+  pT1b_max_mm: 10.0
+  pT1c_max_mm: 20.0
+  pT2_max_mm: 50.0
+  rounding_rule: "ajcc_8th_half_up_mm"
+
+pn_cutoffs:
+  itc_max_mm: 0.2
+  micrometa_max_mm: 2.0
+  n1_max_nodes: 3
+  n2_max_nodes: 9
+
+stage_groups:
+  stage_0:
+    tis: ["pN0", "pNX"]
+  stage_ia:
+    t1: ["pN0", "pNX"]
+  stage_ib:
+    t0: ["pN1mi"]
+    t1: ["pN1mi"]
+  stage_iia:
+    t0: ["pN1", "pN1a", "pN1b", "pN1c"]
+    t1: ["pN1", "pN1a", "pN1b", "pN1c"]
+    t2: ["pN0", "pNX"]
+  stage_iib:
+    t2: ["pN1", "pN1a", "pN1b", "pN1c"]
+    t3: ["pN0", "pNX"]
+  stage_iiia:
+    t0: ["pN2", "pN2a", "pN2b"]
+    t1: ["pN2", "pN2a", "pN2b"]
+    t2: ["pN2", "pN2a", "pN2b"]
+    t3: ["pN1", "pN1a", "pN1b", "pN1c", "pN2", "pN2a", "pN2b"]
+  stage_iiib:
+    t4: ["pN0", "pNX", "pN1", "pN1mi", "pN1a", "pN1b", "pN1c", "pN2", "pN2a", "pN2b"]
+  stage_iiic:
+    any_t: ["pN3", "pN3a", "pN3b", "pN3c"]
+  stage_iv:
+    any_m1: ["pM1", "cM1", "M1"]

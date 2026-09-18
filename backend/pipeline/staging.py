@@ -5,27 +5,59 @@ All arithmetic calculations of Pathologic T (pT), Pathologic N (pN), and AJCC
 Stage Groups are strictly computed deterministically in Python code.
 """
 
-from typing import Dict, Any, List, Optional, Tuple
+import os
+import json
+import hashlib
+from decimal import Decimal, ROUND_HALF_UP
+from typing import Dict, Any, List, Optional
 import re
+import yaml
+
+
+def load_staging_config() -> Dict[str, Any]:
+    """Load AJCC staging thresholds and definitions from configs/staging.yaml if present."""
+    cfg_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../configs/staging.yaml"))
+    if os.path.exists(cfg_path):
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                return yaml.safe_load(f) or {}
+        except Exception:
+            pass
+    return {}
+
+
+def get_staging_config_hash() -> str:
+    """Compute deterministic SHA-256 hash of active staging configuration."""
+    cfg = load_staging_config()
+    raw = json.dumps(cfg, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def round_half_up_mm(val: float) -> int:
+    """Deterministic clinical rounding to nearest whole millimetre (round-half-up)."""
+    return int(Decimal(str(val)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
 
 def calculate_ajcc_pt_stage(
     tumor_size_mm: Optional[float],
     chest_wall_extension: bool = False,
     skin_ulceration: bool = False,
-    is_in_situ_only: bool = False
+    is_in_situ_only: bool = False,
+    cfg: Optional[Dict[str, Any]] = None
 ) -> str:
     """
-    Calculate Pathologic T (pT) category according to AJCC 8th/9th Edition Breast Cancer staging:
+    Calculate Pathologic T (pT) category according to AJCC 8th/9th Edition Breast Cancer staging
+    with strict millimetre rounding rules (AJCC 8th Edition Breast Chapter 48):
     - pTX: Primary tumor cannot be assessed
     - pT0: No evidence of primary tumor
     - pTis: In situ only (DCIS/LCIS/Paget)
-    - pT1mi: Tumor <= 1.0 mm
-    - pT1a: Tumor > 1.0 mm but <= 5.0 mm
-    - pT1b: Tumor > 5.0 mm but <= 10.0 mm
-    - pT1c: Tumor > 10.0 mm but <= 20.0 mm
-    - pT2: Tumor > 20.0 mm but <= 50.0 mm
-    - pT3: Tumor > 50.0 mm
-    - pT4: Direct extension to chest wall or skin ulceration / macroscopic satellite skin nodules
+    - pT1mi: Tumor <= 1.0 mm (microinvasion)
+    - pT1a: Tumor > 1.0 mm to <= 5.0 mm (Note: 1.0-1.9 mm rounds to 2 mm -> pT1a)
+    - pT1b: Tumor > 5.0 mm to <= 10.0 mm
+    - pT1c: Tumor > 10.0 mm to <= 20.0 mm (e.g., 20.4 mm rounds to 20 mm -> pT1c)
+    - pT2: Tumor > 20.0 mm to <= 50.0 mm (e.g., 20.5 mm rounds to 21 mm -> pT2)
+    - pT3: Tumor > 50.0 mm (e.g., 50.4 mm rounds to 50 mm -> pT2, 50.5 mm rounds to 51 mm -> pT3)
+    - pT4: Direct extension to chest wall (pT4a), skin ulceration (pT4b), both (pT4c), or inflammatory (pT4d)
     """
     if is_in_situ_only:
         return "pTis"
@@ -40,15 +72,25 @@ def calculate_ajcc_pt_stage(
     if tumor_size_mm is None or tumor_size_mm <= 0:
         return "pTX"
         
+    # Microinvasion rule: tumor <= 1.0 mm is pT1mi
     if tumor_size_mm <= 1.0:
         return "pT1mi"
-    elif tumor_size_mm <= 5.0:
+        
+    # Special AJCC 8th Ed rule: 1.0 to 1.9 mm is reported as 2 mm (pT1a)
+    if 1.0 < tumor_size_mm < 2.0:
+        rounded_mm = 2
+    else:
+        rounded_mm = round_half_up_mm(tumor_size_mm)
+
+    if rounded_mm <= 1:
+        return "pT1mi"
+    elif rounded_mm <= 5:
         return "pT1a"
-    elif tumor_size_mm <= 10.0:
+    elif rounded_mm <= 10:
         return "pT1b"
-    elif tumor_size_mm <= 20.0:
+    elif rounded_mm <= 20:
         return "pT1c"
-    elif tumor_size_mm <= 50.0:
+    elif rounded_mm <= 50:
         return "pT2"
     else:
         return "pT3"
@@ -58,11 +100,12 @@ def calculate_ajcc_pn_stage(
     nodes_examined: int,
     nodes_positive: int,
     largest_meta_mm: float = 0.0,
-    is_micrometastasis: bool = False
+    is_micrometastasis: bool = False,
+    cfg: Optional[Dict[str, Any]] = None
 ) -> str:
     """
     Calculate Pathologic N (pN) category according to AJCC 8th/9th Edition Breast Cancer staging:
-    - pNX: Regional lymph nodes cannot be assessed (no nodes removed)
+    - pNX: Regional lymph nodes cannot be assessed (0 nodes removed)
     - pN0: No regional lymph node metastasis histologically
     - pN0(i+): Isolated tumor cell clusters (ITC) <= 0.2 mm
     - pN1mi: Micrometastasis (> 0.2 mm to <= 2.0 mm and/or > 200 cells)
@@ -70,12 +113,23 @@ def calculate_ajcc_pn_stage(
     - pN2a: Metastases in 4 to 9 axillary lymph nodes
     - pN3a: Metastases in 10 or more axillary lymph nodes
     """
+    # Strict Invariant: Positive nodes cannot exceed examined nodes
+    if nodes_positive > nodes_examined:
+        raise ValueError(
+            f"Staging Invariant Violation: nodes_positive ({nodes_positive}) cannot exceed nodes_examined ({nodes_examined})"
+        )
+
     if nodes_examined <= 0:
         return "pNX"
         
+    # Isolated tumor cell clusters (ITCs <= 0.2 mm) are classified as pN0(i+)
+    if 0.0 < largest_meta_mm <= 0.2:
+        return "pN0(i+)"
+
     if nodes_positive <= 0:
         return "pN0"
         
+    # Micrometastases (> 0.2 mm to <= 2.0 mm) in 1-3 nodes
     if is_micrometastasis or (0.2 < largest_meta_mm <= 2.0 and nodes_positive <= 3):
         return "pN1mi"
         
@@ -93,9 +147,12 @@ def calculate_ajcc_stage_group(
     pm_stage: str = "cM0"
 ) -> str:
     """
-    Calculate AJCC Anatomic Stage Group (0, IA, IB, IIA, IIB, IIIA, IIIB, IIIC, IV).
+    Calculate AJCC Anatomic Stage Group (0, IA, IB, IIA, IIB, IIIA, IIIB, IIIC, IV)
+    per AJCC 8th Edition Breast Cancer Chapter 48 staging matrix.
+    Never defaults to 'IA' for unhandled combinations.
     """
-    if pm_stage in ("pM1", "cM1"):
+    # Any M1 is Stage IV
+    if pm_stage in ("pM1", "cM1", "M1") or str(pm_stage).endswith("M1"):
         return "IV"
 
     if pt_stage == "N/A" or pn_stage == "N/A":
@@ -103,56 +160,67 @@ def calculate_ajcc_stage_group(
 
     if pt_stage in ("pTX", "TX"):
         return "Unknown"
-        
-    if pt_stage == "pTis" and pn_stage in ("pN0", "pNX"):
+
+    if pt_stage == "pTis" and pn_stage in ("pN0", "pN0(i+)", "pNX", "NX"):
         return "0"
-        
-    # Standard Anatomic Stage Matrix
-    if pt_stage in ("pT1mi", "pT1a", "pT1b", "pT1c"):
-        if pn_stage in ("pN0", "pNX"):
-            return "IA"
-        elif pn_stage == "pN1mi":
-            return "IB"
-        elif pn_stage == "pN1a":
-            return "IIA"
-        elif pn_stage == "pN2a":
-            return "IIIA"
-        elif pn_stage == "pN3a":
-            return "IIIC"
-            
-    elif pt_stage == "pT2":
-        if pn_stage in ("pN0", "pNX"):
-            return "IIA"
-        elif pn_stage in ("pN1mi", "pN1a"):
-            return "IIB"
-        elif pn_stage == "pN2a":
-            return "IIIA"
-        elif pn_stage == "pN3a":
-            return "IIIC"
-            
-    elif pt_stage == "pT3":
-        if pn_stage in ("pN0", "pNX"):
-            return "IIB"
-        elif pn_stage in ("pN1mi", "pN1a", "pN2a"):
-            return "IIIA"
-        elif pn_stage == "pN3a":
-            return "IIIC"
-            
-    elif pt_stage.startswith("pT4"):
-        if pn_stage in ("pN0", "pNX", "pN1mi", "pN1a", "pN2a"):
-            return "IIIB"
-        elif pn_stage == "pN3a":
-            return "IIIC"
-            
-    # Default fallback
-    if pn_stage == "pN3a":
+
+    # Standardize sub-categories to canonical N groups:
+    # N1: pN1, pN1a, pN1b, pN1c
+    # N2: pN2, pN2a, pN2b
+    # N3: pN3, pN3a, pN3b, pN3c
+    is_n0 = pn_stage in ("pN0", "pN0(i+)", "pNX", "NX")
+    is_n1mi = (pn_stage == "pN1mi")
+    is_n1 = pn_stage in ("pN1", "pN1a", "pN1b", "pN1c")
+    is_n2 = pn_stage in ("pN2", "pN2a", "pN2b")
+    is_n3 = pn_stage in ("pN3", "pN3a", "pN3b", "pN3c")
+
+    # Any T with N3 is Stage IIIC
+    if is_n3:
         return "IIIC"
-    elif pn_stage == "pN2a":
-        return "IIIA"
-    elif pn_stage == "pN1a":
-        return "IIA"
-        
-    return "Unknown"
+
+    # pT0 combinations
+    if pt_stage == "pT0":
+        if is_n1mi:
+            return "IB"
+        elif is_n1:
+            return "IIA"
+        elif is_n2:
+            return "IIIA"
+        return "Cannot be determined"
+
+    # pT1 combinations (pT1mi, pT1a, pT1b, pT1c)
+    if pt_stage in ("pT1mi", "pT1a", "pT1b", "pT1c"):
+        if is_n0:
+            return "IA"
+        elif is_n1mi:
+            return "IB"
+        elif is_n1:
+            return "IIA"
+        elif is_n2:
+            return "IIIA"
+
+    # pT2 combinations
+    elif pt_stage == "pT2":
+        if is_n0:
+            return "IIA"
+        elif is_n1mi or is_n1:
+            return "IIB"
+        elif is_n2:
+            return "IIIA"
+
+    # pT3 combinations
+    elif pt_stage == "pT3":
+        if is_n0:
+            return "IIB"
+        elif is_n1mi or is_n1 or is_n2:
+            return "IIIA"
+
+    # pT4 combinations (pT4a, pT4b, pT4c, pT4d)
+    elif pt_stage.startswith("pT4"):
+        if is_n0 or is_n1mi or is_n1 or is_n2:
+            return "IIIB"
+
+    return "Cannot be determined"
 
 
 def validate_staging_invariants(
@@ -242,7 +310,6 @@ def validate_narrative_consistency(
         ]
         for p in pos_lvi_patterns:
             if re.search(p, text_corpus):
-                # Ensure it wasn't preceded by 'no' or 'not'
                 m = re.search(r"(?:no|not|without)\s+[\w\s]{1,30}" + p, text_corpus)
                 if not m:
                     issues.append("Narrative asserts presence of lymphovascular invasion while verified LVI status is 'absent'")
