@@ -28,15 +28,37 @@ def check_icc_profile(slide) -> tuple[bytes | None, bool]:
     """Inspect slide object or properties for embedded ICC color profile."""
     icc_bytes = None
     
-    # 1. OpenSlide properties
-    if hasattr(slide, "properties"):
-        icc_bytes = slide.properties.get("openslide.color-profile")
-        if isinstance(icc_bytes, str):
-            icc_bytes = icc_bytes.encode("utf-8")
+    # 1. OpenSlide Python >= 1.3 color_profile object (Issue #53)
+    if hasattr(slide, "color_profile") and slide.color_profile is not None:
+        try:
+            if hasattr(slide.color_profile, "tobytes"):
+                icc_bytes = slide.color_profile.tobytes()
+            elif hasattr(slide.color_profile, "to_bytes"):
+                icc_bytes = slide.color_profile.to_bytes()
+            elif isinstance(slide.color_profile, (bytes, bytearray)):
+                icc_bytes = bytes(slide.color_profile)
+        except Exception:
+            pass
 
-    # 2. PIL Image info fallback
-    if not icc_bytes and hasattr(slide, "info"):
-        icc_bytes = slide.info.get("icc_profile")
+    # 2. OpenSlide properties
+    if not icc_bytes and hasattr(slide, "properties"):
+        for prop_key in ("openslide.color-profile", "openslide.icc-profile"):
+            val = slide.properties.get(prop_key)
+            if val:
+                if isinstance(val, (bytes, bytearray)):
+                    icc_bytes = bytes(val)
+                    break
+                elif isinstance(val, str):
+                    icc_bytes = val.encode("latin1", errors="ignore")
+                    break
+
+    # 3. PIL Image info fallback
+    if not icc_bytes and hasattr(slide, "info") and isinstance(slide.info, dict):
+        raw_info_icc = slide.info.get("icc_profile")
+        if isinstance(raw_info_icc, (bytes, bytearray)):
+            icc_bytes = bytes(raw_info_icc)
+        elif isinstance(raw_info_icc, str):
+            icc_bytes = raw_info_icc.encode("latin1", errors="ignore")
 
     has_icc = bool(icc_bytes and len(icc_bytes) > 0)
     return (icc_bytes if has_icc else None), has_icc
@@ -83,37 +105,58 @@ def read_region_srgb(
         if x_px_0 >= dim_w or y_px_0 >= dim_h or (x_px_0 + w_px_0) <= 0 or (y_px_0 + h_px_0) <= 0:
             pil_tile = Image.new("RGB", (max(1, target_w_px), max(1, target_h_px)), color=(245, 240, 245))
         else:
+            pil_tile = None
             best_level = 0
+            level_count = getattr(slide, "level_count", 1)
+            target_downsample = w_px_0 / max(1, target_w_px)
             if hasattr(slide, "get_best_level_for_downsample"):
-                target_downsample = w_px_0 / max(1, target_w_px)
                 best_level = slide.get_best_level_for_downsample(target_downsample)
 
-            level_ds = slide.level_downsamples[best_level] if hasattr(slide, "level_downsamples") else 1.0
+            level_ds = slide.level_downsamples[best_level] if hasattr(slide, "level_downsamples") and best_level < len(slide.level_downsamples) else 1.0
 
-            safe_x = max(0, min(dim_w - 1, x_px_0))
-            safe_y = max(0, min(dim_h - 1, y_px_0))
+            # Guard single-level / flat slides requesting large overview downsample (Issue #54)
+            if level_count <= 1 and target_downsample >= 4.0 and hasattr(slide, "get_thumbnail") and x_px_0 <= 0 and y_px_0 <= 0 and (x_px_0 + w_px_0) >= dim_w * 0.8:
+                try:
+                    thumb_candidate = slide.get_thumbnail((max(1, target_w_px), max(1, target_h_px)))
+                    if thumb_candidate is not None:
+                        if thumb_candidate.mode == "RGBA":
+                            bg = Image.new("RGBA", thumb_candidate.size, (255, 255, 255, 255))
+                            thumb_candidate = Image.alpha_composite(bg, thumb_candidate).convert("RGB")
+                        elif thumb_candidate.mode != "RGB":
+                            thumb_candidate = thumb_candidate.convert("RGB")
+                        pil_tile = thumb_candidate
+                except Exception:
+                    pil_tile = None
 
-            # Clamp requested region to actual available slide dimensions at level 0
-            intersect_w_0 = max(1, min(w_px_0, dim_w - safe_x))
-            intersect_h_0 = max(1, min(h_px_0, dim_h - safe_y))
+            if pil_tile is None:
+                safe_x = max(0, min(dim_w - 1, x_px_0))
+                safe_y = max(0, min(dim_h - 1, y_px_0))
 
-            # Bound level pixels to level dimensions to prevent multi-gigabyte memory spikes
-            lvl_dim_w, lvl_dim_h = (dim_w, dim_h)
-            if hasattr(slide, "level_dimensions") and best_level < len(slide.level_dimensions):
-                lvl_dim_w, lvl_dim_h = slide.level_dimensions[best_level]
+                # Clamp requested region to actual available slide dimensions at level 0
+                intersect_w_0 = max(1, min(w_px_0, dim_w - safe_x))
+                intersect_h_0 = max(1, min(h_px_0, dim_h - safe_y))
 
-            safe_x_lvl = int(round(safe_x / level_ds))
-            safe_y_lvl = int(round(safe_y / level_ds))
-            w_px_lvl = max(1, min(int(round(intersect_w_0 / level_ds)), max(1, lvl_dim_w - safe_x_lvl)))
-            h_px_lvl = max(1, min(int(round(intersect_h_0 / level_ds)), max(1, lvl_dim_h - safe_y_lvl)))
+                # Bound level pixels to level dimensions to prevent multi-gigabyte memory spikes
+                lvl_dim_w, lvl_dim_h = (dim_w, dim_h)
+                if hasattr(slide, "level_dimensions") and best_level < len(slide.level_dimensions):
+                    lvl_dim_w, lvl_dim_h = slide.level_dimensions[best_level]
 
-            # Cap maximum raster buffer passed to OpenSlide (never allocate > 4096 px per dimension)
-            w_px_lvl = min(w_px_lvl, 4096)
-            h_px_lvl = min(h_px_lvl, 4096)
+                safe_x_lvl = int(round(safe_x / level_ds))
+                safe_y_lvl = int(round(safe_y / level_ds))
+                w_px_lvl = max(1, min(int(round(intersect_w_0 / level_ds)), max(1, lvl_dim_w - safe_x_lvl)))
+                h_px_lvl = max(1, min(int(round(intersect_h_0 / level_ds)), max(1, lvl_dim_h - safe_y_lvl)))
 
-            pil_tile = slide.read_region((safe_x, safe_y), best_level, (w_px_lvl, h_px_lvl))
-            if pil_tile.mode != "RGB":
-                pil_tile = pil_tile.convert("RGB")
+                # Cap maximum raster buffer passed to OpenSlide (never allocate > 4096 px per dimension)
+                w_px_lvl = min(w_px_lvl, 4096)
+                h_px_lvl = min(h_px_lvl, 4096)
+
+                pil_tile = slide.read_region((safe_x, safe_y), best_level, (w_px_lvl, h_px_lvl))
+                # Issue #554: Alpha-composite over white background instead of black on boundary pixels
+                if pil_tile.mode == "RGBA":
+                    bg = Image.new("RGBA", pil_tile.size, (255, 255, 255, 255))
+                    pil_tile = Image.alpha_composite(bg, pil_tile).convert("RGB")
+                elif pil_tile.mode != "RGB":
+                    pil_tile = pil_tile.convert("RGB")
 
     # 2. PIL Image object fallback
     elif hasattr(slide, "crop"):
@@ -128,7 +171,11 @@ def read_region_srgb(
         else:
             pil_tile = Image.new("RGB", (max(1, target_w_px), max(1, target_h_px)), color=(240, 235, 240))
 
-        if pil_tile.mode != "RGB":
+        # Issue #554: Alpha-composite over white background
+        if pil_tile.mode == "RGBA":
+            bg = Image.new("RGBA", pil_tile.size, (255, 255, 255, 255))
+            pil_tile = Image.alpha_composite(bg, pil_tile).convert("RGB")
+        elif pil_tile.mode != "RGB":
             pil_tile = pil_tile.convert("RGB")
 
     else:
@@ -213,7 +260,7 @@ def extract_patch_from_pyramid(
             return None
             
         mosaic = Image.new("RGB", (stitch_w, stitch_h), (240, 230, 235))
-        found_any = False
+        tiles_fetched = 0
         
         for c in range(c_min, c_max + 1):
             for r in range(r_min, r_max + 1):
@@ -231,11 +278,14 @@ def extract_patch_from_pyramid(
                         paste_x = (c - c_min) * 256
                         paste_y = (r - r_min) * 256
                         mosaic.paste(t_img, (paste_x, paste_y))
-                        found_any = True
+                        tiles_fetched += 1
                     except Exception:
                         pass
                     
-        if not found_any:
+        # Issue #730: Require >= 75% coverage (or 100% when total <= 4)
+        # Avoids returning misleading pink/incomplete mosaics when pyramid tiles are missing
+        min_required_tiles = total_tiles if total_tiles <= 4 else int(math.ceil(total_tiles * 0.75))
+        if tiles_fetched < min_required_tiles:
             return None
             
         crop_x0 = int(round(x0_z - c_min * 256.0))

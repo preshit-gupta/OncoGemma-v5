@@ -38,13 +38,17 @@ def generate_tile_on_the_fly(
     c: int,
     r: int,
     layer: str
-) -> bytes | None:
+) -> tuple[bytes | None, str]:
     """
     On-the-fly tile rendering fallback using OpenSlide / Pillow.
-    Computes exact tile bounding box at DeepZoom level z and returns PNG/JPEG bytes.
+    Computes exact tile bounding box at DeepZoom level z and returns (PNG_bytes, actual_layer).
     Thread-safe to prevent concurrent OpenSlide C-library access violations.
     """
     try:
+        # Issue #739: Validate slide dimensions are initialized
+        if getattr(slide_obj, "width_px", None) is None or getattr(slide_obj, "height_px", None) is None or slide_obj.width_px <= 0 or slide_obj.height_px <= 0:
+            return None, layer
+
         with OPENSLIDE_GLOBAL_LOCK:
             try:
                 import openslide
@@ -52,8 +56,8 @@ def generate_tile_on_the_fly(
             except Exception:
                 slide = Image.open(slide_file_path)
 
-            slide_w = float(getattr(slide_obj, "width_px", 2048) or 2048)
-            slide_h = float(getattr(slide_obj, "height_px", 2048) or 2048)
+            slide_w = float(slide_obj.width_px)
+            slide_h = float(slide_obj.height_px)
             if not getattr(slide_obj, "mpp_x", None) or not getattr(slide_obj, "mpp_y", None):
                 raise HTTPException(status_code=400, detail="Slide is missing valid MPP (status='needs_mpp'). Cannot render tile.")
             mpp_x = float(slide_obj.mpp_x)
@@ -91,6 +95,7 @@ def generate_tile_on_the_fly(
             if hasattr(slide, "close"):
                 slide.close()
 
+        actual_layer = layer
         if layer == "norm":
             try:
                 stain_text = download_blob_as_text(settings.GCS_ARTIFACTS_BUCKET, f"cases/{slide_obj.case_id}/preprocess/stain_params.json")
@@ -105,35 +110,61 @@ def generate_tile_on_the_fly(
                     norm_obj.max_conc_src = np.array(stain_params["max_conc_src"])
                 tile_arr = norm_obj.transform(tile_arr)
             except Exception as norm_err:
-                print(f"[Tile Router Warning] On-the-fly norm transform note: {norm_err}")
+                # Issue #640: If stain normalization fails, fall back to 'orig' rather than mislabeling as 'norm'
+                print(f"[Tile Router Warning] On-the-fly norm transform fallback note: {norm_err}")
+                actual_layer = "orig"
 
         img = Image.fromarray(tile_arr)
         buf = BytesIO()
         img.save(buf, format="PNG")
-        return buf.getvalue()
+        return buf.getvalue(), actual_layer
     except Exception as e:
         print(f"[Tile Router Warning] Dynamic tile extraction error for z={z}, c={c}, r={r}: {e}")
-        return None
+        return None, layer
 
 
 def stream_slide_tile(slide: Slide, layer: str, z: int, filename: str, case_id: uuid.UUID | None = None) -> Response:
+    # Issue #211: Validate layer parameter
+    if layer not in ("orig", "norm"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid tile layer '{layer}'. Must be 'orig' or 'norm'."
+        )
+
+    # Issue #739: Do not substitute silent 2048 defaults when dimensions are missing/non-positive
+    has_valid_dim = (
+        getattr(slide, "width_px", None) is not None
+        and getattr(slide, "height_px", None) is not None
+        and slide.width_px > 0
+        and slide.height_px > 0
+    )
+    if has_valid_dim:
+        slide_w = float(slide.width_px)
+        slide_h = float(slide.height_px)
+        max_dim = max(slide_w, slide_h)
+        slide_max_level = int(math.ceil(math.log2(max_dim)))
+    else:
+        slide_w = 0.0
+        slide_h = 0.0
+        slide_max_level = 0
+
     stem = os.path.splitext(filename)[0]
     ext = os.path.splitext(filename)[1] or ".png"
 
-    slide_w = float(getattr(slide, "width_px", 2048) or 2048)
-    slide_h = float(getattr(slide, "height_px", 2048) or 2048)
-    max_dim = max(slide_w, slide_h)
-    slide_max_level = int(math.ceil(math.log2(max_dim))) if max_dim > 0 else 11
-    cap_10x_level = max(0, slide_max_level - 2)
+    # Issue #212: Compute cap_10x_level dynamically from slide.base_mag
+    base_mag = float(getattr(slide, "base_mag", None) or 40.0)
+    mag_ratio = max(1.0, base_mag / 10.0)
+    level_diff = int(round(math.log2(mag_ratio)))
+    cap_10x_level = max(0, slide_max_level - level_diff)
 
-    # Validate zoom level bounds (Issue #200, #636)
+    # Validate zoom level bounds (Issue #200, #636, #641)
     if z < 0 or z > slide_max_level:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Tile zoom level {z} out of bounds (max level {slide_max_level})"
         )
 
-    # Validate coordinate bounds (Issue #200)
+    # Validate coordinate bounds (Issue #200, #641)
     parts = stem.split("_")
     if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invalid tile coordinate format")
@@ -157,8 +188,9 @@ def stream_slide_tile(slide: Slide, layer: str, z: int, filename: str, case_id: 
 
     target_z = z
 
+    # Issue #340: Use private cache control for PHI tile privacy
     no_cache_headers = {
-        "Cache-Control": "public, max-age=3600",
+        "Cache-Control": "private, max-age=86400",
         "X-Tile-Layer": target_layer,
         "X-Tile-Zoom": str(target_z)
     }
@@ -191,7 +223,7 @@ def stream_slide_tile(slide: Slide, layer: str, z: int, filename: str, case_id: 
         local_slide_path = os.path.join(cache_dir, f"{slide.id}{slide_ext}")
 
         if os.path.exists(local_slide_path) and os.path.getsize(local_slide_path) > 0:
-            tile_bytes = generate_tile_on_the_fly(
+            tile_bytes, actual_layer = generate_tile_on_the_fly(
                 slide_file_path=local_slide_path,
                 slide_obj=slide,
                 z=target_z,
@@ -200,7 +232,9 @@ def stream_slide_tile(slide: Slide, layer: str, z: int, filename: str, case_id: 
                 layer=target_layer
             )
             if tile_bytes:
-                return Response(content=tile_bytes, media_type="image/png", headers=no_cache_headers)
+                tile_headers = dict(no_cache_headers)
+                tile_headers["X-Tile-Layer"] = actual_layer
+                return Response(content=tile_bytes, media_type="image/png", headers=tile_headers)
     except Exception as dynamic_err:
         print(f"[Tile Router Warning] Dynamic tile extraction fallback error: {dynamic_err}")
 
@@ -216,7 +250,9 @@ def stream_slide_tile(slide: Slide, layer: str, z: int, filename: str, case_id: 
                     try:
                         tile_bytes = blob.download_as_bytes()
                         m_type = "image/png" if check_ext.lower() == ".png" else "image/jpeg"
-                        return Response(content=tile_bytes, media_type=m_type, headers=no_cache_headers)
+                        fallback_headers = dict(no_cache_headers)
+                        fallback_headers["X-Tile-Layer"] = "orig"
+                        return Response(content=tile_bytes, media_type=m_type, headers=fallback_headers)
                     except Exception:
                         pass
         except Exception:

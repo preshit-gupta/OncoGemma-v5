@@ -17,7 +17,8 @@ from app.core.gcs import (
     generate_signed_upload_url,
     get_gcs_tile_template_url,
     parse_gcs_uri,
-    blob_exists
+    blob_exists,
+    ALLOWED_WSI_EXTS
 )
 from starlette.concurrency import run_in_threadpool
 from app.core.openslide_lock import OPENSLIDE_GLOBAL_LOCK
@@ -545,6 +546,11 @@ def get_slide_upload_url(
 
     file_uuid = uuid.uuid4()
     ext = req.filename.rsplit(".", 1)[-1].lower() if "." in req.filename else "svs"
+    if f".{ext}" not in ALLOWED_WSI_EXTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported WSI file extension '.{ext}'. Allowed: {sorted(list(ALLOWED_WSI_EXTS))}"
+        )
     
     blob_name = f"cases/{case_id}/{file_uuid}.{ext}"
     gcs_uri = f"gs://{settings.GCS_RAW_BUCKET}/{blob_name}"

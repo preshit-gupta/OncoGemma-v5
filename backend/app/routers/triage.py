@@ -645,6 +645,12 @@ def confirm_triage(payload: TriageConfirmPayload, db: Session = Depends(get_db))
 
     # Zero-tumor guardrail: if 0 active hotspots, must explicitly specify no_invasive_tumor=True (#92)
     active_hotspots = [h for h in effective_hotspots if not h.get("excluded", False)]
+    if payload.no_invasive_tumor and len(active_hotspots) > 0:
+        # Issue #569: Reject attempt to confirm zero tumor while active hotspots remain
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Cannot confirm 'no_invasive_tumor=True' when {len(active_hotspots)} active tumor hotspot(s) exist. All tumor hotspots must be excluded or deleted before confirming zero tumor."
+        )
     if len(active_hotspots) == 0 and not payload.no_invasive_tumor:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,

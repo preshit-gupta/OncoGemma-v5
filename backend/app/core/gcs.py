@@ -10,6 +10,10 @@ from app.core.config import settings
 
 
 import tempfile
+import re
+from fastapi import HTTPException, status
+
+ALLOWED_WSI_EXTS = {".svs", ".ndpi", ".mrxs", ".tif", ".tiff", ".bif", ".vms"}
 
 _LOCAL_STORAGE_DIR = os.path.join(tempfile.gettempdir(), "oncogemma_local_gcs")
 
@@ -274,13 +278,27 @@ def get_service_account_email() -> str:
     return "oncogemma-cloudrun-sa@oncogemma.iam.gserviceaccount.com"
 
 
-def generate_signed_upload_url(bucket_name: str, blob_name: str, expiration_minutes: int = 60) -> str:
+def generate_signed_upload_url(
+    bucket_name: str,
+    blob_name: str,
+    expiration_minutes: int = 60,
+    content_type: str = "application/octet-stream"
+) -> str:
     """
     Generates a V4 signed upload URL for direct browser-to-GCS upload.
     Uses IAM Credentials API with explicit cloud-platform scope for Cloud Run compatibility.
     """
+    # Issue #19: Validate file extension for raw slide uploads
+    clean_blob = blob_name.replace("\\", "/").lstrip("/")
+    ext = os.path.splitext(clean_blob)[1].lower()
+    if bucket_name == settings.GCS_RAW_BUCKET and ext and ext not in ALLOWED_WSI_EXTS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported WSI file extension '{ext}'. Allowed: {sorted(list(ALLOWED_WSI_EXTS))}"
+        )
+
     if not settings.USE_REAL_GCS:
-        return f"http://localhost:8000/api/v1/mock-upload/{bucket_name}/{blob_name.replace(chr(92), '/').lstrip('/')}"
+        return f"http://localhost:8000/api/v1/mock-upload/{bucket_name}/{clean_blob}"
 
     import google.auth
     from google.auth.transport.requests import Request
@@ -301,7 +319,7 @@ def generate_signed_upload_url(bucket_name: str, blob_name: str, expiration_minu
                 version="v4",
                 expiration=expiration,
                 method="PUT",
-                content_type="application/octet-stream",
+                content_type=content_type,
             )
     except Exception as e:
         print(f"[Signed URL] Strategy 1 (SA private key) not available: {e}")
@@ -329,13 +347,14 @@ def generate_signed_upload_url(bucket_name: str, blob_name: str, expiration_minu
             version="v4",
             expiration=expiration,
             method="PUT",
-            content_type="application/octet-stream",
+            content_type=content_type,
         )
     except Exception as e2:
+        # Issue #5: Raise HTTP 503 rather than returning unauthenticated URL or uncaught crash
         print(f"[Signed URL] Strategy 2 (IAM Signer) failed: {e2}")
-        raise RuntimeError(
-            f"Could not generate signed upload URL via IAM Credentials API: {e2}\n"
-            f"Ensure {sa_email} has roles/iam.serviceAccountTokenCreator on project {settings.GCP_PROJECT_ID}."
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Signed upload URL generation unavailable: {e2}"
         )
 
 def upload_directory_to_gcs_and_purge(local_dir: str, bucket_name: str, dest_prefix: str, max_workers: int = 16):
@@ -367,7 +386,7 @@ def upload_directory_to_gcs_and_purge(local_dir: str, bucket_name: str, dest_pre
         pass
 
 def ensure_buckets_exist():
-    """Ensures configured GCS buckets exist in the GCP project (or local mock)."""
+    """Ensures configured GCS buckets exist in the GCP project (or local mock) with uniform access."""
     client = get_gcs_client()
     for bucket_name in [settings.GCS_RAW_BUCKET, settings.GCS_PYRAMIDS_BUCKET, settings.GCS_ARTIFACTS_BUCKET]:
         try:
@@ -376,11 +395,17 @@ def ensure_buckets_exist():
                 continue
             bucket = client.bucket(bucket_name)
             if not bucket.exists(timeout=5.0):
-                client.create_bucket(bucket_name, location=settings.GCP_REGION)
+                bucket = client.create_bucket(bucket_name, location=settings.GCP_REGION)
                 print(f"[GCS] Created bucket: {bucket_name}")
+            # Issue #21: Ensure uniform bucket-level access
+            if hasattr(bucket, "iam_configuration"):
+                iam_config = bucket.iam_configuration
+                if hasattr(iam_config, "uniform_bucket_level_access_enabled") and not iam_config.uniform_bucket_level_access_enabled:
+                    iam_config.uniform_bucket_level_access_enabled = True
+                    bucket.patch()
         except Exception as e:
-            # Bucket exists or already accessible
-            pass
+            # Bucket exists or permission note
+            print(f"[GCS Bucket Check Note] {bucket_name}: {e}")
 
 
 def get_gcs_tile_template_url(slide_id: str, layer: str = "{layer}") -> str:
@@ -411,7 +436,8 @@ def get_gcs_artifact_direct_url(relative_gcs_path: str) -> str:
             case_id = parts[c_idx+1]
             if "patches" in parts:
                 hs_file = parts[-1]
-                hs_id = hs_file.replace("_thumb.png", "").replace(".png", "")
+                # Issue #22: Strip mag, stain, and thumb suffixes so hotspot IDs aren't mangled
+                hs_id = re.sub(r'(_(10x|20x|40x))?(_(norm|orig))?(_thumb)?\.png$', '', hs_file)
                 return f"/api/v1/stages/triage/{case_id}/hotspots/{hs_id}/thumbnail?mag=10x"
             elif "heatmap" in parts[-1]:
                 return f"/api/v1/stages/triage/{case_id}/heatmap"

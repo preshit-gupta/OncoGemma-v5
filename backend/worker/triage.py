@@ -268,8 +268,13 @@ def run_triage(stage_execution: StageExecution, session: Session) -> tuple[str, 
     width_um = width_px * mpp_x
     height_um = height_px * mpp_y
 
-    nx = max(1, int(np.ceil(width_um / stride_um)))
-    ny = max(1, int(np.ceil(height_um / stride_um)))
+    # Issue #86: Define triage overview grid dimensions matching slide aspect ratio
+    nx = 80
+    ny = max(1, int(round(nx * (height_px / max(width_px, 1)))))
+
+    stride_x_um = (width_px * mpp_x) / nx
+    stride_y_um = (height_px * mpp_y) / ny
+    stride_um = stride_x_um
     grid_origin_um = (0.0, 0.0)
 
     scratch_dir = tempfile.mkdtemp(prefix="og_triage_")
@@ -280,27 +285,14 @@ def run_triage(stage_execution: StageExecution, session: Session) -> tuple[str, 
 
         endpoint_calls_made = 0
 
-        # Check for preprocess tissue mask in GCS
+        # Check for preprocess tissue mask in GCS (Issue #86)
         tissue_mask = None
         try:
             mask_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/preprocess/tissue_mask.png")
-            mask_img = Image.open(io.BytesIO(mask_bytes)).convert("L").resize((nx, ny), Image.NEAREST)
+            mask_img = Image.open(io.BytesIO(mask_bytes)).convert("L").resize((nx, ny), Image.Resampling.NEAREST)
             tissue_mask = np.array(mask_img) > 10
         except Exception:
-            tissue_mask = np.ones((ny, nx), dtype=bool)
-
-        # If no tissue found, fall back to center region
-        if tissue_mask is None or tissue_mask.sum() == 0:
-            tissue_mask = np.zeros((ny, nx), dtype=bool)
-            tissue_mask[int(ny*0.2):int(ny*0.8), int(nx*0.2):int(nx*0.8)] = True
-
-        # Grid dimensions matching exact slide aspect ratio
-        nx = 80
-        ny = max(1, int(round(nx * (height_px / max(width_px, 1)))))
-
-        stride_x_um = (width_px * mpp_x) / nx
-        stride_y_um = (height_px * mpp_y) / ny
-        stride_um = stride_x_um
+            tissue_mask = None
 
         stain_map = np.zeros((ny, nx), dtype=float)
         tissue_mask_overview = np.zeros((ny, nx), dtype=bool)
@@ -327,15 +319,23 @@ def run_triage(stage_execution: StageExecution, session: Session) -> tuple[str, 
                 arr = np.array(thumb).astype(float)
                 r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
                 is_glass = (r > 215) & (g > 215) & (b > 215)
-                tissue_mask_overview = ~is_glass
+                # Issue #86: Prioritize preprocessed QC tissue mask if available
+                if tissue_mask is not None and tissue_mask.sum() > 0:
+                    tissue_mask_overview = tissue_mask & ~is_glass
+                else:
+                    tissue_mask_overview = ~is_glass
                 od = np.maximum(0, -np.log10(np.clip(arr / 255.0, 1e-4, 1.0)))
                 stain_map = od.sum(axis=-1)
             except Exception:
-                tissue_mask_overview = np.ones((ny, nx), dtype=bool)
+                tissue_mask_overview = tissue_mask if (tissue_mask is not None and tissue_mask.sum() > 0) else np.ones((ny, nx), dtype=bool)
                 stain_map = np.full((ny, nx), 0.5)
         else:
-            tissue_mask_overview = np.ones((ny, nx), dtype=bool)
+            tissue_mask_overview = tissue_mask if (tissue_mask is not None and tissue_mask.sum() > 0) else np.ones((ny, nx), dtype=bool)
             stain_map = np.full((ny, nx), 0.5)
+
+        # Fallback to center region if mask is still entirely blank
+        if tissue_mask_overview.sum() == 0:
+            tissue_mask_overview[int(ny*0.2):int(ny*0.8), int(nx*0.2):int(nx*0.8)] = True
 
         # 2. Sample real 224px @ 1.0 mpp patches from tissue locations for Google Path Foundation
         sample_patches = []

@@ -52,17 +52,21 @@ def generate_mitosis_density_map(
     for cand in candidates:
         # Only splat confirmed or high-confidence candidate figures
         label = cand.get("label", "unreviewed")
-        if label == "not_mitosis":
+        if label in ("not_mitosis", "rejected", "dismissed"):
             continue
+
+        weight = 1.0
+        if label == "unreviewed":
+            weight = float(cand.get("ver_conf", cand.get("det_conf", 0.5)))
+            # Issue #596: Ignore low-confidence candidate noise (< 0.5)
+            if weight < 0.5:
+                continue
 
         cx_um, cy_um = cand["centroid_um"]
         gx = int(round((cx_um - min_x_um) / grid_res_um))
         gy = int(round((cy_um - min_y_um) / grid_res_um))
 
         if 0 <= gx < nx and 0 <= gy < ny:
-            weight = 1.0
-            if label == "unreviewed":
-                weight = cand.get("ver_conf", cand.get("det_conf", 0.5))
             point_grid[gy, gx] += float(weight)
 
     # Convolve with circular disk kernel
@@ -70,6 +74,7 @@ def generate_mitosis_density_map(
     kernel = create_circular_disk_mask(radius_cells)
     density_map = fftconvolve(point_grid, kernel, mode="same")
     density_map = np.maximum(density_map, 0.0)
+    density_map[density_map < 1e-6] = 0.0
 
     grid_meta = {
         "origin_um": [float(min_x_um), float(min_y_um)],
@@ -157,6 +162,10 @@ def greedy_place_hpfs(
     Enforces non-overlapping constraint (distance >= 2r) and strict tissue coverage gating (>= 70%).
     Prioritizes hotspots by cellular density/tumor probability and strictly rejects empty glass areas.
     """
+    # Issue #747: Distinguish None (unconstrained slide search) from [] (explicitly zero hotspots remaining)
+    if hotspot_polygons_um is not None and len(hotspot_polygons_um) == 0:
+        return []
+
     origin_x, origin_y = grid_meta["origin_um"]
     stride = grid_meta["stride_um"]
     ny, nx = density_map.shape
@@ -173,9 +182,18 @@ def greedy_place_hpfs(
         coverage_grid = np.ones((ny, nx), dtype=np.float32)
         valid_tissue_mask = np.ones((ny, nx), dtype=bool)
 
-    # Hotspot polygon masks
+    # Helper to enforce circle fully inside slide dimensions (Issue #586)
+    def _is_circle_inside_slide(cx: float, cy: float, r: float) -> bool:
+        if slide_dimensions_um is not None:
+            sw, sh = slide_dimensions_um
+            if (cx - r < 0.0) or (cy - r < 0.0) or (cx + r > sw) or (cy + r > sh):
+                return False
+        return True
+
+    # Hotspot polygon masks (Vectorized using matplotlib.path.Path #720)
     ordered_hotspot_masks: List[np.ndarray] = []
     if hotspot_polygons_um:
+        import matplotlib.path as mpath
         indexed_polys = list(enumerate(hotspot_polygons_um))
         if hotspot_priorities and len(hotspot_priorities) == len(hotspot_polygons_um):
             indexed_polys.sort(key=lambda item: (hotspot_priorities[item[0]] or 0.0), reverse=True)
@@ -191,12 +209,14 @@ def greedy_place_hpfs(
             gy_max = min(ny, int(math.ceil((max(poly_ys) - origin_y) / stride)) + 1)
 
             h_mask = np.zeros((ny, nx), dtype=bool)
-            for gy in range(gy_min, gy_max):
-                py_um = origin_y + gy * stride
-                for gx in range(gx_min, gx_max):
-                    px_um = origin_x + gx * stride
-                    if is_point_in_polygon(px_um, py_um, poly):
-                        h_mask[gy, gx] = True
+            gx_range = np.arange(gx_min, gx_max)
+            gy_range = np.arange(gy_min, gy_max)
+            if len(gx_range) > 0 and len(gy_range) > 0:
+                grid_x, grid_y = np.meshgrid(origin_x + gx_range * stride, origin_y + gy_range * stride)
+                pts = np.column_stack((grid_x.ravel(), grid_y.ravel()))
+                path = mpath.Path(poly)
+                inside = path.contains_points(pts).reshape(len(gy_range), len(gx_range))
+                h_mask[gy_min:gy_max, gx_min:gx_max] = inside
             ordered_hotspot_masks.append(h_mask)
 
     placed_hpfs: List[Dict[str, Any]] = []
@@ -237,11 +257,12 @@ def greedy_place_hpfs(
         cx_um = float(origin_x + gx * stride)
         cy_um = float(origin_y + gy * stride)
 
-        valid = True
-        for px, py in placed_centers:
-            if math.hypot(cx_um - px, cy_um - py) < min_separation_um - 1e-3:
-                valid = False
-                break
+        valid = _is_circle_inside_slide(cx_um, cy_um, radius_um)
+        if valid:
+            for px, py in placed_centers:
+                if math.hypot(cx_um - px, cy_um - py) < min_separation_um - 1e-3:
+                    valid = False
+                    break
 
         if valid:
             placed_centers.append((cx_um, cy_um))
@@ -275,11 +296,12 @@ def greedy_place_hpfs(
                 cx_um = float(origin_x + gx * stride)
                 cy_um = float(origin_y + gy * stride)
 
-                valid = True
-                for px, py in placed_centers:
-                    if math.hypot(cx_um - px, cy_um - py) < sep_req - 1e-3:
-                        valid = False
-                        break
+                valid = _is_circle_inside_slide(cx_um, cy_um, radius_um)
+                if valid:
+                    for px, py in placed_centers:
+                        if math.hypot(cx_um - px, cy_um - py) < sep_req - 1e-3:
+                            valid = False
+                            break
 
                 if valid:
                     placed_centers.append((cx_um, cy_um))
@@ -298,7 +320,8 @@ def greedy_place_hpfs(
                     working_density[gy, gx] = 0.0
 
     # Pass 3: Search within valid tissue mask (never in empty glass)
-    if len(placed_hpfs) < count:
+    # Issue #747: Only run unconstrained tissue search if hotspots were NOT explicitly provided
+    if len(placed_hpfs) < count and hotspot_polygons_um is None:
         for sep_req in (relaxed_min_separation_um, radius_um * 1.0):
             r_relax_cells = sep_req / stride
             while len(placed_hpfs) < count:
@@ -312,11 +335,12 @@ def greedy_place_hpfs(
                 cx_um = float(origin_x + gx * stride)
                 cy_um = float(origin_y + gy * stride)
 
-                valid = True
-                for px, py in placed_centers:
-                    if math.hypot(cx_um - px, cy_um - py) < sep_req - 1e-3:
-                        valid = False
-                        break
+                valid = _is_circle_inside_slide(cx_um, cy_um, radius_um)
+                if valid:
+                    for px, py in placed_centers:
+                        if math.hypot(cx_um - px, cy_um - py) < sep_req - 1e-3:
+                            valid = False
+                            break
 
                 if valid:
                     placed_centers.append((cx_um, cy_um))

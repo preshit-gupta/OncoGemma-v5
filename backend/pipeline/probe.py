@@ -32,6 +32,17 @@ class ProbeRunner:
         if embeddings is None or len(embeddings) == 0:
             return np.array([], dtype=np.float32)
 
+        # Issue #88: Verify embedding dimension strictly before predicting
+        if embeddings.ndim != 2:
+            raise ValueError(f"Embeddings must be a 2D array of shape (N, D), got shape {embeddings.shape}")
+
+        expected_dim = 384
+        if self.model is not None and hasattr(self.model, "n_features_in_"):
+            expected_dim = int(self.model.n_features_in_)
+
+        if embeddings.shape[1] != expected_dim:
+            raise ValueError(f"Embedding dimension mismatch: expected {expected_dim}, got {embeddings.shape[1]}")
+
         # L2-normalize embeddings per spec
         norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
         norms[norms == 0] = 1e-8
