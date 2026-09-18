@@ -197,6 +197,9 @@ app.include_router(admin_router)
 @app.get("/health")
 @app.get("/api/health")
 @app.get("/healthz")
+@app.get("/api/healthz")
+@app.get("/api/v1/health")
+@app.get("/api/v1/healthz")
 async def health_check():
     from starlette.concurrency import run_in_threadpool
     def _ping():

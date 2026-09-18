@@ -36,7 +36,7 @@ def setup_auth_test_db():
 client = TestClient(app)
 
 def test_healthz_endpoint():
-    for endpoint in ["/health", "/api/health", "/healthz"]:
+    for endpoint in ["/health", "/api/health", "/healthz", "/api/healthz", "/api/v1/health", "/api/v1/healthz"]:
         response = client.get(endpoint)
         assert response.status_code == 200
         data = response.json()
