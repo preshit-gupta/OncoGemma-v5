@@ -81,7 +81,11 @@ class VertexPathFoundationClient:
                 "project": self.project_id,
                 "location": self.location,
             }
-            if self.api_endpoint:
+            # Only set api_endpoint if explicitly provided and NOT a dedicated prediction domain.
+            # Dedicated prediction endpoints (*.prediction.vertexai.goog) are used for raw_predict,
+            # but aiplatform.init sets the control-plane endpoint for EndpointServiceClient/GetEndpoint,
+            # which rejects non-control-plane endpoints with 501 UNIMPLEMENTED.
+            if self.api_endpoint and not self.api_endpoint.endswith("prediction.vertexai.goog"):
                 init_kwargs["api_endpoint"] = self.api_endpoint
             aiplatform.init(**init_kwargs)
 

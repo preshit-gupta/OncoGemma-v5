@@ -20,9 +20,12 @@ class Settings(BaseSettings):
         "VERTEX_PATH_FOUNDATION_LOCATION",
         "asia-south1"
     )
-    VERTEX_PATH_FOUNDATION_API_ENDPOINT: str = os.getenv(
+    # Note: Dedicated prediction DNS (*.prediction.vertexai.goog) is discovered automatically
+    # by aiplatform.Endpoint and used for raw_predict. VERTEX_PATH_FOUNDATION_API_ENDPOINT
+    # should only be set if routing the regional control plane (*-aiplatform.googleapis.com).
+    VERTEX_PATH_FOUNDATION_API_ENDPOINT: str | None = os.getenv(
         "VERTEX_PATH_FOUNDATION_API_ENDPOINT",
-        "mg-endpoint-25e5ee92-10b3-41b5-9da7-bccbd2b255f8.asia-south1-962838713357.prediction.vertexai.goog"
+        None
     )
 
     # Vertex AI Endpoint Configuration - MedGemma 1.5 (Stage 5 Grading)

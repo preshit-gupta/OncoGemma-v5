@@ -117,3 +117,66 @@ def test_triage_worker_raises_cleanly_when_mock_disabled(db_session, monkeypatch
 
     with pytest.raises(RuntimeError, match="(Could not extract real|Endpoint ID is required)"):
         run_triage(stage_exec, db_session)
+
+
+def test_vertex_path_foundation_client_ignores_dedicated_prediction_dns_in_init(monkeypatch):
+    """
+    Ensure dedicated prediction endpoints (*.prediction.vertexai.goog) are never
+    passed to aiplatform.init() as control plane api_endpoint (which causes 501 UNIMPLEMENTED).
+    """
+    from worker.triage import VertexPathFoundationClient
+    from app.core.config import settings
+    from PIL import Image
+
+    monkeypatch.setattr(settings, "USE_MOCK_VERTEX_AI", False)
+
+    captured_init_kwargs = {}
+
+    class MockEndpoint:
+        def __init__(self, endpoint_name, project, location):
+            self.endpoint_name = endpoint_name
+            self.project = project
+            self.location = location
+
+        def raw_predict(self, body, headers):
+            class MockResponse:
+                def json(self):
+                    return {
+                        "predictions": [
+                            {"result": {"patch_embeddings": [{"embedding_vector": [0.1] * 384}]}}
+                        ]
+                    }
+            return MockResponse()
+
+    def mock_aiplatform_init(**kwargs):
+        nonlocal captured_init_kwargs
+        captured_init_kwargs = kwargs
+
+    import google.cloud.aiplatform as mock_aiplatform
+    monkeypatch.setattr(mock_aiplatform, "init", mock_aiplatform_init)
+    monkeypatch.setattr(mock_aiplatform, "Endpoint", MockEndpoint)
+
+    # 1. Test with dedicated prediction endpoint DNS -> must NOT be in init kwargs
+    client = VertexPathFoundationClient(
+        endpoint_id="mg-endpoint-test",
+        location="asia-south1",
+        project_id="oncogemma",
+        api_endpoint="mg-endpoint-test.asia-south1-962838713357.prediction.vertexai.goog"
+    )
+    patches = [Image.new("RGB", (224, 224), (200, 200, 200))]
+    embs = client.predict_embeddings(patches=patches)
+    assert embs.shape == (1, 384)
+    assert "api_endpoint" not in captured_init_kwargs
+    assert captured_init_kwargs["project"] == "oncogemma"
+    assert captured_init_kwargs["location"] == "asia-south1"
+
+    # 2. Test with control plane endpoint -> allowed in init kwargs
+    client2 = VertexPathFoundationClient(
+        endpoint_id="mg-endpoint-test",
+        location="asia-south1",
+        project_id="oncogemma",
+        api_endpoint="asia-south1-aiplatform.googleapis.com"
+    )
+    client2.predict_embeddings(patches=patches)
+    assert captured_init_kwargs.get("api_endpoint") == "asia-south1-aiplatform.googleapis.com"
+
