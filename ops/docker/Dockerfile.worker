@@ -36,6 +36,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 COPY backend /app/backend
 COPY configs /app/configs
 COPY models /app/models
+RUN rm -f /app/backend/.env*
 
 WORKDIR /app/backend
 

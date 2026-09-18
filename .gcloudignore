@@ -20,3 +20,10 @@ infra/bin/
 infra/terraform/.terraform/
 infra/terraform/tfplan
 infra/terraform/*.tfstate*
+.env
+.env.*
+backend/.env
+backend/.env.*
+frontend/.env
+frontend/.env.*
+

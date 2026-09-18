@@ -34,13 +34,16 @@ if os.path.exists("/cloudsql"):
         pass
 
 for sock in cloudsql_instances:
-    if os.path.exists(sock) and ("localhost" in db_url or "127.0.0.1" in db_url):
+    if os.path.exists(sock):
         cloud_pw = os.getenv("DB_PASSWORD", "oncogemma_secure_cloud_password")
         db_url = f"postgresql+psycopg2://oncogemma:{cloud_pw}@/oncogemma_db?host={sock}"
         print(f"[DB Core] Connected to Cloud SQL via unix socket at {sock}")
         break
 
 if db_url.startswith("sqlite"):
+    # If running on Linux and a Windows-style path was specified, fallback to container path
+    if os.name != "nt" and ":/" in db_url:
+        db_url = "sqlite:////tmp/oncogemma_local.db"
     connect_args = {"check_same_thread": False}
     engine_kwargs = {"connect_args": connect_args}
     if ":memory:" in db_url:
