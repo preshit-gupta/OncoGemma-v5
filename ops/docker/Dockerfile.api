@@ -10,13 +10,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Install system dependencies for OpenSlide and PyVips
+# Install system dependencies for OpenSlide, PyVips, and OpenCV
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libvips-dev \
     libvips42 \
     libopenslide-dev \
     libopenslide0 \
+    libgl1 \
+    libglib2.0-0 \
     curl \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
