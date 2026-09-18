@@ -66,16 +66,47 @@ flowchart TD
 
 ---
 
-## 🔬 Stage Specifications
+## 🔬 Stage Specifications & Architecture Flowcharts
 
 ### Stage 1: Whole-Slide Ingestion & Pyramid Generation
+```mermaid
+flowchart TD
+    A["Pathologist Client (Browser)"] -->|"1. Request Direct Upload URL"| B["FastAPI Control Plane (Cloud Run)"]
+    B -->|"2. Issue Pre-Signed PUT URL"| A
+    A -->|"3. Chunked Streaming Direct Upload"| C["GCS Raw Bucket (oncogemma-dev-raw)"]
+    A -->|"4. Finalize Ingest & Register Slide"| B
+    B -->|"5. Queue Ingest Stage"| D["Worker Daemon (worker/ingest.py)"]
+    D -->|"Validate MPP & Metadata"| E{"Valid MPP Present?"}
+    E -->|"No: State = needs_mpp"| F["Prompt Pathologist MPP Calibration in UI"]
+    F -->|"Submit Measured MPP"| D
+    E -->|"Yes"| G["De-identify TIFF IFD Tags & Strip PHI"]
+    G -->|"PyVips / OpenSlide Full-Depth Tiling"| H["GCS Pyramids Bucket (oncogemma-dev-pyramids)"]
+    H -->|"Multi-Scale DZI Streaming"| I["OpenSeadragon 5.0 High-DPI Viewer Canvas"]
+    D -->|"Emit Ingest Completed Event"| J["Audit Ledger (audit_events) -> Advance to Stage 2"]
+```
 * **Direct-to-GCS Resilient Ingestion**: Direct client-to-bucket chunked uploads via pre-signed Google Cloud Storage URLs bypass server payload ceilings, enabling seamless gigapixel slide intake with live progress tracking.
 * **Universal WSI Support**: Decodes Aperio (`.svs`), Hamamatsu (`.ndpi`), and generic BigTIFF slides using `pyvips` and `openslide` with global process locking.
 * **Calibrated Optical Resolution (MPP)**: Strictly validates micrometers-per-pixel metadata across slide headers. If missing, prompts the pathologist for manual calibration (`needs_mpp` state) rather than silently guessing.
 * **Full-Depth DZI Pyramids**: Automatically generates multi-resolution DeepZoom pyramids streamed to `oncogemma-dev-pyramids` to power responsive high-DPI viewing in OpenSeadragon.
 * **HIPAA De-Identification**: Unlinks non-essential TIFF IFD tags and wipes embedded patient labels before storage.
 
+---
+
 ### Stage 2: Preprocessing & Automated QC Gate
+```mermaid
+flowchart TD
+    A["Ingested WSI Slide (Stage 1)"] --> B["Stage 2 Worker: Preprocessing & Stain Normalization"]
+    B -->|"Otsu 1.25x Tissue Masking"| C["Tissue Mask PNG (oncogemma-dev-artifacts)"]
+    B -->|"Fit Macenko Normalizer against stain_reference.png"| D["Stain Profile JSON (oncogemma-dev-artifacts)"]
+    B -->|"Generate Normalized DeepZoom Pyramids"| E["GCS Pyramids Bucket (oncogemma-dev-pyramids/{slide_id}/norm/)"]
+    B --> F["Automated QC Gate (5 Checks)"]
+    F -->|"Tissue Coverage + Focus Variance + Pen Marks + Folds + Stain Sanity"| G{"QC Checks Pass?"}
+    G -->|"PASS"| H["Status: open / awaiting_review"]
+    G -->|"FAIL"| I["Status: needs_rescan / warn"]
+    H & I --> J["Pathologist QC Review Workspace"]
+    J -->|"Override QC or Re-Process"| B
+    J -->|"Approve Slide"| K["Queue Stage 3: Hotspot Triage"]
+```
 * **Tissue Segmentation**: Otsu thresholding in HSV color space differentiates cellular tissue parenchyma from background glass and empty lumina.
 * **5-Check Automated Pre-Flight QC**:
   * **Tissue Coverage**: Verifies tissue area percentage against diagnostic thresholds.
@@ -85,13 +116,48 @@ flowchart TD
   * **Stain Sanity**: Assesses Hematoxylin-to-Eosin optical density balance and concentration boundaries.
 * **Fitted Macenko Stain Normalization**: Transforms slide optical density using fitted source stain matrices and calibrated reference targets ($W_{\text{target}}$: Hematoxylin $[0.644, 0.717, 0.267]$, Eosin $[0.093, 0.954, 0.283]$), ensuring consistent color fidelity across scanners.
 
+---
+
 ### Stage 3: Tumor Bed Triage & Hotspot Selection
+```mermaid
+flowchart TD
+    A["Approved Slide & Stain Profile (Stage 2)"] --> B["Stage 3 Worker: Hotspot Triage (worker/triage.py)"]
+    B -->|"Extract 10x 224x224 Optical Patches"| C["Vertex AI Path Foundation ViT Endpoint (asia-south1)"]
+    C -->|"384-Dim Representation Embeddings"| D["GCS Parquet Cache (oncogemma-dev-artifacts)"]
+    D -->|"Calibrated Linear Probe Classifier"| E["Per-Tile Invasive Tumor Probability P(tumor)"]
+    E -->|"Spatial KDE & Viridis Colormap"| F["2D Probability Grid & Dynamic RGBA Heatmap Overlay"]
+    F -->|"DBSCAN Spatial ROI Contouring"| G["Automated Tumor Bed Hotspots (hs_01 to hs_10)"]
+    G --> H["Pathologist Interactive Triage Workspace (TriageViewer.tsx)"]
+    H -->|"Non-Destructive Opacity Slider (10% - 100%)"| I["Fluid Viridis WSI Heatmap Overlay"]
+    H -->|"Add / Delete / Exclude ROIs"| J["Pathologist Hotspot Polygon Review"]
+    H -->|"Zero-Tumor Confirmation Gate"| K{"Active Hotspots > 0?"}
+    K -->|"Yes: Malignant Pathway"| L["Confirm Hotspots -> Queue Stage 4 Mitosis"]
+    K -->|"No + no_invasive_tumor=True"| M["Benign Protocol -> Skip to Stage 6 Report"]
+```
 * **Live Google Path Foundation Integration**: Connected to a dedicated Vertex AI Vision Transformer (ViT) endpoint (`asia-south1`), streaming optical patches to produce 384-dimensional representation vectors.
 * **Calibrated Linear Probe**: Predicts tumor probability scores ($P(\text{invasive carcinoma})$) per tile to localize active tumor margins.
 * **Fluid Viridis Heatmap Overlay**: High-resolution RGBA probability overlay registered with slide coordinates. Pathologists adjust opacity dynamically (10%–100%) with non-destructive client-side rendering.
 * **Interactive Hotspot Workspace**: Allows pathologists to inspect candidate regions of interest (ROIs), adjust contour thresholds, manually add/delete ROIs, or confirm benign slides via explicit zero-tumor verification.
 
+---
+
 ### Stage 4: High-Power Mitosis Studio & Virtual HPF Placement
+```mermaid
+flowchart TD
+    A["Confirmed Stage 3 Hotspots"] -->|"Enumerate 40x Tiles (0.25 µm/px)"| B["Macenko Stain Normalization Transform"]
+    B --> C["First-Pass Sweep: YOLOv8 Mitosis Detector (High Recall)"]
+    C -->|"Intra-Tile & Global 20 µm Spatial NMS"| D["Deduplicated Candidate Mitotic Centroids"]
+    D -->|"Extract 128x128 Focus Crops"| E["Second-Pass Verification: HoVer-Net Nuclear Segmenter"]
+    E -->|"Spicule Variance & Envelope Breakdown"| F["Candidate Scoring & Morphology Filters"]
+    F -->|"Apoptosis & Lymphocyte Rejection"| G["Van Diest Morphological Mimic Filter"]
+    G -->|"Dual-Magnification Inputs (40x Focus + 10x HPF)"| H["MedGemma 1.5 Multimodal Referee Adjudication"]
+    H -->|"Parenchymal Tissue Ratio >= 70%"| I["Density-Conscious 10 Virtual HPF Convolution (r=262 µm)"]
+    I -->|"Point-in-Circle Mitotic Figure Count"| J["Live Elston-Ellis Nottingham Mitotic Score"]
+    J --> K["Pathologist Mitosis Studio (MitosisViewer.tsx)"]
+    K -->|"Spacebar 10x <-> 40x Toggle & Reticle"| L["Sub-Cellular Chromatin & Spindle Pole Inspection"]
+    K -->|"Keyboard Hotkeys (M: Mitosis, X: Reject)"| M["Pathologist Confirmation Gate"]
+    M --> N["Confirm 10 HPFs -> Queue Stage 5 Grading"]
+```
 * **True 40× Optical Magnification ($0.25\text{--}0.28\,\mu\text{m/px}$)**: Extracts authentic high-power optical patches across standard $577\,\mu\text{m}$ fields, enabling clear visualization of nuclear chromatin, spindle poles, and cell boundaries.
 * **MICCAI MIDOG-Standard 20 µm NMS**: Implements physical micrometer Non-Maximum Suppression (intra-tile and global) to eliminate multi-pole duplicate detections.
 * **Van Diest & WHO Morphological Filtering**: Automatically suppresses apoptosis (retraction halos) and normal lymphocytes ($5\text{--}7\,\mu\text{m}$), verifying true mitotic features (spicules, jagged arms, envelope breakdown).
@@ -99,7 +165,28 @@ flowchart TD
 * **Tissue Density–Conscious HPF Selection**: Selects 10 standardized Virtual High-Power Fields ($2.157\,\text{mm}^2$ total area) restricted to $\ge 70\%$ tissue cellularity, preventing HPF placement in fat, glass, or necrosis.
 * **Interactive Pathologist Studio**: Ergonomic review canvas with spacebar magnification toggle ($10\times \leftrightarrow 40\times$), candidate auto-centering, and rapid keyboard hotkeys (<kbd>M</kbd> Confirm, <kbd>X</kbd> Reject).
 
+---
+
 ### Stage 5: Nottingham Histologic Grading (MedGemma 1.5)
+```mermaid
+flowchart TD
+    A["Confirmed Stage 3 Hotspots + Stage 4 Mitotic Score"] -->|"Continuous Density Hotspot Sampling (>= 384 µm Sep)"| B["Sample 24 Stratified Evidence Patches (512x512 @ 1.0 µm/px)"]
+    B --> C["Macenko Stain Normalizer Transform"]
+    C --> D["Persist Patch PNGs to GCS (oncogemma-dev-artifacts)"]
+    D -->|"Async Batched Inference (MedGemma 1.5)"| E1["MedGemma 1.5: Tubule Formation (24 patches)"]
+    D -->|"Async Batched Inference (MedGemma 1.5)"| E2["MedGemma 1.5: Nuclear Pleomorphism (24 patches)"]
+    D -->|"Multi-Patch Call (Top 8 Patches)"| E3["MedGemma 1.5: Histologic Subtype Consensus"]
+    E1 & E2 & E3 -->|"Pydantic Schema Validation & Cleaning"| F["Parsed Machine Findings"]
+    F -->|"Pure Zero-LLM Deterministic Calculation"| G["Deterministic Nottingham Aggregation Engine"]
+    G -->|"Weighted Median (Tubule %) -> Score 1/2/3"| H1["Tubule Formation Score (T)"]
+    G -->|"Weighted Mode (Tie -> Higher Grade)"| H2["Nuclear Pleomorphism Score (P)"]
+    A -->|"From Stage 4"| H3["Mitotic Score (M)"]
+    H1 & H2 & H3 -->|"Nottingham Sum = T + P + M (Range: 3-9)"| I["Nottingham Grade (Grade 1 / 2 / 3)"]
+    I & F --> J["MedGemma 1.5: Grounded Findings Narrative"]
+    I & J & E3 --> K["Pathologist Grading Review Workspace (GradingReviewWorkspace.tsx)"]
+    K -->|"Dual-Level Sign-Off Gate"| L["Explicit Confirmation of Patches & Histologic Subtype"]
+    L -->|"Commit to DB (CHECK Constraint Enforced)"| M["Persist to gradings Table + Audit Event -> Advance to Stage 6"]
+```
 * **Continuous Density Hotspot Sampling**: Extracts 24 stratified $10\times$ evidence patches ($512\times 512\,\mu\text{m}$) from peak cellularity zones of confirmed Stage 3 hotspots ($\ge 384\,\mu\text{m}$ separation).
 * **Multimodal Nottingham Evaluation**:
   * **Tubule Formation**: Quantifies glandular/tubular lumen percentage ($>75\% \to 1$, $10\text{--}75\% \to 2$, $<10\% \to 3$).
@@ -110,7 +197,28 @@ flowchart TD
   $$\text{Nottingham Sum} = \text{Score}_{\text{Tubule}} + \text{Score}_{\text{Pleo}} + \text{Score}_{\text{Mitosis}} \quad (\text{Range: } 3\text{--}9)$$
   $$\text{Grade} = \begin{cases} \text{Grade 1 (Well Differentiated)} & 3 \le \text{Sum} \le 5 \\ \text{Grade 2 (Moderately Differentiated)} & 6 \le \text{Sum} \le 7 \\ \text{Grade 3 (Poorly Differentiated)} & 8 \le \text{Sum} \le 9 \end{cases}$$
 
+---
+
 ### Stage 6: CAP Synoptic Reporting & Staging
+```mermaid
+flowchart TD
+    A["Confirmed Stage 5 Grading + Stage 4 Mitotic HPFs + Stage 3 Hotspots"] --> B["Stage 6 Background Worker (worker/report.py)"]
+    B --> C["Aggregate Verified Stage 1-5 Machine & Override Data"]
+    C --> D["Deterministic Zero-LLM AJCC Staging Engine (pipeline/staging.py)"]
+    C --> E["MedGemma 1.5 Multi-Section Narrative Synthesis"]
+    E --> F["Code-Level Numerical Consistency Guardrail"]
+    D & F --> G["Persist Draft Report to DB (reports Table) -> Status: awaiting_review"]
+    G --> H["Pathologist Synoptic Workspace (ReportWorkspace.tsx)"]
+    H -->|"Interactive Synoptic Smart-Form"| I["Update Gross / Surgical / Biomarker Elements"]
+    I -->|"Live Debounced API Call"| D
+    H -->|"Live PDF Streaming / Preview"| J["ReportLab Platypus 3-Page Clinical PDF Engine"]
+    J -->|"Embed Key Visual Evidence"| K["WSI Heatmap + Top Mitotic HPF + Grading Patch"]
+    H -->|"Pathologist Review & Sign-Off Gate"| L["Digital Attestation Modal (Credentials, NPI, PIN)"]
+    L -->|"Commit Final Signature"| M["Lock Report -> Status: signed (Case: done)"]
+    M --> N["Generate SHA-256 Integrity Hash & Audit Event"]
+    M --> O["Structured CAP eCC / FHIR JSON Export + Printable 3-Page PDF"]
+    M -.->|"Formal Re-Open / Correction"| P["Versioned Amendment Workflow (v1.0 -> v1.1)"]
+```
 * **Deterministic Zero-LLM AJCC Staging**: Pure-code calculation of Pathologic T (pT), Pathologic N (pN), and Anatomic Stage Grouping (Stage 0 to IV) strictly following AJCC 8th/9th Edition criteria.
 * **MedGemma Narrative Synthesis with Guardrails**: Generates professional microscopic descriptions and clinical summaries, protected by validation guardrails that prevent numerical or grade contradictions.
 * **ReportLab Platypus 3-Page Clinical PDF**:
@@ -118,6 +226,7 @@ flowchart TD
   * **Page 2**: Microscopic Findings, MedGemma Clinical Narrative, Key Visual Evidence (WSI Heatmap, Top Mitotic HPF, Grading Patch), and Pathologist Attestation Block.
   * **Page 3**: Clinical Appendix & Provenance (RUO Amber Warning Banner, Model Fingerprints, Reviewer Audit Trail, and Version History).
 * **Digital Sign-Off & Immutability**: PIN-authenticated sign-off generates a cryptographic SHA-256 integrity seal. Signed reports are permanently locked; updates require the formal versioned amendment workflow (`v1.0` $\to$ `v1.1`).
+
 
 ---
 
