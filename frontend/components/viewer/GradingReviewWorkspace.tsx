@@ -11,23 +11,15 @@ import {
   ArrowRight,
   Eye,
   Microscope,
-  HelpCircle,
-  FileCheck,
   Check,
   X,
   Loader2,
-  ExternalLink,
-  ChevronRight,
-  Info,
   ShieldCheck,
   AlertCircle,
-  Sliders,
   CheckCheck,
   Filter,
   Plus,
   Minus,
-  MessageSquare,
-  Lock,
   Crosshair
 } from "lucide-react";
 import {

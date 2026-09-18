@@ -6,7 +6,6 @@ import shutil
 import tempfile
 import numpy as np
 from PIL import Image
-from datetime import datetime, timezone
 import glob
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -18,7 +17,6 @@ from app.core.gcs import (
     get_gcs_client,
     parse_gcs_uri,
     upload_blob_from_bytes,
-    upload_blob_from_filename,
     download_blob_to_filename,
     resolve_slide_raw_uri
 )
@@ -26,7 +24,6 @@ from app.models.slide import Slide
 from app.models.stage_execution import StageExecution
 from app.models.audit import AuditEvent
 from pipeline.stain import fit_macenko_stain
-from pipeline.tiles import read_region_srgb
 
 def generate_norm_dzi_pyramid(slide_obj, normalizer, local_slide_path: str, scratch_dir: str) -> str:
     """

@@ -4,7 +4,6 @@ Performs second-pass instance segmentation and classification on 128x128 candida
 Filters out apoptotic bodies, lymphocytes, and pyknotic debris from true mitotic figures.
 """
 import os
-import math
 from typing import Protocol, Tuple, List, Optional
 import numpy as np
 
@@ -235,7 +234,7 @@ def create_dual_magnification_composite(
     1. Focus Crop (40x, 128x128 px): Target cell with subtle circular reticle.
     2. Context Patch (10x, 512x512 px): Surrounding tumor bed architecture.
     """
-    from PIL import Image, ImageDraw
+    from PIL import Image
     import io
     from app.core.openslide_lock import OPENSLIDE_GLOBAL_LOCK
 

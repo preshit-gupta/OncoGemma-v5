@@ -2,14 +2,12 @@ import os
 import json
 import shutil
 import tempfile
-import numpy as np
 from PIL import Image
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.gcs import (
-    get_gcs_client,
     parse_gcs_uri,
     upload_blob_from_bytes,
     download_blob_to_filename,

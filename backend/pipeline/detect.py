@@ -7,7 +7,6 @@ import os
 import math
 from typing import Protocol, List, Tuple, Dict, Any, Optional
 import numpy as np
-from PIL import Image
 
 class MitosisDetector(Protocol):
     def detect(self, tile_rgb: np.ndarray) -> List[Tuple[float, float, float]]:

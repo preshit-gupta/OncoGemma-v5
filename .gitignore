@@ -71,3 +71,12 @@ infra/bin/
 .terraform/
 tfplan
 
+# SQLite Database journals & temp artifacts (#545)
+*.db-journal
+*.db-wal
+*.db-shm
+.coverage.*
+coverage.xml
+nosetests.xml
+
+

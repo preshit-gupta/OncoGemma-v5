@@ -181,7 +181,6 @@ def check_pen_marks(
         thumb_arr, _ = read_region_srgb(slide_obj, 0, 0, thumb_w_um, thumb_h_um, out_px=(512, 512), mpp_x=mpp_x, mpp_y=mpp_y)
     except Exception:
         if hasattr(slide_obj, "resize"):
-            from PIL import Image
             thumb_arr = np.array(slide_obj.convert("RGB").resize((512, 512)))
         else:
             thumb_arr = np.ones((512, 512, 3), dtype=np.uint8) * 240
@@ -267,7 +266,6 @@ def check_tissue_folds(
         thumb_arr, _ = read_region_srgb(slide_obj, 0, 0, thumb_w_um, thumb_h_um, out_px=(512, 512), mpp_x=mpp_x, mpp_y=mpp_y)
     except Exception:
         if hasattr(slide_obj, "resize"):
-            from PIL import Image
             thumb_arr = np.array(slide_obj.convert("RGB").resize((512, 512)))
         else:
             thumb_arr = np.ones((512, 512, 3), dtype=np.uint8) * 240

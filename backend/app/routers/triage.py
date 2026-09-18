@@ -4,25 +4,22 @@ import json
 import uuid
 import tempfile
 import shutil
-import threading
 from datetime import datetime, timezone
 from typing import Any, Optional, Literal
 import numpy as np
 from PIL import Image
 from fastapi import APIRouter, Depends, HTTPException, status, Response, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.gcs import (
-    get_gcs_client,
     parse_gcs_uri,
     download_blob_as_bytes,
     download_blob_as_text,
     download_blob_to_filename,
     upload_blob_from_bytes,
-    blob_exists,
     resolve_slide_raw_uri
 )
 from app.core.db import get_db
@@ -653,7 +650,7 @@ def confirm_triage(payload: TriageConfirmPayload, db: Session = Depends(get_db))
         )
     if len(active_hotspots) == 0 and not payload.no_invasive_tumor:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="No active hotspots remaining. Pathologist must explicitly flag no_invasive_tumor=True to confirm zero tumor on this slide."
         )
 

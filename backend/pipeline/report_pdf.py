@@ -31,16 +31,15 @@ from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List, Tuple
 
 from jinja2 import Environment, FileSystemLoader
-from PIL import Image as PILImage, ImageDraw, ImageFont
+from PIL import Image as PILImage, ImageDraw
 
 # ReportLab imports for deterministic fallback engine
 from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage, KeepTogether, HRFlowable, PageBreak
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage, HRFlowable, PageBreak
 )
-from reportlab.lib.units import inch
 from reportlab.pdfgen import canvas
 
 

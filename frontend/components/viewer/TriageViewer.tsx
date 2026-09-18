@@ -4,7 +4,6 @@ import React, { useEffect, useState } from "react";
 import { 
   Flame, 
   CheckCircle2, 
-  XCircle, 
   Plus, 
   Sliders, 
   ShieldAlert, 
@@ -14,9 +13,7 @@ import {
   Trash2,
   Crosshair,
   ZoomIn,
-  Eye,
   X,
-  Layers, 
   Activity,
   RotateCcw,
   MapPin,

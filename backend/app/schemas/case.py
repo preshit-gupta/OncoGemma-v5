@@ -1,11 +1,13 @@
 from datetime import datetime, timezone
 from uuid import UUID
-from pydantic import BaseModel, field_serializer, field_validator
+from pydantic import BaseModel, ConfigDict, field_serializer, field_validator
 
 class CaseCreate(BaseModel):
     pass
 
 class CaseResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: UUID
     created_by: str
     status: str
@@ -16,9 +18,6 @@ class CaseResponse(BaseModel):
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.isoformat()
-
-    class Config:
-        from_attributes = True
 
 class SlideUploadUrlRequest(BaseModel):
     filename: str
@@ -45,6 +44,8 @@ class SlideMppUpdateRequest(BaseModel):
     mpp_y: float | None = None
 
 class CaseDetailResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: UUID
     created_by: str
     status: str
@@ -59,9 +60,6 @@ class CaseDetailResponse(BaseModel):
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.isoformat()
-
-    class Config:
-        from_attributes = True
 
 class ApproveStageRequest(BaseModel):
     override_justification: str | None = None

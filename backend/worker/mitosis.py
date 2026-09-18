@@ -2,10 +2,9 @@ import os
 import io
 import json
 import yaml
-import asyncio
 import tempfile
 import shutil
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, Tuple
 import numpy as np
 from PIL import Image
 from sqlalchemy import select, delete

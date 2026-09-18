@@ -5,7 +5,7 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-009688.svg)](https://fastapi.tiangolo.com)
 [![Next.js](https://img.shields.io/badge/Next.js-14.2+-black.svg)](https://nextjs.org)
 [![Google Cloud](https://img.shields.io/badge/GCP-Cloud%20Storage%20%7C%20Vertex%20AI-4285F4.svg)](https://cloud.google.com)
-[![Tests](https://img.shields.io/badge/Tests-100%2F100%20Passing-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/Tests-226%2F226%20Passing-brightgreen.svg)](backend/tests/)
 
 **OncoGemma v5** is an enterprise-grade clinical AI platform and diagnostic copilot designed for pathologists to analyze Whole-Slide Images (WSIs) of invasive breast carcinoma. It automates gigapixel slide ingestion, quality control, tumor bed triage, mitotic figure quantification, Nottingham Histologic Grading (Elston-Ellis modification), and College of American Pathologists (CAP) synoptic cancer reporting with AJCC 8th/9th Edition staging.
 
@@ -357,10 +357,22 @@ cd backend
 pytest tests/ -v
 ```
 
-### Test Coverage Summary (100/100 Tests Passing Across 18 Suites)
+### Test Coverage Summary (226/226 Tests Passing Across 30 Suites)
 * `backend/tests/test_api_auth.py` (Authentication, bearer tokens, RBAC roles: admin, pathologist, technician, viewer, and `/health` aliases)
 * `backend/tests/test_batch4_state_and_concurrency.py` (Row locking, worker skip_locked, orphan recovery, SQLite foreign keys, case cascade deletes, attempt monotonicity)
 * `backend/tests/test_batch5_stain_and_qc.py` (Fitted Macenko deconvolution, tissue mask sampling, degenerate slide handling, 5-check automated QC suite)
+* `backend/tests/test_batch7_report_signing.py` (Report digital signatures, attestation hashes, prior stage gating, password/PIN validation)
+* `backend/tests/test_batch8_grading_pipeline.py` (Tubule formation, nuclear pleomorphism, histologic typing, and Nottingham grade scoring)
+* `backend/tests/test_batch9_mitosis_pipeline.py` (40x tile extraction, YOLO candidate sweeping, HoVer-Net verification, and HPF spatial packing)
+* `backend/tests/test_batch10_triage_pipeline.py` (Path Foundation feature embeddings, linear probe classification, and viridis heatmap overlays)
+* `backend/tests/test_batch11_pipeline_integrity.py` (End-to-end stage state transitions, retry semantics, and input/output ref validation)
+* `backend/tests/test_batch12_reporting_and_validation.py` (CAP synoptic element validation, AJCC 8th/9th staging rules, and narrative consistency)
+* `backend/tests/test_batch14_triage_edge_cases.py` (Zero tumor confirmation, manual hotspot additions/removals, and coordinate boundary clipping)
+* `backend/tests/test_batch15_tiles_and_hpf.py` (DeepZoom tile generation, boundary clamping, and Virtual HPF density sorting)
+* `backend/tests/test_batch16_mitosis_pipeline.py` (MIDOG NMS, high-power reticle calibration, and candidate proximity deduplication)
+* `backend/tests/test_batch17_grading_staging.py` (Dual-level sign-off gating, histologic subtype confirmation, and Nottingham invariants)
+* `backend/tests/test_batch18_reporting_pdf_audit.py` (ReportLab Platypus 3-page layout, NumberedCanvas, RUO banners, audit order tiebreaker)
+* `backend/tests/test_batch19_21_hardening.py` (Pydantic v2 migration, CORS whitelist & regex security, health check endpoints, zero deprecation warnings)
 * `backend/tests/test_cap_reporting.py` (CAP synoptic PDF generation, benign protocols, digital signatures, multi-version immutable amendments)
 * `backend/tests/test_coords.py` (Micron-to-pixel coordinate transforms and geometric scaling)
 * `backend/tests/test_grading.py` (Nottingham grading, MedGemma integration, spatial candidate deduplication across overlapping HPFs)

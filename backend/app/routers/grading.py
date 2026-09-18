@@ -7,17 +7,12 @@ patch image streaming, and clinical confirmation gate with mandatory dual-level 
 """
 
 import os
-import io
 import json
 import math
 import uuid
-import tempfile
-import shutil
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Literal
-import numpy as np
 import yaml
-from PIL import Image
 from fastapi import APIRouter, Depends, HTTPException, status, Response
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
@@ -25,20 +20,13 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.auth import get_current_user, CurrentUser
-from app.core.openslide_lock import OPENSLIDE_GLOBAL_LOCK
-from app.core.gcs import (
-    parse_gcs_uri,
-    download_blob_as_bytes,
-    resolve_slide_raw_uri
-)
+from app.core.gcs import download_blob_as_bytes
 from app.core.db import get_db
 from app.models.case import Case
-from app.models.slide import Slide
 from app.models.stage_execution import StageExecution
 from app.models.hpf_site import HpfSite
 from app.models.detection import Detection
 from app.models.grading import Grading
-from app.models.hotspot import Hotspot
 from app.models.report import Report
 from app.models.audit import AuditEvent
 from pipeline.grading import (

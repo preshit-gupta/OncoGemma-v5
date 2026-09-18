@@ -1,7 +1,9 @@
 from datetime import datetime
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 class AuditEventResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     case_id: str | None
     actor: str
@@ -9,9 +11,6 @@ class AuditEventResponse(BaseModel):
     stage: str | None
     payload: dict | None
     created_at: datetime
-
-    class Config:
-        from_attributes = True
 
 class PaginatedAuditEvents(BaseModel):
     events: list[AuditEventResponse]

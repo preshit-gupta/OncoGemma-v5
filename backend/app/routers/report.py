@@ -1,5 +1,4 @@
 import os
-import io
 import json
 import uuid
 import hashlib
@@ -16,8 +15,6 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.gcs import (
-    get_gcs_client,
-    parse_gcs_uri,
     upload_blob_from_bytes,
     download_blob_as_bytes,
     blob_exists
@@ -41,7 +38,7 @@ from pipeline.staging import (
     validate_staging_invariants,
     validate_narrative_consistency
 )
-from pipeline.medgemma import MedGemmaClient, load_prompt_template
+from pipeline.medgemma import MedGemmaClient
 from pipeline.report_pdf import generate_clinical_cap_pdf, render_report_html, build_report_pdf_context
 
 router = APIRouter(prefix="/api/v1/stages/report", tags=["report"])
@@ -459,7 +456,7 @@ def update_report_data(
         stage_grp = calculate_ajcc_stage_group(pt_stage, pn_stage)
         validate_staging_invariants(tumor_size, pt_stage, n_exam, n_pos, pn_stage, stage_grp)
     except ValueError as ve:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(ve))
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(ve))
 
     report.staging = {
         "ajcc_version": "8th/9th Edition",
@@ -635,7 +632,7 @@ def sign_final_report(
 
     if payload.password_or_pin is not None and len(payload.password_or_pin.strip()) < 4:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail={
                 "detail": "Valid re-authentication PIN or password (minimum 4 characters) is required to digitally sign.",
                 "missing_items": ["reauthentication_pin_required"]
@@ -689,7 +686,7 @@ def sign_final_report(
 
     if missing_items:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail={
                 "detail": "Digital sign-off preconditions failed. All prior stages, histologic type, and mandatory CAP synoptic elements must be verified.",
                 "missing_items": missing_items

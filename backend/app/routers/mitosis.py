@@ -4,7 +4,6 @@ import json
 import uuid
 import math
 import tempfile
-import shutil
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, Literal
 import numpy as np
@@ -656,7 +655,7 @@ def recompute_scoring(payload: RecomputePayload, db: Session = Depends(get_db)):
                 min_sep = (h1.radius_um + h2.radius_um) - 5.0
                 if dist < min_sep:
                     raise HTTPException(
-                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                         detail=f"HPF sites cannot overlap: field #{h1.seq} and field #{h2.seq} are {dist:.1f} µm apart (minimum separation: {min_sep:.1f} µm)."
                     )
 
@@ -702,7 +701,7 @@ def add_pathologist_mitosis(payload: AddCandidatePayload, db: Session = Depends(
     case_uid = case_obj.id
 
     if not payload.centroid_um or len(payload.centroid_um) != 2:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="centroid_um must be a coordinate pair [x, y].")
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="centroid_um must be a coordinate pair [x, y].")
     cx_um = float(payload.centroid_um[0])
     cy_um = float(payload.centroid_um[1])
 

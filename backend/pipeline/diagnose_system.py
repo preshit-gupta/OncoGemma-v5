@@ -13,10 +13,7 @@ Runs end-to-end checks across:
 """
 import os
 import sys
-import io
 import time
-import json
-import base64
 import numpy as np
 from PIL import Image
 
@@ -27,7 +24,7 @@ if sys.platform == "win32":
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from app.core.config import settings
-from app.core.db import SessionLocal, Base, engine
+from app.core.db import SessionLocal, engine
 from app.core.gcs import get_gcs_client
 from app.models.case import Case
 from app.models.slide import Slide

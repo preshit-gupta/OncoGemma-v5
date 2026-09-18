@@ -15,9 +15,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db
-from app.core.config import settings
 from app.models.stage_execution import StageExecution
-from app.models.case import Case
 from worker.ingest import run_ingest
 from worker.preprocess import run_preprocess
 from worker.qc import run_qc

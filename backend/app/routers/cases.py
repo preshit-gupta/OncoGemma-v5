@@ -845,9 +845,6 @@ def update_slide_mpp(
         )
         db.add(next_prep_stage)
         db.commit()
-        db.refresh(next_prep_stage)
-
-        from app.core.cloud_tasks import dispatch_stage_task
         dispatch_stage_task(
             case_id=str(case_id),
             stage="preprocess",

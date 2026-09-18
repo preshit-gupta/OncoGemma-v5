@@ -2,7 +2,7 @@
 
 import React, { useEffect, useRef, useState, useCallback } from "react";
 import OpenSeadragon from "openseadragon";
-import { ZoomIn, ZoomOut, Maximize, ChevronDown, Check, Layers, Image as ImageIcon, Info } from "lucide-react";
+import { ZoomIn, ZoomOut, Maximize, ChevronDown, Check, Layers, Info } from "lucide-react";
 import { API_BASE } from "@/lib/api";
 
 export interface ViewerHotspot {

@@ -1,11 +1,8 @@
 import uuid
 import os
-import io
 import json
 import math
 import tempfile
-import shutil
-import threading
 from io import BytesIO
 import numpy as np
 from PIL import Image
@@ -19,13 +16,10 @@ from app.core.config import settings
 from app.core.gcs import (
     get_gcs_client,
     parse_gcs_uri,
-    download_blob_as_bytes,
     download_blob_as_text,
-    download_blob_to_filename,
     resolve_slide_raw_uri
 )
 from app.core.openslide_lock import OPENSLIDE_GLOBAL_LOCK
-from app.models.case import Case
 from app.models.slide import Slide
 from pipeline.tiles import read_region_srgb
 

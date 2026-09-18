@@ -16,7 +16,6 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
-from typing import Any
 import matplotlib
 import matplotlib.cm as cm
 from PIL import Image
@@ -24,17 +23,13 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.gcs import (
-    get_gcs_client,
     parse_gcs_uri,
     upload_blob_from_bytes,
-    upload_blob_from_filename,
     download_blob_as_bytes,
-    download_blob_as_text,
     download_blob_to_filename,
     get_gcs_artifact_direct_url,
     resolve_slide_raw_uri
 )
-from app.models.case import Case
 from app.models.slide import Slide
 from app.models.stage_execution import StageExecution
 from app.models.audit import AuditEvent

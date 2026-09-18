@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useState } from "react";
-import { CheckCircle2, Clock, AlertTriangle, XCircle, Play, PanelLeftClose, PanelLeft, RotateCcw, UserCheck } from "lucide-react";
+import { CheckCircle2, Clock, XCircle, Play, PanelLeftClose, PanelLeft, RotateCcw, UserCheck } from "lucide-react";
 import { retryStage } from "@/lib/api";
 
 export interface StageInfo {

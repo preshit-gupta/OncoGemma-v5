@@ -1,7 +1,6 @@
 import os
 import sys
 import time
-import uuid
 import traceback
 from datetime import datetime, timezone, timedelta
 

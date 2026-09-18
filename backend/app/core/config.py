@@ -1,7 +1,9 @@
 import os
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
     ENV: str = os.getenv("ENV", "dev")
     ENVIRONMENT: str = os.getenv("ENVIRONMENT", "dev")
     DEBUG: bool = True
@@ -73,8 +75,8 @@ class Settings(BaseSettings):
     # Config directory
     CONFIGS_DIR: str = os.path.join(os.path.dirname(__file__), "../../../configs")
     
-    class Config:
-        env_file = ".env"
-        extra = "ignore"
+    # CORS Configuration (#3)
+    CORS_ORIGINS: str = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000,http://localhost:8000")
+
 
 settings = Settings()
