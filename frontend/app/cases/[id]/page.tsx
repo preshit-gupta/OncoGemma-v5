@@ -671,14 +671,16 @@ export default function CaseWorkspacePage({ params }: { params: { id: string } }
               />
             </ErrorBoundary>
           ) : (
-            <OpenSeadragonViewer
-              caseId={caseId}
-              mppX={slide?.mpp_x || 0.25}
-              mppY={slide?.mpp_y || slide?.mpp_x || 0.25}
-              imageWidthPx={slide?.width_px || 2048}
-              imageHeightPx={slide?.height_px || 2048}
-              tileUrlTemplate={caseDetail?.tile_url_template}
-            />
+            <ErrorBoundary>
+              <OpenSeadragonViewer
+                caseId={caseId}
+                mppX={slide?.mpp_x || 0.25}
+                mppY={slide?.mpp_y || slide?.mpp_x || 0.25}
+                imageWidthPx={slide?.width_px || 2048}
+                imageHeightPx={slide?.height_px || 2048}
+                tileUrlTemplate={caseDetail?.tile_url_template}
+              />
+            </ErrorBoundary>
           )}
         </div>
 
