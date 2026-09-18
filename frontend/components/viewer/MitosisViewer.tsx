@@ -271,8 +271,8 @@ export function MitosisViewer({
       const rank = (c: MitosisCandidate) => (c.label === "mitosis" ? 2 : (c.label === "unreviewed" ? 1 : 0));
       const diff = rank(b) - rank(a);
       if (diff !== 0) return diff;
-      const confA = a.ver_conf || a.det_conf || 0;
-      const confB = b.ver_conf || b.det_conf || 0;
+      const confA = Math.max(a.ver_conf ?? 0, a.det_conf ?? 0);
+      const confB = Math.max(b.ver_conf ?? 0, b.det_conf ?? 0);
       return confB - confA;
     });
   }, [candidates, activeHpf]);
@@ -430,7 +430,7 @@ export function MitosisViewer({
         y_um,
         centroid_um: cand.centroid_um,
         label: cand.label,
-        conf: cand.ver_conf || cand.det_conf || 0.0,
+        conf: Math.max(cand.ver_conf ?? 0, cand.det_conf ?? 0),
         in_hpf: isInsideHpf
       };
     });
@@ -585,7 +585,7 @@ export function MitosisViewer({
 
   // Calculate unreviewed count for candidates >= 0.50 conf
   const unreviewedHighConf = candidates.filter(
-    c => c.label === "unreviewed" && ((c.ver_conf || c.det_conf || 0) >= 0.50)
+    c => c.label === "unreviewed" && (Math.max(c.ver_conf ?? 0, c.det_conf ?? 0) >= 0.50)
   ).length;
 
   if (loading && !data) {

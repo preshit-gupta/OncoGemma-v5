@@ -23,20 +23,43 @@ class YoloMitosisDetector:
     YOLO-family Mitosis Object Detector (trained on MIDOG / MIDOG++).
     Provides high-recall sweeping for dark, dense hyperchromatic nuclear structures.
     """
-    def __init__(self, weights_path: Optional[str] = None, conf_threshold: float = 0.35, device: str = "cpu"):
+    def __init__(
+        self,
+        weights_path: Optional[str] = None,
+        conf_threshold: float = 0.35,
+        device: str = "cpu",
+        max_candidates_per_tile: int = 64,
+        batch_size: int = 16,
+        fp16: bool = False
+    ):
         self.conf_threshold = conf_threshold
         self.device = device
         self.weights_path = weights_path
+        self.max_candidates_per_tile = max_candidates_per_tile
+        self.batch_size = batch_size
+        self.fp16 = fp16
         self.model = None
         self.model_version = "od_heuristic@dev"
 
         if weights_path and os.path.exists(weights_path):
             try:
-                import torch
-                # If torch and model weights are present, attempt loading
-                self.model = torch.load(weights_path, map_location=device)
-                self.model_version = "midog22_yolov8x_sweep@v1.0"
-                print(f"[MitosisDetector] Loaded published weights from {weights_path}")
+                # Try loading via Ultralytics YOLO first if available
+                try:
+                    from ultralytics import YOLO
+                    self.model = YOLO(weights_path)
+                    self.model_version = "midog22_yolov8x_sweep@v1.0"
+                    print(f"[MitosisDetector] Loaded Ultralytics weights from {weights_path}")
+                except Exception:
+                    import torch
+                    loaded = torch.load(weights_path, map_location=device)
+                    if isinstance(loaded, dict) and "model" in loaded:
+                        self.model = loaded["model"]
+                    else:
+                        self.model = loaded
+                    if hasattr(self.model, "eval"):
+                        self.model.eval()
+                    self.model_version = "midog22_yolov8x_sweep@v1.0"
+                    print(f"[MitosisDetector] Loaded PyTorch weights from {weights_path}")
             except Exception as e:
                 print(f"[MitosisDetector Warning] Failed to load {weights_path}: {e}. Running in algorithmic fallback mode.")
                 self.model = None
@@ -48,26 +71,49 @@ class YoloMitosisDetector:
         """
         if self.model is not None:
             try:
-                # Real PyTorch/YOLO inference if model is loaded
+                # If Ultralytics YOLO predict interface exists
+                if hasattr(self.model, "predict"):
+                    results = self.model.predict(
+                        tile_rgb,
+                        conf=self.conf_threshold,
+                        device=self.device,
+                        verbose=False,
+                        half=self.fp16
+                    )
+                    detections = []
+                    for r in results:
+                        if hasattr(r, "boxes") and r.boxes is not None:
+                            for box in r.boxes:
+                                coords = box.xyxy[0].tolist()
+                                conf = float(box.conf[0].item())
+                                cx = float((coords[0] + coords[2]) / 2.0)
+                                cy = float((coords[1] + coords[3]) / 2.0)
+                                detections.append((cx, cy, conf))
+                    return detections[:self.max_candidates_per_tile]
+
+                # Direct PyTorch module inference
                 import torch
                 img_t = torch.from_numpy(tile_rgb).permute(2, 0, 1).float() / 255.0
+                if self.fp16 and self.device != "cpu":
+                    img_t = img_t.half()
                 img_t = img_t.unsqueeze(0).to(self.device)
                 with torch.no_grad():
                     preds = self.model(img_t)
-                # Parse bounding boxes / centroids
                 detections = []
-                for box in preds[0]:
-                    conf = float(box[4])
-                    if conf >= self.conf_threshold:
-                        cx = float((box[0] + box[2]) / 2.0)
-                        cy = float((box[1] + box[3]) / 2.0)
-                        detections.append((cx, cy, conf))
-                return detections
+                if isinstance(preds, (list, tuple)) and len(preds) > 0:
+                    raw_boxes = preds[0]
+                    if hasattr(raw_boxes, "shape") and len(raw_boxes.shape) >= 2 and raw_boxes.shape[-1] >= 5:
+                        for box in raw_boxes:
+                            conf = float(box[4])
+                            if conf >= self.conf_threshold:
+                                cx = float((box[0] + box[2]) / 2.0)
+                                cy = float((box[1] + box[3]) / 2.0)
+                                detections.append((cx, cy, conf))
+                return detections[:self.max_candidates_per_tile]
             except Exception as e:
                 print(f"[MitosisDetector Runtime Error] {e}. Falling back to visual feature extractor.")
 
         # Algorithmic optical density & hyperchromatic nuclear detection fallback
-        # Mitotic figures appear as intensely dark, hyperchromatic, dense chromatin clumps in H&E (low green/blue, high hematoxylin absorption)
         return self._detect_hyperchromatic_features(tile_rgb)
 
     def _detect_hyperchromatic_features(self, tile_rgb: np.ndarray) -> List[Tuple[float, float, float]]:
@@ -104,18 +150,23 @@ class YoloMitosisDetector:
                         cx = float(M["m10"] / M["m00"])
                         cy = float(M["m01"] / M["m00"])
 
-                        # Calculate local peak OD within contour
-                        mask_cnt = np.zeros((h, w), dtype=np.uint8)
-                        cv2.drawContours(mask_cnt, [cnt], -1, 255, -1)
-                        p95_od = float(np.percentile(h_od[mask_cnt > 0], 95))
+                        # Calculate local peak OD within contour using bounding-box sub-mask (#583)
+                        bx, by, bw, bh = cv2.boundingRect(cnt)
+                        sub_mask = np.zeros((bh, bw), dtype=np.uint8)
+                        cnt_shifted = cnt - [bx, by]
+                        cv2.drawContours(sub_mask, [cnt_shifted], -1, 255, -1)
+                        sub_od = h_od[by:by + bh, bx:bx + bw]
+                        pixels_inside = sub_od[sub_mask > 0]
+                        if len(pixels_inside) > 0:
+                            p95_od = float(np.percentile(pixels_inside, 95))
+                        else:
+                            p95_od = float(np.max(sub_od))
 
-                        # Scale confidence based on chromatin condensation and cluster size
-                        conf = float(np.clip(
-                            0.35 + min(0.35, (p95_od - 0.40) * 0.30) + min(0.20, (area / 500.0) * 0.20),
-                            self.conf_threshold,
-                            0.95
-                        ))
-                        candidates.append((cx, cy, conf))
+                        # Un-floored confidence computation (#582)
+                        raw_conf = 0.20 + min(0.50, max(0.0, (p95_od - 0.70) * 0.60)) + min(0.25, (area / 1000.0) * 0.25)
+                        conf = float(np.clip(raw_conf, 0.05, 0.98))
+                        if conf >= self.conf_threshold:
+                            candidates.append((cx, cy, conf))
 
             # Apply intra-tile NMS (radius 80 px = 20 um at 0.25 um/px) to avoid multi-contour fragments of same cell
             candidates.sort(key=lambda c: c[2], reverse=True)
@@ -123,7 +174,9 @@ class YoloMitosisDetector:
             for c in candidates:
                 if not any(math.hypot(c[0] - s[0], c[1] - s[1]) < 80.0 for s in suppressed):
                     suppressed.append(c)
-            return suppressed[:6]
+            if len(suppressed) > self.max_candidates_per_tile:
+                print(f"[MitosisDetector] Capping {len(suppressed)} tile candidates to max limit {self.max_candidates_per_tile}")
+            return suppressed[:self.max_candidates_per_tile]
         except ImportError:
             # Fallback if OpenCV is not available
             stride = 48
@@ -136,8 +189,10 @@ class YoloMitosisDetector:
                         py, px = np.unravel_index(np.argmax(patch), patch.shape)
                         actual_x = float(x - stride // 2 + px)
                         actual_y = float(y - stride // 2 + py)
-                        conf = float(np.clip(0.35 + (max_val - chromatin_thresh) * 0.4, self.conf_threshold, 0.90))
-                        candidates.append((actual_x, actual_y, conf))
+                        raw_conf = 0.25 + (max_val - chromatin_thresh) * 0.50
+                        conf = float(np.clip(raw_conf, 0.05, 0.95))
+                        if conf >= self.conf_threshold:
+                            candidates.append((actual_x, actual_y, conf))
             candidates.sort(key=lambda c: c[2], reverse=True)
             suppressed = []
             for c in candidates:
@@ -212,16 +267,35 @@ def enumerate_hotspot_tiles(
     stride_um = stride_px * mpp
 
     mh, mw = (tissue_mask.shape if tissue_mask is not None else (0, 0))
-    slide_w_um, slide_h_um = (slide_dimensions_um if slide_dimensions_um is not None else (1.0, 1.0))
+    slide_w_um, slide_h_um = (slide_dimensions_um if slide_dimensions_um is not None else (float("inf"), float("inf")))
+
+    # Prepare polygon geometry for intersection testing (#121)
+    poly_geom = None
+    if len(hotspot_polygon_um) >= 3:
+        try:
+            from shapely.geometry import Polygon, box
+            poly_geom = Polygon(hotspot_polygon_um)
+            if not poly_geom.is_valid:
+                poly_geom = poly_geom.buffer(0)
+        except Exception:
+            poly_geom = None
 
     tiles = []
-    curr_y = min_y_um
-    while curr_y <= max_y_um:
-        curr_x = min_x_um
-        while curr_x <= max_x_um:
+    curr_y = max(0.0, min_y_um)
+    while curr_y <= max_y_um and curr_y < slide_h_um:
+        curr_x = max(0.0, min_x_um)
+        while curr_x <= max_x_um and curr_x < slide_w_um:
+            # Check tile intersection with hotspot polygon (#121)
+            if poly_geom is not None:
+                from shapely.geometry import box
+                tile_box = box(curr_x, curr_y, curr_x + tile_size_um, curr_y + tile_size_um)
+                if not poly_geom.intersects(tile_box):
+                    curr_x += stride_um
+                    continue
+
             # Check tissue coverage if tissue_mask is available
             include_tile = True
-            if tissue_mask is not None and mh > 0 and mw > 0:
+            if tissue_mask is not None and mh > 0 and mw > 0 and slide_dimensions_um is not None:
                 mx0 = max(0, min(mw - 1, int(round(curr_x / max(slide_w_um, 1.0) * (mw - 1)))))
                 mx1 = max(0, min(mw - 1, int(round((curr_x + tile_size_um) / max(slide_w_um, 1.0) * (mw - 1)))))
                 my0 = max(0, min(mh - 1, int(round(curr_y / max(slide_h_um, 1.0) * (mh - 1)))))

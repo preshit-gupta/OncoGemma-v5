@@ -2,26 +2,26 @@ import os
 import io
 import json
 import uuid
+import math
 import tempfile
 import shutil
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Literal
 import numpy as np
 from PIL import Image
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import select, update, delete
+from sqlalchemy import select, delete
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.gcs import (
-    get_gcs_client,
     parse_gcs_uri,
     download_blob_as_bytes,
     download_blob_as_text,
     download_blob_to_filename,
     upload_blob_from_bytes,
-    blob_exists,
+    delete_blob,
     resolve_slide_raw_uri
 )
 from app.core.db import get_db
@@ -36,7 +36,6 @@ from app.models.audit import AuditEvent
 from app.core.rehydrate import rehydrate_case_from_gcs
 from pipeline.hpf import generate_mitosis_density_map, greedy_place_hpfs
 from pipeline.scoring import calculate_hpf_mitosis_counts, compute_nottingham_mitotic_score
-from pipeline.stain import MacenkoNormalizer
 
 router = APIRouter(prefix="/api/v1/stages/mitosis", tags=["mitosis"])
 
@@ -49,18 +48,83 @@ def to_uuid(val: Any) -> uuid.UUID:
         return val
 
 
+def get_verified_mitosis_stage(
+    case_id: str,
+    db: Session,
+    require_awaiting: bool = False,
+    forbid_confirmed: bool = False
+) -> Tuple[Case, StageExecution]:
+    """
+    Validates case existence and retrieves latest mitosis StageExecution.
+    Enforces state machine gating (#313, #116).
+    """
+    case_uid = to_uuid(case_id)
+    case_obj = db.scalars(select(Case).where(Case.id == case_uid)).first() if isinstance(case_uid, uuid.UUID) else db.get(Case, case_id)
+    if not case_obj:
+        case_obj = db.scalars(select(Case).where(Case.id == str(case_id))).first()
+    if not case_obj:
+        case_obj = rehydrate_case_from_gcs(case_id, db)
+    if not case_obj:
+        raise HTTPException(status_code=404, detail=f"Case {case_id} not found")
+
+    stmt = select(StageExecution).where(
+        (StageExecution.case_id == case_uid) | (StageExecution.case_id == str(case_id)),
+        StageExecution.stage == "mitosis"
+    ).order_by(StageExecution.attempt.desc()).limit(1)
+
+    stage_exec = db.scalars(stmt).first()
+    if not stage_exec:
+        rehydrate_case_from_gcs(case_id, db)
+        stage_exec = db.scalars(stmt).first()
+    if not stage_exec:
+        raise HTTPException(status_code=404, detail="Stage 4 (mitosis) not found for this case")
+
+    if require_awaiting and stage_exec.status != "awaiting_review":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Mitosis stage is in status '{stage_exec.status}', must be 'awaiting_review' to confirm."
+        )
+
+    if forbid_confirmed and stage_exec.status == "confirmed":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cannot modify mitosis candidates or HPFs: stage execution is already confirmed."
+        )
+
+    return case_obj, stage_exec
+
+
+def invalidate_hpf_cached_thumbnails(case_id: str):
+    """Busts stale HPF thumbnails in GCS when HPFs move (#107)."""
+    for s in range(1, 11):
+        for m in ("10x", "20x", "40x"):
+            for st in ("norm", "orig"):
+                blob_name = f"cases/{case_id}/mitosis/hpfs/hpf_{s}_{m}_{st}.png"
+                try:
+                    delete_blob(settings.GCS_ARTIFACTS_BUCKET, blob_name)
+                except Exception:
+                    pass
+
+
 # Pydantic Schemas
+class HpfIn(BaseModel):
+    seq: int = Field(..., ge=1, le=100)
+    center_um: Tuple[float, float]
+    radius_um: float = Field(default=262.0, gt=0.0)
+    source: Optional[str] = "model"
+
+
 class RecomputePayload(BaseModel):
     case_id: str
-    candidate_labels: Optional[Dict[str, str]] = None # {"m_0001": "mitosis", ...}
-    hpfs: Optional[List[Dict[str, Any]]] = None # [{"seq": 1, "center_um": [x, y], "radius_um": 262.0}]
-    audit_toggle: Optional[Dict[str, Any]] = None # {"id": "m_0001", "from": "unreviewed", "to": "mitosis"}
+    candidate_labels: Optional[Dict[str, Literal["mitosis", "not_mitosis", "unreviewed"]]] = None
+    hpfs: Optional[List[HpfIn]] = None
+    audit_toggle: Optional[Dict[str, Any]] = None
 
 
 class AddCandidatePayload(BaseModel):
     case_id: str
     centroid_um: List[float] # [x, y]
-    label: str = "mitosis"
+    label: Literal["mitosis", "not_mitosis", "unreviewed"] = "mitosis"
     reviewed_by: str = "pathologist_01"
 
 
@@ -158,7 +222,8 @@ def get_mitosis_stage_data(case_id: str, db: Session = Depends(get_db)):
     summary = compute_nottingham_mitotic_score(
         count_total=total_count,
         n_hpf=len(hpfs) if hpfs else 10,
-        radius_um=hpfs[0]["radius_um"] if hpfs else 262.0
+        radius_um=hpfs[0]["radius_um"] if hpfs else 262.0,
+        hpfs=hpfs
     )
 
     slide_stmt = select(Slide).where(Slide.case_id == case_id).limit(1)
@@ -210,7 +275,7 @@ def get_candidate_crop(
     try:
         crop_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, blob_name)
         if len(crop_bytes) > 1000:
-            return Response(content=crop_bytes, media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
+            return Response(content=crop_bytes, media_type="image/png", headers={"Cache-Control": "private, max-age=31536000, immutable"})
     except Exception:
         pass
 
@@ -310,7 +375,7 @@ def get_candidate_crop(
                 except Exception as up_e:
                     print(f"[Candidate Crop GCS Cache Note] {up_e}")
 
-                return Response(content=extracted_crop_bytes, media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
+                return Response(content=extracted_crop_bytes, media_type="image/png", headers={"Cache-Control": "private, max-age=31536000, immutable"})
         except Exception as e:
             print(f"[Candidate Crop Extraction Error] {e}")
 
@@ -493,7 +558,8 @@ def sync_and_persist_hpf_counts(case_id: str, db: Session) -> Tuple[List[Dict[st
     summary = compute_nottingham_mitotic_score(
         count_total=total_count,
         n_hpf=len(updated_hpfs) if updated_hpfs else 10,
-        radius_um=updated_hpfs[0]["radius_um"] if updated_hpfs else 262.0
+        radius_um=updated_hpfs[0]["radius_um"] if updated_hpfs else 262.0,
+        hpfs=updated_hpfs
     )
 
     for uh in updated_hpfs:
@@ -513,16 +579,19 @@ def recompute_scoring(payload: RecomputePayload, db: Session = Depends(get_db)):
     updates DB records, recomputes Nottingham Mitotic Score, and logs audit events.
     """
     case_id = payload.case_id
+    case_obj, stage_exec = get_verified_mitosis_stage(case_id, db, forbid_confirmed=True)
+    case_uid = case_obj.id
 
     # Fetch detections from DB
     det_rows = db.scalars(
-        select(Detection).where(Detection.case_id == case_id)
+        select(Detection).where((Detection.case_id == case_uid) | (Detection.case_id == str(case_id)))
     ).all()
 
     candidates_dict = {d.id: d for d in det_rows}
 
-    # Apply candidate label changes if provided and log audit event per changed label (#114)
+    # Apply candidate label changes if provided and log audit event + review_edits diff (#114, #592)
     logged_candidate_ids = set()
+    review_edits = list(stage_exec.review_edits or [])
     if payload.candidate_labels:
         for cid, new_label in payload.candidate_labels.items():
             if cid in candidates_dict:
@@ -531,6 +600,13 @@ def recompute_scoring(payload: RecomputePayload, db: Session = Depends(get_db)):
                     old_label = d.label
                     d.label = new_label
                     d.label_source = "pathologist"
+                    review_edits.append({
+                        "op": "replace",
+                        "path": f"/candidates/{cid}/label",
+                        "from": old_label,
+                        "to": new_label,
+                        "timestamp": datetime.now(timezone.utc).isoformat()
+                    })
                     audit = AuditEvent(
                         case_id=case_id,
                         actor="pathologist",
@@ -563,21 +639,46 @@ def recompute_scoring(payload: RecomputePayload, db: Session = Depends(get_db)):
             )
             db.add(audit)
 
-    # Fetch or update HPF sites
+    stage_exec.review_edits = review_edits
+
+    # Fetch or update HPF sites with server-side validation (#115, #344, #127)
     if payload.hpfs:
-        # Update HPFs in DB
-        db.execute(delete(HpfSite).where(HpfSite.case_id == case_id))
-        for h in payload.hpfs:
-            hpf_row = HpfSite(
-                case_id=case_id,
-                seq=h["seq"],
-                center_um=h["center_um"],
-                radius_um=h.get("radius_um", 262.0),
-                mitotic_count=0,
-                source="pathologist" if h.get("source") == "pathologist" else "model"
-            )
-            db.add(hpf_row)
-        db.flush()
+        seqs = [h.seq for h in payload.hpfs]
+        if len(seqs) != len(set(seqs)):
+            raise HTTPException(status_code=422, detail="HPF seq numbers must be unique.")
+
+        # Non-overlap validation in micrometer space
+        for i in range(len(payload.hpfs)):
+            for j in range(i + 1, len(payload.hpfs)):
+                h1 = payload.hpfs[i]
+                h2 = payload.hpfs[j]
+                dist = math.hypot(h1.center_um[0] - h2.center_um[0], h1.center_um[1] - h2.center_um[1])
+                min_sep = (h1.radius_um + h2.radius_um) - 5.0
+                if dist < min_sep:
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail=f"HPF sites cannot overlap: field #{h1.seq} and field #{h2.seq} are {dist:.1f} µm apart (minimum separation: {min_sep:.1f} µm)."
+                    )
+
+        try:
+            db.execute(delete(HpfSite).where((HpfSite.case_id == case_uid) | (HpfSite.case_id == str(case_id))))
+            for h in payload.hpfs:
+                hpf_row = HpfSite(
+                    case_id=case_uid,
+                    seq=h.seq,
+                    center_um=list(h.center_um),
+                    radius_um=h.radius_um,
+                    mitotic_count=0,
+                    source=h.source or "model"
+                )
+                db.add(hpf_row)
+            db.flush()
+            invalidate_hpf_cached_thumbnails(case_id)
+        except HTTPException:
+            raise
+        except Exception as he:
+            db.rollback()
+            raise HTTPException(status_code=500, detail=f"Failed to update HPF sites: {he}")
 
     # Synchronize and persist HPF counts (#110)
     updated_hpfs, summary = sync_and_persist_hpf_counts(case_id, db)
@@ -594,31 +695,71 @@ def recompute_scoring(payload: RecomputePayload, db: Session = Depends(get_db)):
 def add_pathologist_mitosis(payload: AddCandidatePayload, db: Session = Depends(get_db)):
     """
     Adds a missed mitotic figure pinned directly by the pathologist at 40x coordinates.
-    Cuts a 128x128 crop, uploads directly to GCS, creates Detection DB record, and returns candidate data.
+    Cuts a 128x128 crop, uploads to GCS (defensively), creates Detection DB record, and returns candidate data.
     """
     case_id = payload.case_id
-    cx_um, cy_um = payload.centroid_um
+    case_obj, stage_exec = get_verified_mitosis_stage(case_id, db, forbid_confirmed=True)
+    case_uid = case_obj.id
 
-    # Count existing detections to generate unique ID
-    count_dets = len(db.scalars(select(Detection).where(Detection.case_id == case_id)).all())
-    new_id = f"m_user_{count_dets + 1:03d}"
+    if not payload.centroid_um or len(payload.centroid_um) != 2:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="centroid_um must be a coordinate pair [x, y].")
+    cx_um = float(payload.centroid_um[0])
+    cy_um = float(payload.centroid_um[1])
+
+    # Proximity de-duplication check against existing detections (#593)
+    existing_dets = db.scalars(
+        select(Detection).where((Detection.case_id == case_uid) | (Detection.case_id == str(case_id)))
+    ).all()
+    for ed in existing_dets:
+        if ed.centroid_um and math.hypot(ed.centroid_um[0] - cx_um, ed.centroid_um[1] - cy_um) < 7.5:
+            old_label = ed.label
+            ed.label = payload.label
+            ed.label_source = "pathologist"
+            audit = AuditEvent(
+                case_id=case_id,
+                actor=payload.reviewed_by,
+                event_type="review_edit",
+                stage="mitosis",
+                payload={
+                    "detection_id": ed.id,
+                    "from": old_label,
+                    "to": ed.label,
+                    "reason": "proximity_reactivation"
+                }
+            )
+            db.add(audit)
+            sync_and_persist_hpf_counts(case_id, db)
+            db.commit()
+            return {
+                "status": "success",
+                "candidate": {
+                    "id": ed.id,
+                    "centroid_um": ed.centroid_um,
+                    "det_conf": ed.det_conf or 1.0,
+                    "ver_conf": ed.ver_conf or 1.0,
+                    "label": ed.label,
+                    "label_source": ed.label_source,
+                    "crop_uri": ed.crop_uri
+                }
+            }
+
+    # Unique collision-proof candidate ID (#128)
+    new_id = f"m_user_{uuid.uuid4().hex[:8]}"
 
     # Generate crop via transient scratch dir
-    try:
-        case_uid = uuid.UUID(str(case_id))
-    except Exception:
-        case_uid = case_id
     stmt = select(Slide).where((Slide.case_id == case_id) | (Slide.case_id == case_uid)).limit(1)
     slide_obj = db.scalars(stmt).first()
     if slide_obj:
-        if not getattr(slide_obj, "mpp_x", None):
+        if not getattr(slide_obj, "mpp_x", None) or not getattr(slide_obj, "mpp_y", None):
             raise HTTPException(status_code=400, detail="Slide is missing valid MPP (status='needs_mpp'). Cannot generate crop.")
         mpp_x = float(slide_obj.mpp_x)
+        mpp_y = float(slide_obj.mpp_y)
     else:
-        mpp_x = None
+        mpp_x = 0.25
+        mpp_y = 0.25
 
     crop_pil = None
-    if slide_obj and mpp_x:
+    if slide_obj and mpp_x and mpp_y:
         gcs_uri_original = resolve_slide_raw_uri(case_id, slide_obj) or getattr(slide_obj, "gcs_uri_original", None) or f"gs://{settings.GCS_RAW_BUCKET}/cases/{case_id}/{slide_obj.id}.svs"
         raw_bucket_name, blob_name = parse_gcs_uri(gcs_uri_original)
         try:
@@ -628,37 +769,40 @@ def add_pathologist_mitosis(payload: AddCandidatePayload, db: Session = Depends(
                 with OPENSLIDE_GLOBAL_LOCK:
                     oslide = openslide.OpenSlide(local_slide_path)
                     px = int(cx_um / mpp_x - 64)
-                    py = int(cy_um / mpp_x - 64)
+                    py = int(cy_um / mpp_y - 64) # Anisotropic Y axis (#753)
                     crop_pil = oslide.read_region((px, py), 0, (128, 128)).convert("RGB")
                     oslide.close()
         except Exception as e:
             print(f"[add_pathologist_mitosis Error] Slide crop extraction failed: {e}")
 
     if crop_pil is None:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Could not extract authentic optical crop for candidate at ({cx_um:.1f}, {cy_um:.1f}) µm from slide"
-        )
+        raise HTTPException(status_code=500, detail="Could not extract authentic optical crop from slide.")
 
     buf = io.BytesIO()
     crop_pil.save(buf, format="PNG")
     crop_bytes = buf.getvalue()
 
-    from app.core.gcs import upload_blob_from_bytes
-    upload_blob_from_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/mitosis/crops/{new_id}.png", crop_bytes, "image/png")
-    upload_blob_from_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/mitosis/crops/{new_id}_orig.png", crop_bytes, "image/png")
+    crop_uri = f"gs://{settings.GCS_ARTIFACTS_BUCKET}/cases/{case_id}/mitosis/crops/{new_id}.png"
+    crop_orig_uri = f"gs://{settings.GCS_ARTIFACTS_BUCKET}/cases/{case_id}/mitosis/crops/{new_id}_orig.png"
+
+    # Defensively wrapped GCS upload (#399)
+    try:
+        upload_blob_from_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/mitosis/crops/{new_id}.png", crop_bytes, "image/png")
+        upload_blob_from_bytes(settings.GCS_ARTIFACTS_BUCKET, f"cases/{case_id}/mitosis/crops/{new_id}_orig.png", crop_bytes, "image/png")
+    except Exception as gcs_err:
+        print(f"[add_pathologist_mitosis Note] GCS upload skipped or failed offline ({gcs_err}). Creating Detection row.")
 
     det = Detection(
         id=new_id,
-        case_id=case_id,
+        case_id=case_uid,
         hotspot_id=None,
         centroid_um=[float(cx_um), float(cy_um)],
         det_conf=1.0,
         ver_conf=1.0,
-        label="mitosis",
+        label=payload.label,
         label_source="pathologist",
-        crop_uri=f"gs://{settings.GCS_ARTIFACTS_BUCKET}/cases/{case_id}/mitosis/crops/{new_id}.png",
-        crop_orig_uri=f"gs://{settings.GCS_ARTIFACTS_BUCKET}/cases/{case_id}/mitosis/crops/{new_id}_orig.png"
+        crop_uri=crop_uri,
+        crop_orig_uri=crop_orig_uri
     )
     db.add(det)
 
@@ -669,7 +813,8 @@ def add_pathologist_mitosis(payload: AddCandidatePayload, db: Session = Depends(
         stage="mitosis",
         payload={
             "detection_id": new_id,
-            "centroid_um": [cx_um, cy_um]
+            "centroid_um": [cx_um, cy_um],
+            "label": payload.label
         }
     )
     db.add(audit)
@@ -685,7 +830,7 @@ def add_pathologist_mitosis(payload: AddCandidatePayload, db: Session = Depends(
             "centroid_um": [cx_um, cy_um],
             "det_conf": 1.0,
             "ver_conf": 1.0,
-            "label": "mitosis",
+            "label": payload.label,
             "label_source": "pathologist",
             "crop_uri": det.crop_uri
         }
@@ -699,14 +844,30 @@ def bulk_reject_unreviewed(payload: BulkActionPayload, db: Session = Depends(get
     Logs the action in the audit trail and updates the live Nottingham Mitotic Score.
     """
     case_id = payload.case_id
+    case_obj, stage_exec = get_verified_mitosis_stage(case_id, db, forbid_confirmed=True)
+    case_uid = case_obj.id
 
     unreviewed_rows = db.scalars(
-        select(Detection).where(Detection.case_id == case_id, Detection.label == "unreviewed")
+        select(Detection).where(
+            (Detection.case_id == case_uid) | (Detection.case_id == str(case_id)),
+            Detection.label == "unreviewed"
+        )
     ).all()
 
+    now_iso = datetime.now(timezone.utc).isoformat()
+    review_edits = list(stage_exec.review_edits or [])
     for d in unreviewed_rows:
         d.label = "not_mitosis"
         d.label_source = "pathologist_bulk"
+        review_edits.append({
+            "op": "replace",
+            "path": f"/candidates/{d.id}/label",
+            "from": "unreviewed",
+            "to": "not_mitosis",
+            "timestamp": now_iso
+        })
+
+    stage_exec.review_edits = review_edits
 
     audit = AuditEvent(
         case_id=case_id,
@@ -734,7 +895,8 @@ def re_place_hpfs(payload: BulkActionPayload, db: Session = Depends(get_db)):
     Re-runs the greedy 10-HPF placement algorithm based on currently confirmed mitosis coordinates.
     """
     case_id = payload.case_id
-    case_uid = to_uuid(case_id)
+    case_obj, stage_exec = get_verified_mitosis_stage(case_id, db, forbid_confirmed=True)
+    case_uid = case_obj.id
 
     # Fetch slide dimensions and MPP for accurate physical metric
     slide_row = db.scalars(select(Slide).where((Slide.case_id == case_uid) | (Slide.case_id == str(case_id)))).first()
@@ -776,10 +938,29 @@ def re_place_hpfs(payload: BulkActionPayload, db: Session = Depends(get_db)):
     hotspot_prios = [float(h.prob_mean or 0.0) for h in hotspot_rows_sorted]
 
     cands = [{"id": d.id, "centroid_um": d.centroid_um, "label": "mitosis"} for d in confirmed_dets]
-    
-    xs = [d.centroid_um[0] for d in confirmed_dets] or [0.0, 5000.0]
-    ys = [d.centroid_um[1] for d in confirmed_dets] or [0.0, 5000.0]
-    bbox = (min(xs), min(ys), max(xs), max(ys))
+
+    if confirmed_dets:
+        xs = [d.centroid_um[0] for d in confirmed_dets if d.centroid_um]
+        ys = [d.centroid_um[1] for d in confirmed_dets if d.centroid_um]
+        bbox = (min(xs), min(ys), max(xs), max(ys))
+    elif hotspot_polys:
+        all_x = []
+        all_y = []
+        for poly in hotspot_polys:
+            if isinstance(poly, list):
+                for pt in poly:
+                    if isinstance(pt, (list, tuple)) and len(pt) >= 2:
+                        all_x.append(pt[0])
+                        all_y.append(pt[1])
+        if all_x and all_y:
+            bbox = (min(all_x), min(all_y), max(all_x), max(all_y))
+        else:
+            bbox = (0.0, 0.0, slide_dims_um[0] if slide_dims_um else 5000.0, slide_dims_um[1] if slide_dims_um else 5000.0)
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cannot re-place HPFs: No confirmed mitoses and no tumor hotspots exist for this case."
+        )
 
     density_map, grid_meta = generate_mitosis_density_map(cands, bounding_box_um=bbox)
     new_hpfs = greedy_place_hpfs(
@@ -806,6 +987,10 @@ def re_place_hpfs(payload: BulkActionPayload, db: Session = Depends(get_db)):
         )
         db.add(hpf_row)
 
+    db.flush()
+    # Invalidate cached HPF thumbnails on GCS (#127)
+    invalidate_hpf_cached_thumbnails(case_id)
+
     # Synchronize HpfSite mitotic counts immediately (#110)
     sync_and_persist_hpf_counts(case_id, db)
     db.commit()
@@ -818,27 +1003,16 @@ def confirm_mitosis_stage(payload: MitosisConfirmPayload, db: Session = Depends(
     """
     Clinical Safety Gate & Stage 4 Confirmation.
     Verifies that all candidate mitotic figures above threshold (conf >= 0.50) have been reviewed.
-    Finalizes 10 HPFs and Nottingham Mitotic Score, marks Stage 4 as confirmed, and queues Stage 5.
+    Finalizes 10 HPFs and Nottingham Mitotic Score, marks Stage 4 as confirmed, snapshots metrics, and queues Stage 5.
     """
     case_id = payload.case_id
-    case_uid = to_uuid(case_id)
-
-    stage_exec = db.scalars(
-        select(StageExecution)
-        .where(
-            (StageExecution.case_id == case_uid) | (StageExecution.case_id == str(case_id)),
-            StageExecution.stage == "mitosis"
-        )
-        .order_by(StageExecution.attempt.desc())
-    ).first()
-
-    if not stage_exec:
-        raise HTTPException(status_code=404, detail="Stage execution for mitosis not found")
+    case_obj, stage_exec = get_verified_mitosis_stage(case_id, db, require_awaiting=True)
+    case_uid = case_obj.id
 
     # Check unreviewed high-confidence candidates
     unreviewed_high_conf = db.scalars(
         select(Detection).where(
-            Detection.case_id == case_id,
+            (Detection.case_id == case_uid) | (Detection.case_id == str(case_id)),
             Detection.label == "unreviewed",
             (Detection.det_conf >= 0.50) | (Detection.ver_conf >= 0.50)
         )
@@ -887,7 +1061,9 @@ def confirm_mitosis_stage(payload: MitosisConfirmPayload, db: Session = Depends(
             next_exec.completed_at = None
             next_exec.error = None
 
-    # Synchronize confirmed detections & HPFs back to GCS output.json
+    # Synchronize confirmed detections & HPFs back to GCS output.json and snapshot metrics (#118)
+    total_m = 0
+    scoring_summary = {}
     try:
         from pipeline.grading import calculate_mitotic_score_from_detections_and_hpfs
         all_dets = db.scalars(select(Detection).where((Detection.case_id == case_uid) | (Detection.case_id == str(case_id)))).all()
@@ -912,7 +1088,19 @@ def confirm_mitosis_stage(payload: MitosisConfirmPayload, db: Session = Depends(
         ]
         total_m, conf_score = calculate_mitotic_score_from_detections_and_hpfs(cand_dicts, hpf_dicts)
         r_um = hpf_dicts[0]["radius_um"] if hpf_dicts else 262.0
-        scoring_summary = compute_nottingham_mitotic_score(count_total=total_m, n_hpf=len(hpf_dicts) or 10, radius_um=r_um)
+        scoring_summary = compute_nottingham_mitotic_score(
+            count_total=total_m,
+            n_hpf=len(hpf_dicts) or 10,
+            radius_um=r_um,
+            hpfs=hpf_dicts
+        )
+
+        stage_exec.metrics = {
+            "count_total": total_m,
+            "area_mm2": scoring_summary.get("area_mm2"),
+            "mitoses_per_mm2": scoring_summary.get("mitoses_per_mm2"),
+            "mitotic_score": scoring_summary.get("score")
+        }
 
         existing_out = {}
         try:
@@ -938,18 +1126,23 @@ def confirm_mitosis_stage(payload: MitosisConfirmPayload, db: Session = Depends(
         actor=payload.reviewed_by,
         event_type="stage_confirmed",
         stage="mitosis",
-        payload={"next_stage": "grading"}
+        payload={
+            "next_stage": "grading",
+            "mitotic_score": scoring_summary.get("score"),
+            "count_total": total_m
+        }
     )
     db.add(audit)
     db.commit()
 
     try:
         from app.core.cloud_tasks import dispatch_stage_task
-        dispatch_stage_task(
-            case_id=str(case_id),
-            stage="grading",
-            stage_exec_id=str(next_exec.id)
-        )
+        if next_exec:
+            dispatch_stage_task(
+                case_id=str(case_id),
+                stage="grading",
+                stage_exec_id=str(next_exec.id)
+            )
     except Exception as e:
         print(f"[CloudTasks Warning] Failed to dispatch next stage grading: {e}")
 

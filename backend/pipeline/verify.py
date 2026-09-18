@@ -59,9 +59,17 @@ class HoVerNetMitosisVerifier:
                 img_t = img_t.unsqueeze(0).to(self.device)
                 with torch.no_grad():
                     output = self.model(img_t)
-                # Output has tp_map (nuclear type prediction) and np_map (nuclear pixel map)
-                p_mitosis = float(output.get("p_mitosis", 0.5))
-                return p_mitosis, None
+                # Output may be dict ({'p_mitosis': ...}), tensor, or scalar
+                if isinstance(output, dict):
+                    p_mitosis = float(output.get("p_mitosis", 0.5))
+                elif hasattr(output, "item"):
+                    p_mitosis = float(output.item())
+                elif hasattr(output, "__getitem__"):
+                    first = output[0]
+                    p_mitosis = float(first.item() if hasattr(first, "item") else first)
+                else:
+                    p_mitosis = float(output)
+                return float(np.clip(p_mitosis, 0.0, 1.0)), None
             except Exception as e:
                 print(f"[HoVerNet Runtime Error] {e}. Falling back to morphometric classifier.")
 
@@ -87,7 +95,7 @@ class HoVerNetMitosisVerifier:
 
         h, w, _ = crop_rgb.shape
         cy, cx = h // 2, w // 2
-        r_px = min(24, min(h, w) // 4) # ~12 um radius region
+        r_px = min(36, min(h, w) // 2 - 2) # ~18 um radius (72 px diameter) region for true mitotic figures (#124)
 
         # Optical density transformation
         rgb_f = np.maximum(crop_rgb.astype(np.float32), 1.0) / 255.0
@@ -180,7 +188,7 @@ class HoVerNetMitosisVerifier:
                 return 0.15, contour_pts
 
             # 4. Reject Tiny Debris / Giant Tissue Folds:
-            if area < 300.0 or equiv_diam < 20.0 or area > 3200.0 or equiv_diam > 62.0:
+            if area < 300.0 or equiv_diam < 20.0 or area > 4200.0 or equiv_diam > 75.0:
                 return 0.12, contour_pts
 
             # 5. Mitotic Figure Scoring (Van Diest Classic Metaphase / Anaphase / Telophase Criteria):
@@ -190,19 +198,19 @@ class HoVerNetMitosisVerifier:
             # - High texture variance from individual chromosomes (std_od >= 0.20)
             # - Irregular, jagged contour from envelope dissolution (solidity < 0.82)
             size_score = float(np.clip((equiv_diam - 20.0) / 22.0, 0.0, 1.0))
-            spic_score = float(np.clip((spiculation - 0.18) / 0.40, 0.0, 1.0))
-            od_score = float(np.clip((p95_od - 0.75) / 0.75, 0.0, 1.0))
-            texture_score = float(np.clip((std_od - 0.20) / 0.35, 0.0, 1.0))
-            irregularity_score = float(np.clip((0.85 - solidity) / 0.25, 0.0, 1.0))
+            spic_score = float(np.clip((spiculation - 0.15) / 0.25, 0.0, 1.0))
+            od_score = float(np.clip((p95_od - 0.70) / 0.60, 0.0, 1.0))
+            texture_score = float(np.clip((std_od - 0.18) / 0.30, 0.0, 1.0))
+            irregularity_score = float(np.clip((0.90 - solidity) / 0.25, 0.0, 1.0))
 
             if spic_score < 0.10 or od_score < 0.20 or texture_score < 0.15:
                 return 0.22, contour_pts
 
-            p_mitosis = 0.15 + (
-                0.30 * spic_score +
+            p_mitosis = 0.20 + (
+                0.25 * spic_score +
                 0.25 * od_score +
                 0.25 * texture_score +
-                0.10 * size_score +
+                0.15 * size_score +
                 0.10 * irregularity_score
             )
 

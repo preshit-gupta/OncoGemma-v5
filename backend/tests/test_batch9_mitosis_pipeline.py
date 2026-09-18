@@ -215,7 +215,8 @@ def test_recompute_derives_audit_events_for_multiple_labels():
     det1 = Detection(id="m_01", case_id=case_id, centroid_um=[100.0, 100.0], label="unreviewed", label_source="model")
     det2 = Detection(id="m_02", case_id=case_id, centroid_um=[200.0, 200.0], label="unreviewed", label_source="model")
     hpf = HpfSite(case_id=case_id, seq=1, center_um=[150.0, 150.0], radius_um=262.0, mitotic_count=0)
-    db.add_all([case, det1, det2, hpf])
+    stage_exec = StageExecution(id=uuid.uuid4(), case_id=case_id, stage="mitosis", attempt=1, status="awaiting_review")
+    db.add_all([case, det1, det2, hpf, stage_exec])
     db.commit()
     db.close()
 
@@ -260,7 +261,8 @@ def test_add_candidate_raises_500_on_slide_read_failure():
         mpp_y=0.25,
         gcs_uri_original="gs://raw/slide.svs"
     )
-    db.add_all([case, slide])
+    stage_exec = StageExecution(id=uuid.uuid4(), case_id=case_id, stage="mitosis", attempt=1, status="awaiting_review")
+    db.add_all([case, slide, stage_exec])
     db.commit()
     db.close()
 

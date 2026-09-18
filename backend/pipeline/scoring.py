@@ -47,11 +47,30 @@ def calculate_hpf_mitosis_counts(
     return updated_hpfs, total_count
 
 
+def load_scoring_config() -> Dict[str, Any]:
+    """Loads configs/scoring.yaml or configs/mitosis.yaml."""
+    cfg_paths = [
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "../../configs/scoring.yaml")),
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "../../configs/mitosis.yaml")),
+    ]
+    for p in cfg_paths:
+        if os.path.exists(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    data = yaml.safe_load(f)
+                    if data:
+                        return data
+            except Exception:
+                pass
+    return {}
+
+
 def compute_nottingham_mitotic_score(
     count_total: int,
     n_hpf: int = 10,
     radius_um: float = 262.0,
-    config_dict: Optional[Dict[str, Any]] = None
+    config_dict: Optional[Dict[str, Any]] = None,
+    hpfs: Optional[List[Dict[str, Any]]] = None
 ) -> Dict[str, Any]:
     """
     Computes Nottingham Mitotic Score based on standardized mm² area normalization.
@@ -61,21 +80,42 @@ def compute_nottingham_mitotic_score(
       - Score 2: 3.65 - 7.30 mitoses/mm² (Classic: 10 - 19 / 2.74 mm²)
       - Score 3: >= 7.30 mitoses/mm² (Classic: >= 20 / 2.74 mm²)
     """
+    if config_dict is None:
+        config_dict = load_scoring_config()
+
     score2_min = 3.65
     score3_min = 7.30
     classic_area_mm2 = 2.74
 
-    if config_dict and "mitotic_score" in config_dict:
-        m_cfg = config_dict["mitotic_score"]
+    if config_dict:
+        # Check 'mitotic_score' (scoring.yaml) or 'scoring' (mitosis.yaml)
+        m_cfg = config_dict.get("mitotic_score") or config_dict.get("scoring") or {}
         thresh = m_cfg.get("thresholds", {})
-        score2_min = thresh.get("score2_min", score2_min)
-        score3_min = thresh.get("score3_min", score3_min)
+        score2_min = float(thresh.get("score2_min", score2_min))
+        score3_min = float(thresh.get("score3_min", score3_min))
+        classic_area_mm2 = float(m_cfg.get("classic_area_mm2", classic_area_mm2))
 
-    # Calculate actual cumulative HPF inspection area
-    # Area of one HPF circle = pi * (radius_um / 1000)^2 mm²
-    # For r = 262 um: pi * 0.262^2 = 0.215651 mm² -> 10 HPFs = 2.157 mm²
-    single_hpf_area_mm2 = math.pi * ((radius_um / 1000.0) ** 2)
-    area_mm2 = max(0.001, float(n_hpf * single_hpf_area_mm2))
+    # Calculate actual cumulative HPF inspection area summing per-HPF radius (#764)
+    if hpfs and len(hpfs) > 0:
+        n_fields = len(hpfs)
+        area_mm2 = sum(math.pi * ((float(h.get("radius_um", radius_um)) / 1000.0) ** 2) for h in hpfs)
+    else:
+        n_fields = n_hpf
+        single_hpf_area_mm2 = math.pi * ((radius_um / 1000.0) ** 2)
+        area_mm2 = float(n_fields * single_hpf_area_mm2)
+
+    # Clean zero-HPF state handling (#373)
+    if n_fields <= 0 or area_mm2 <= 0.0:
+        return {
+            "count_total": int(count_total),
+            "n_hpf": 0,
+            "area_mm2": 0.0,
+            "per_mm2": 0.0,
+            "mitoses_per_mm2": 0.0,
+            "classic_per_10hpf": 0.0,
+            "mitotic_score": 1,
+            "score": 1
+        }
 
     density = float(count_total) / area_mm2
     classic_per_10hpf = density * classic_area_mm2
@@ -90,9 +130,11 @@ def compute_nottingham_mitotic_score(
 
     return {
         "count_total": int(count_total),
-        "n_hpf": int(n_hpf),
+        "n_hpf": int(n_fields),
         "area_mm2": round(area_mm2, 3),
         "per_mm2": round(density, 2),
+        "mitoses_per_mm2": round(density, 2),
         "classic_per_10hpf": round(classic_per_10hpf, 1),
-        "mitotic_score": mitotic_score
+        "mitotic_score": mitotic_score,
+        "score": mitotic_score
     }

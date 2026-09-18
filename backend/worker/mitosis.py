@@ -1,12 +1,10 @@
 import os
 import io
 import json
-import math
 import yaml
 import asyncio
 import tempfile
 import shutil
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple, Optional
 import numpy as np
 from PIL import Image
@@ -15,18 +13,15 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.gcs import (
-    get_gcs_client,
     parse_gcs_uri,
     upload_blob_from_bytes,
     download_blob_as_bytes,
     download_blob_to_filename,
-    get_gcs_artifact_direct_url,
     resolve_slide_raw_uri
 )
 from app.core.openslide_lock import OPENSLIDE_GLOBAL_LOCK
 from app.models.case import Case
 from app.models.slide import Slide
-from app.models.stage_execution import StageExecution
 from app.models.hotspot import Hotspot
 from app.models.detection import Detection
 from app.models.hpf_site import HpfSite
@@ -36,7 +31,6 @@ from pipeline.verify import HoVerNetMitosisVerifier, create_dual_magnification_c
 from pipeline.medgemma import MedGemmaClient
 from pipeline.hpf import generate_mitosis_density_map, greedy_place_hpfs
 from pipeline.scoring import calculate_hpf_mitosis_counts, compute_nottingham_mitotic_score
-from pipeline.stain import MacenkoNormalizer
 
 
 def load_mitosis_config() -> Dict[str, Any]:
@@ -257,10 +251,16 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
             crop_rgb = None
             if openslide_slide is not None:
                 try:
-                    top_left_x = max(0, cx_px - half_crop_px)
-                    top_left_y = max(0, cy_px - half_crop_px)
+                    top_left_x = max(0, min(max(0, width_px - crop_size_px), cx_px - half_crop_px))
+                    top_left_y = max(0, min(max(0, height_px - crop_size_px), cy_px - half_crop_px))
                     with OPENSLIDE_GLOBAL_LOCK:
-                        crop_pil = openslide_slide.read_region((top_left_x, top_left_y), 0, (crop_size_px, crop_size_px)).convert("RGB")
+                        raw_crop = openslide_slide.read_region((top_left_x, top_left_y), 0, (crop_size_px, crop_size_px))
+                        if raw_crop.mode in ("RGBA", "LA") or (raw_crop.mode == "P" and "transparency" in raw_crop.info):
+                            canvas = Image.new("RGB", raw_crop.size, (255, 255, 255))
+                            canvas.paste(raw_crop, mask=raw_crop.split()[-1] if raw_crop.mode in ("RGBA", "LA") else None)
+                            crop_pil = canvas
+                        else:
+                            crop_pil = raw_crop.convert("RGB")
                         crop_rgb = np.array(crop_pil)
                 except Exception as e:
                     print(f"[Worker:Mitosis] Crop extraction error for {cand['id']}: {e}")
@@ -269,16 +269,23 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
                 print(f"[Worker:Mitosis Warning] Skipping candidate {cand['id']} - could not extract optical crop from slide")
                 continue
 
-            # Run HoVer-Net nuclear instance verification
-            ver_conf, contour = verifier.verify(crop_rgb)
-            cand["ver_conf"] = float(ver_conf)
-
-            if ver_conf >= ver_thresh:
-                cand["label"] = "mitosis"
-            elif ver_conf >= review_thresh or (cand["det_conf"] >= 0.70 and ver_conf >= 0.35):
+            # Run HoVer-Net nuclear instance verification (#124)
+            ver_enabled = ver_cfg.get("enabled", True)
+            if not ver_enabled:
+                cand["ver_conf"] = None
                 cand["label"] = "unreviewed"
             else:
-                cand["label"] = "not_mitosis"
+                ver_conf, contour = verifier.verify(crop_rgb)
+                cand["ver_conf"] = float(ver_conf)
+                if contour:
+                    cand["contour"] = contour
+
+                if ver_conf >= ver_thresh:
+                    cand["label"] = "mitosis"
+                elif ver_conf >= review_thresh or (cand["det_conf"] >= 0.70 and ver_conf >= 0.35):
+                    cand["label"] = "unreviewed"
+                else:
+                    cand["label"] = "not_mitosis"
 
             # Prepare 128x128 crop PNGs for concurrent GCS upload
             crop_id = cand["id"]
