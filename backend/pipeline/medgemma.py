@@ -27,7 +27,14 @@ class TumorVerificationResponse(BaseModel):
     )
     cellularity: Literal["low", "medium", "high"] = Field(default="high", description="Visual tumor cellular density")
     confidence: Literal["low", "medium", "high", "unassessed_schema_error"] = Field(default="high", description="Model confidence level")
-    rationale: str = Field(default="", max_length=500, description="Brief morphological rationale")
+    rationale: str = Field(default="", max_length=4000, description="Brief morphological rationale")
+
+    @field_validator("rationale", mode="before")
+    @classmethod
+    def sanitize_rationale(cls, v: Any) -> str:
+        if not isinstance(v, str):
+            return str(v or "")
+        return v[:3900].strip()
 
 
 class TubuleResponse(BaseModel):
@@ -38,8 +45,15 @@ class TubuleResponse(BaseModel):
 
 class PleoResponse(BaseModel):
     pleomorphism_score: Literal[1, 2, 3] = Field(description="Nottingham nuclear pleomorphism score (1, 2, 3)")
-    rationale: str = Field(default="", max_length=300, description="Brief clinical rationale")
+    rationale: str = Field(default="", max_length=4000, description="Brief clinical rationale")
     confidence: Literal["low", "medium", "high", "unassessed_schema_error"] = Field(default="medium")
+
+    @field_validator("rationale", mode="before")
+    @classmethod
+    def sanitize_rationale(cls, v: Any) -> str:
+        if not isinstance(v, str):
+            return str(v or "")
+        return v[:3900].strip()
 
 
 class HistologicTypeResponse(BaseModel):
@@ -47,10 +61,17 @@ class HistologicTypeResponse(BaseModel):
         description="Primary CAP histologic subtype"
     )
     differential: List[str] = Field(default_factory=list, description="Differential diagnoses")
-    rationale: str = Field(default="", max_length=500, description="Clinical rationale")
+    rationale: str = Field(default="", max_length=4000, description="Clinical rationale")
     confidence: Literal["low", "medium", "high", "unassessed_schema_error"] = Field(
         description="Model confidence level"
     )
+
+    @field_validator("rationale", mode="before")
+    @classmethod
+    def sanitize_rationale(cls, v: Any) -> str:
+        if not isinstance(v, str):
+            return str(v or "")
+        return v[:3900].strip()
 
 
 class MitosisConfirmationResponse(BaseModel):
@@ -60,7 +81,14 @@ class MitosisConfirmationResponse(BaseModel):
     envelope_dissolved: bool = Field(default=False, description="Whether nuclear envelope is dissolved")
     spiculation_detected: bool = Field(default=False, description="Whether chromosome spiculation is detected")
     confidence: Literal["low", "medium", "high"] = Field(default="medium")
-    rationale: str = Field(default="", max_length=500, description="Brief morphological rationale")
+    rationale: str = Field(default="", max_length=4000, description="Brief morphological rationale")
+
+    @field_validator("rationale", mode="before")
+    @classmethod
+    def sanitize_rationale(cls, v: Any) -> str:
+        if not isinstance(v, str):
+            return str(v or "")
+        return v[:3900].strip()
 
     @field_validator("verdict", mode="before")
     @classmethod

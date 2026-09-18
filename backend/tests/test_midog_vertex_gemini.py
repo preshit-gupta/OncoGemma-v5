@@ -174,3 +174,35 @@ def test_pipeline_referee_model_version_provenance():
     assert "van_diest" in referee_version
     assert ("gemini-2.5-flash" in referee_version or "gemini-1.5-flash" in referee_version)
 
+
+def test_yolo_detector_negative_tile_empty_list():
+    """Verify negative tiles returning 0 predictions do not fall back to heuristic generator."""
+    with patch("google.cloud.aiplatform.Endpoint") as mock_endpoint_cls, \
+         patch("google.cloud.aiplatform.init"):
+        mock_endpoint = MagicMock()
+        mock_endpoint_cls.return_value = mock_endpoint
+        mock_endpoint.predict.return_value = MagicMock(predictions=[{"boxes": []}])
+
+        detector = YoloMitosisDetector(endpoint_id="projects/123/locations/us-central1/endpoints/456")
+        dummy_tile = np.ones((512, 512, 3), dtype=np.uint8) * 200
+        detections = detector.detect(dummy_tile)
+        assert detections == []
+
+
+def test_mitosis_confirmation_long_rationale_sanitization():
+    """Verify rationales exceeding 500 characters do not crash Pydantic validation."""
+    long_rationale = "Candidate exhibits clear metaphase features with aligned equatorial chromosome plate. " * 20
+    assert len(long_rationale) > 1000
+
+    payload = {
+        "verdict": "CONFIRMED",
+        "envelope_dissolved": True,
+        "spiculation_detected": True,
+        "confidence": "high",
+        "rationale": long_rationale
+    }
+    resp = MitosisConfirmationResponse.model_validate(payload)
+    assert resp.verdict == "CONFIRMED"
+    assert len(resp.rationale) > 500
+    assert len(resp.rationale) <= 4000
+

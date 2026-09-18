@@ -313,8 +313,12 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
                 cand["ver_conf"] = float(ver_conf)
                 if contour:
                     cand["contour"] = contour
-                # Keep candidate as unreviewed so multimodal referee evaluates it
-                cand["label"] = "unreviewed"
+                if cand["det_conf"] >= 0.70:
+                    cand["label"] = "mitosis"
+                elif cand["det_conf"] >= review_thresh:
+                    cand["label"] = "unreviewed"
+                else:
+                    cand["label"] = "not_mitosis"
             else:
                 ver_conf, contour = verifier.verify(crop_rgb)
                 cand["ver_conf"] = float(ver_conf)
@@ -339,50 +343,73 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
             cand["crop_uri"] = f"gs://{settings.GCS_ARTIFACTS_BUCKET}/cases/{case_id}/mitosis/crops/{crop_id}.png"
             cand["crop_orig_uri"] = f"gs://{settings.GCS_ARTIFACTS_BUCKET}/cases/{case_id}/mitosis/crops/{crop_id}_orig.png"
 
-            # Multimodal Referee Cross-Check (Mandatory for ALL auto-confirmed & unreviewed candidates)
             cand["medgemma_verdict"] = None
             cand["medgemma_rationale"] = None
             cand["medgemma_confidence"] = None
 
-            if cand["label"] in ("unreviewed", "mitosis"):
+            # Prepare dual-magnification composite for multimodal referee if slide available
+            if openslide_slide is not None:
                 try:
-                    f_crop_b = None
-                    ctx_b = None
-                    if openslide_slide is not None:
-                        try:
-                            f_crop_b, ctx_b = create_dual_magnification_composite(openslide_slide, cx_px, cy_px, mpp_x)
-                        except Exception:
-                            f_crop_b = crop_bytes
-                    else:
-                        f_crop_b = crop_bytes
+                    f_crop_b, ctx_b = create_dual_magnification_composite(openslide_slide, cx_px, cy_px, mpp_x)
+                    cand["_composite_bytes"] = f_crop_b
+                    cand["_context_bytes"] = ctx_b
+                except Exception:
+                    pass
 
-                    mg_resp = medgemma_client.evaluate_mitosis_confirmation_sync(f_crop_b, ctx_b)
-                    cand["medgemma_verdict"] = mg_resp.verdict
-                    cand["medgemma_rationale"] = mg_resp.rationale
-                    cand["medgemma_confidence"] = mg_resp.confidence
+        # Multimodal Referee Cross-Check (Concurrent via ThreadPoolExecutor)
+        from concurrent.futures import ThreadPoolExecutor
 
-                    referee_src = "gemini_referee" if getattr(settings, "USE_GEMINI_FLASH_REFEREE", True) else "medgemma"
-                    if mg_resp.verdict == "CONFIRMED":
-                        cand["label"] = "mitosis"
-                        cand["label_source"] = f"{referee_src}_confirmed"
-                        cand["ver_conf"] = max(cand.get("ver_conf") or 0.5, 0.88)
-                    elif mg_resp.verdict in ("REJECTED_APOPTOSIS", "REJECTED_LYMPHOCYTE", "REJECTED_RESTING_NUCLEUS"):
-                        cand["label"] = "not_mitosis"
-                        cand["label_source"] = f"{referee_src}_{mg_resp.verdict.lower()}"
-                        cand["ver_conf"] = min(cand.get("ver_conf") or 0.5, 0.12)
-                    else: # EQUIVOCAL
-                        cand["label"] = "unreviewed"
-                        cand["label_source"] = f"{referee_src}_equivocal"
-                except Exception as mge:
-                    print(f"[Worker:Mitosis] Referee note for {cand['id']}: {mge}")
+        referee_candidates = [
+            c for c in candidates if c.get("label") in ("unreviewed", "mitosis")
+        ]
+        # Prioritize top candidates by detection confidence
+        referee_candidates.sort(key=lambda c: float(c.get("det_conf") or 0.0), reverse=True)
+
+        MAX_REFEREE_CANDIDATES = 64
+        candidates_to_referee = referee_candidates[:MAX_REFEREE_CANDIDATES]
+
+        def _evaluate_single_referee(c_item):
+            c_id = c_item["id"]
+            f_crop_b = c_item.get("_composite_bytes") or c_item.get("_crop_bytes")
+            ctx_b = c_item.get("_context_bytes")
+
+            try:
+                mg_resp = medgemma_client.evaluate_mitosis_confirmation_sync(f_crop_b, ctx_b)
+                c_item["medgemma_verdict"] = mg_resp.verdict
+                c_item["medgemma_rationale"] = mg_resp.rationale
+                c_item["medgemma_confidence"] = mg_resp.confidence
+
+                referee_src = "gemini_referee" if getattr(settings, "USE_GEMINI_FLASH_REFEREE", True) else "medgemma"
+                if mg_resp.verdict == "CONFIRMED":
+                    c_item["label"] = "mitosis"
+                    c_item["label_source"] = f"{referee_src}_confirmed"
+                    c_item["ver_conf"] = max(c_item.get("ver_conf") or 0.5, 0.88)
+                elif mg_resp.verdict in ("REJECTED_APOPTOSIS", "REJECTED_LYMPHOCYTE", "REJECTED_RESTING_NUCLEUS"):
+                    c_item["label"] = "not_mitosis"
+                    c_item["label_source"] = f"{referee_src}_{mg_resp.verdict.lower()}"
+                    c_item["ver_conf"] = min(c_item.get("ver_conf") or 0.5, 0.12)
+                else: # EQUIVOCAL
+                    c_item["label"] = "unreviewed"
+                    c_item["label_source"] = f"{referee_src}_equivocal"
+            except Exception as mge:
+                print(f"[Worker:Mitosis] Referee note for {c_id}: {mge}")
+
+        if candidates_to_referee:
+            ref_model_name = getattr(settings, "GEMINI_REFEREE_MODEL", "gemini-2.5-flash")
+            print(f"[Worker:Mitosis] Adjudicating {len(candidates_to_referee)} candidates via Multimodal Referee ({ref_model_name}) with 8 worker threads...")
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                list(pool.map(_evaluate_single_referee, candidates_to_referee))
+
+        # Clean temporary composite/context bytes from all candidates
+        for c_item in candidates:
+            c_item.pop("_composite_bytes", None)
+            c_item.pop("_context_bytes", None)
 
         # Post-referee physical NMS (20 um) to eliminate any residual coinciding/overlapping detections
         candidates = apply_global_nms(candidates, nms_radius_um=nms_radius_um)
         print(f"[Worker:Mitosis] Retained {len(candidates)} spatially distinct candidates after MedGemma refereeing and 20um NMS.")
 
         # Concurrently upload all crop PNGs to GCS
-        from concurrent.futures import ThreadPoolExecutor
-
         def _upload_single_crop(c_item):
             c_id = c_item["id"]
             c_data = c_item.pop("_crop_bytes", None)

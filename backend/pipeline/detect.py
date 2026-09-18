@@ -135,7 +135,7 @@ class YoloMitosisDetector:
             return detections[:self.max_candidates_per_tile]
         except Exception as e:
             print(f"[MitosisDetector Vertex AI Error] {e}. Falling back to visual feature extractor.")
-            return []
+            return None
 
     def detect(self, tile_rgb: np.ndarray) -> List[Tuple[float, float, float]]:
         """
@@ -144,7 +144,7 @@ class YoloMitosisDetector:
         # 1. Try Vertex AI Endpoint first if configured
         if self.vertex_endpoint is not None:
             vertex_results = self._detect_vertex_ai(tile_rgb)
-            if vertex_results:
+            if vertex_results is not None:
                 return vertex_results
 
         # 2. Try Local YOLO Model if loaded
