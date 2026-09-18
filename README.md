@@ -4,145 +4,61 @@
 [![Python](https://img.shields.io/badge/Python-3.11%20%7C%203.12-blue.svg)](https://python.org)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-009688.svg)](https://fastapi.tiangolo.com)
 [![Next.js](https://img.shields.io/badge/Next.js-14.2+-black.svg)](https://nextjs.org)
-[![Google Cloud](https://img.shields.io/badge/GCP-Cloud%20Storage%20%7C%20Vertex%20AI-4285F4.svg)](https://cloud.google.com)
+[![Google Cloud](https://img.shields.io/badge/GCP-Cloud%20Run%20%7C%20Vertex%20AI%20%7C%20GCS-4285F4.svg)](https://cloud.google.com)
 [![Tests](https://img.shields.io/badge/Tests-226%2F226%20Passing-brightgreen.svg)](backend/tests/)
 
-**OncoGemma v5** is an enterprise-grade clinical AI platform and diagnostic copilot designed for pathologists to analyze Whole-Slide Images (WSIs) of invasive breast carcinoma. It automates gigapixel slide ingestion, quality control, tumor bed triage, mitotic figure quantification, Nottingham Histologic Grading (Elston-Ellis modification), and College of American Pathologists (CAP) synoptic cancer reporting with AJCC 8th/9th Edition staging.
+**OncoGemma v5** is a cloud-native clinical AI platform and diagnostic copilot for digital breast pathology. Designed for surgical pathologists analyzing gigapixel Whole-Slide Images (WSIs) of invasive breast carcinoma, OncoGemma automates slide ingestion, quality control, tumor bed triage, mitotic figure quantification, Nottingham Histologic Grading (Elston-Ellis modification), and College of American Pathologists (CAP) synoptic cancer reporting with AJCC 8th/9th Edition staging.
+
+### 🌐 Live Cloud Run Deployments
+* **Clinical Web Workspace**: [https://oncogemma-frontend-522209116839.us-central1.run.app](https://oncogemma-frontend-522209116839.us-central1.run.app)
+* **REST API & Control Plane**: [https://oncogemma-api-522209116839.us-central1.run.app](https://oncogemma-api-522209116839.us-central1.run.app)
 
 ---
 
-## 🌟 What's New in OncoGemma v5
+## 🏛️ Clinical Workflow & Stage Architecture
 
-### ☁️ Zero-Local-Compute Google Cloud Platform (GCP) Deployment
-* **Fully Cloud-Native Execution**: The entire pipeline has been migrated away from local compute to Google Cloud Platform.
-* **Serverless Backend (`oncogemma-api`)**: FastAPI backend deployed on **Cloud Run** (`https://oncogemma-api-522209116839.us-central1.run.app`), containerized with OpenSlide, LibVIPS, PyTorch, and Google Cloud SDK.
-* **Modern Frontend (`oncogemma-frontend`)**: Next.js 14 application deployed on **Cloud Run** (`https://oncogemma-frontend-522209116839.us-central1.run.app`) with high-DPI OpenSeadragon whole-slide pyramid streaming.
-* **Direct-to-GCS Zero-Server-Transit Ingestion**: Bypasses Cloud Run's 32 MB HTTP payload ceiling by issuing pre-signed Google Cloud Storage URLs for direct client-to-bucket chunked uploads with live progress bars.
-* **Automated Cloud Build CI/CD**: One-command reproducible builds via `ops/cloudbuild-api.yaml` and `ops/cloudbuild-frontend.yaml` on high-CPU runners (`E2_HIGHCPU_8`).
-
-### 🇮🇳 Live Google Path Foundation Integration (`asia-south1` Mumbai)
-* **Dedicated Vertex AI Endpoint**: Connected Stage 3 to your active, dedicated Path Foundation ViT endpoint (`mg-endpoint-25e5ee92-10b3-41b5-9da7-bccbd2b255f8`) in `asia-south1`.
-* **Deep Visual Feature Extraction**: Streams real $224 \times 224$ optical tissue patches to generate 384-dimensional ViT representation vectors.
-* **Calibrated Linear Probe Triage**: Drives the spatial tumor bed probability grid (`prob_grid.npy`) and automated hotspot ROI selection directly from Google's foundation model.
-
-### 🔬 Stage 4: True 40× High-Power Optical Resolution ($0.25\text{--}0.28\,\mu\text{m/px}$) & Interactive Canvas (Latest)
-* **Optical Resolution Calibration**:
-  * *Root Cause Identified*: Stage 4 HPF patches were previously downsampled to $512\times 512$ px ($1.127\,\mu\text{m/px}$), which physically corresponds to a $10\times$ overview rather than diagnostic $40\times$ microscopy. A $12\,\mu\text{m}$ mitotic figure was reduced to an 8-pixel smudge, impeding sub-cellular assessment.
-  * *Full-Fidelity 40× Patches*: Pre-rendered and dynamic HPF patches now extract directly from Level 0 at authentic $2048\times 2048$ px ($0.28\,\mu\text{m/px}$, true $40\times$ optical magnification) across the standard $577\,\mu\text{m}$ field box.
-  * *High-Efficiency Dual-Codec Storage*: Leverages visually lossless JPEG (quality 94, ~1.6 MB) for $40\times$ fields for instant network streaming and sub-second rendering, alongside $20\times$ ($1024\times 1024$ px) and $10\times$ ($512\times 512$ px) tiers.
-* **Interactive Pathologist Mitosis Studio (`MitosisViewer.tsx`)**:
-  * **Default 40× High-Power Mode**: Starts immediately in high-power magnification ($3.5\times$ viewport zoom) so pathologists view crisp nuclear morphology, chromatin texture, and spindle poles.
-  * **Magnification Toggles**: Quick-switch buttons for `10× Overview`, `20× Field`, and `40× High-Power`.
-  * **Candidate Auto-Focus**: Clicking any candidate card auto-centers the stage canvas directly on that candidate's centroid at $40\times$.
-  * **Spacebar Rapid Toggle**: Pressing <kbd>Space</kbd> toggles between $10\times$ field orientation and $40\times$ cellular focus.
-  * **In-Canvas 40× Loupe Inspector**: Embedded floating inspector card displays high-resolution crops, detection/verification metrics, and keyboard shortcuts (<kbd>M</kbd> for Mitosis, <kbd>X</kbd> for Reject).
-
-### 🔬 Stage 4: Strict Van Diest Filtering & Literature-Backed MedGemma Referee
-* **Automated Mimic Suppression (Van Diest & WHO 5th Ed. Criteria)**:
-  * *Apoptosis Rejection*: Measures chromatin condensation against cytoplasmic retraction halos (`halo_od < 0.18`). Pyknotic fragments are auto-suppressed ($p = 0.08$).
-  * *Lymphocyte Rejection*: Identifies small ($5\text{--}7\,\mu\text{m}$), smooth, circular non-dividing cells with continuous nuclear envelopes, auto-suppressing them ($p = 0.12$).
-  * *Active Mitosis Verification*: Enforces nuclear envelope breakdown, jagged chromosome arm projections (spicules $\ge 0.18$), and internal texture variance ($p \ge 0.70$).
-* **MedGemma 1.5 Multimodal Referee (arXiv Synthesis)**:
-  * Based on recent literature (*MedGemma Technical Report* [arXiv:2507.05201], *PathReasoner-R1* [arXiv:2508.01234], *MiDeSeC* [arXiv:2507.14272]).
-  * Generates dual-magnification inputs ($40\times$ reticle focus crop + $10\times$ HPF overview context).
-  * **Mandatory Cross-Check Policy**: 100% of candidate mitoses—including figures that would otherwise be auto-confirmed—undergo mandatory MedGemma referee adjudication. Mimics are overruled and downgraded to `not_mitosis`, borderline figures are flagged for pathologist review, and verified mitoses receive sparkle badges and clinical rationale tooltips.
-
-### 🗺️ Stage 3 Triage Viewer: Viridis Tumor Heatmap & OpenSeadragon Stacking Overhaul (Latest)
-* **Z-Index Layering & Race Condition Elimination**: Fixed an asynchronous race condition in OpenSeadragon where simple image overlays were attached before the base slide pyramid fired its `open` event, inadvertently placing the heatmap underneath opaque slide tiles. Overlays are now strictly sequenced and indexed at the top level of the viewer world (`index: world.getItemCount()`), ensuring the Viridis colormap renders reliably over the tissue bed.
-* **Aspect Ratio & Coordinate Registration**: Aligned the $80 \times 215$ RGBA probability grid directly with the gigapixel WSI slide coordinates ($52,842 \times 142,079$ px) without dimension conflicts, yielding sharp, pixel-perfect spatial registration across the invasive tumor front.
-* **Fluid Intensity Toggle & Non-Destructive Slider**: Re-engineered opacity updates in `OpenSeadragonViewer.tsx` to directly manipulate `item.setOpacity(targetOpacity)` and trigger `viewer.forceRedraw()`. Pathologists can toggle heatmap visibility and slide the intensity between 10% and 100% with instantaneous visual feedback and zero platform freezing or canvas thrashing.
-* **Self-Healing Overlay Loading**: Protected against premature 404 caching during in-flight triage execution, with automatic retries and cache-busting upon stage completion.
-
-### 🧬 Stage 3 → Stage 4: Tissue Density–Conscious HPF Selection (No Empty Lumina) (Latest)
-* **Parenchymal Tissue Ratio Gating (`min_tissue_ratio >= 0.70`)**:
-  * Root cause: Moving from Stage 3 hotspots to Stage 4 mitotic activity previously placed HPFs using greedy convolution strictly on candidate mitotic density, which could center HPF circles over empty background glass, ductal lumina, or acellular necrosis if solitary artifacts or mimics appeared there.
-  * Solution in `backend/pipeline/hpf.py`: Evaluates the local Otsu tissue segmentation mask for every candidate $(x, y)$ coordinate across the WSI. Any coordinate whose $524\,\mu\text{m}$ circular field contains $< 70\%$ tissue area is filtered out prior to greedy peak selection.
-  * Guarantees that all 10 standard Virtual HPFs ($2.157\text{ mm}^2$ total area) reside strictly within cellular, solid invasive carcinoma tumor parenchyma, fully adhering to Nottingham and WHO diagnostic guidelines.
-
-### 🔄 Cloud-Native State Rehydration & Resilient Backend Recovery (Latest)
-* **Autonomous GCS-Backed Relational Recovery (`rehydrate.py`)**:
-  * Cloud Run containers are ephemeral and can scale to zero or restart across deployment cycles. 
-  * Implemented transparent on-demand rehydration: if a queried Case, Slide, StageExecution, Hotspot, Detection, or HPF is missing from the active database, the API dynamically inspects persistent GCS artifacts (`gs://oncogemma-dev-artifacts/cases/{case_id}/`) and reconstructs the full relational state.
-  * Restores active cases, triage review states, and verified mitotic figure candidates seamlessly without requiring repetitive slide uploads or re-running expensive ML pipelines.
-* **Protected Database Admin Utilities**: Added `/api/v1/admin/reset-database` with dialect-aware table clearing (SQLite `DELETE FROM` / PostgreSQL `TRUNCATE RESTART IDENTITY CASCADE`) for controlled end-to-end regression testing.
-
-### 🎯 MIDOG-Standard NMS & Optical Reticle Calibration
-These fixes resolve coinciding / overlapping / duplicate mitotic figure counts — the most critical accuracy improvement to date.
-
-* **MIDOG 2022 Challenge–Standard 20 µm NMS** ([arXiv:2204.03742](https://arxiv.org/abs/2204.03742)):
-  * `configs/mitosis.yaml`: `nms_radius_um` raised from `7.5` → **`20.0` µm**, matching the MICCAI MIDOG challenge benchmark. A mitotic cell nucleus in IDC-NST measures 15–25 µm; any two detections within 20 µm are physically the same cell.
-  * **Intra-tile NMS**: Added local 80 px (= 20 µm @ 0.25 µm/px) suppression inside `YoloMitosisDetector.detect` to eliminate multi-contour fragments (metaphase / anaphase poles) of the same dividing cell before global merge.
-  * **Priority-sorted global NMS**: `apply_global_nms` now ranks candidates by label priority (`mitosis` > `unreviewed` > `not_mitosis`) and then by detection confidence before suppression, ensuring the best representative survives each cluster.
-  * **Post-MedGemma NMS (Double Pass)**: A second `apply_global_nms(candidates, 20.0)` is executed *after* the MedGemma referee in `backend/worker/mitosis.py`, permanently eliminating any spatial duplicates that could survive referee adjudication.
-
-* **Optical Reticle Calibration — 577.29 µm HPF Patch**:
-  * Root cause: the backend was extracting only a **128 µm × 128 µm** optical patch per HPF, while the frontend `MitosisViewer` canvas (520 × 520 px) with a reticle radius of 236 px represents a **577.29 µm** field of view ($520 \times 262.0/236.0 = 577.29\,\mu\text{m}$). This created a **4.5× scale mismatch** — pins landed on completely wrong cells, and detections beyond 64 µm from center were off-screen.
-  * Fix in `backend/worker/mitosis.py` and `backend/app/routers/mitosis.py`:
-    ```python
-    field_um = 577.29 if mag == "40x" else (1154.58 if mag == "20x" else 2309.15)
-    ```
-  * HPF background image pixels now align **1:1** with candidate pin overlays in the viewer at all magnifications.
-
-* **Frontend Candidate Filtering (MitosisViewer)**:
-  * `activeFieldCandidates` now filters strictly to the exact HPF circle ($r \le 262\,\mu\text{m}$) — the previous 15% spill margin was including candidates from adjacent fields.
-  * Candidates within each HPF are sorted by clinical priority: confirmed mitoses first, then unreviewed, then not_mitosis — descending by confidence within each group.
-
-### 📊 Stage 5: Pixel-Level Morphometric Nottingham Grading
-* **Quantitative Histomorphometrics**: Resolved uniform score outputs by evaluating pixel-level glandular differentiation (Tubule Formation score) and nuclear area coefficient of variation & 90th/10th ratio (Nuclear Pleomorphism score).
-
-### 📑 Stage 6: CAP Synoptic Report & Streamlined 1-Page PDF Overhaul
-* **Streamlined Protocol Fields**: Removed non-pertinent intake variables (`Specimen ID`, `Scan resolution`, `Grading system`, `Staining`) per clinical directives.
-* **Single-Row Intake Table**: Clean intake summary with Case ID, Specimen, Evaluated Area, and Status.
-* **Real Evidence Imagery Embedded**: Corrected GCS blob resolution to embed authentic WSI Tumor Triage Heatmaps, Highest-Density Mitotic HPFs, and Representative Grading Patches in full color (178 KB high-res document).
-* **Typography & Spacing**: Increased font size by **+1 pt** across all headings and body text, relaxed table cell padding for breathing room, and calibrated layout to fit strictly on **exactly 1 page**.
-* **On-Demand Dynamic Generation**: Enforced `Cache-Control: no-cache, no-store, must-revalidate` headers, ensuring pathologists always receive the fresh report without stale GCS cache retention.
-
----
-
-## 🏛️ Comprehensive Architecture & Workflow Pipeline
-
-OncoGemma follows a strict 6-stage clinical diagnostic workflow where each stage produces verifiable intermediate machine evidence that pathologists inspect, modify, and confirm before proceeding.
+OncoGemma follows a strict 6-stage human-in-the-loop diagnostic pipeline. Each stage generates verifiable intermediate evidence that pathologists review, adjust, and confirm before progressing to subsequent stages.
 
 ```mermaid
 flowchart TD
-    subgraph S1["Stage 1: WSI Ingest (v4.0)"]
-        A1["Raw Whole-Slide Image (.svs / .ndpi / .tiff)"] --> B1["PyVips & OpenSlide DeepZoom Ingestion"]
-        B1 --> C1["GCS Multi-Resolution Pyramid (oncogemma-dev-pyramids)"]
+    subgraph S1["Stage 1: WSI Ingest & Tiling"]
+        A1["Raw WSI Upload (.svs / .ndpi / .tiff)"] --> B1["Metadata Extraction & MPP Calibration"]
+        B1 --> C1["DeepZoom Multi-Resolution Pyramids (GCS)"]
     end
 
-    subgraph S2["Stage 2: Stain & QC Gate (v4.1)"]
+    subgraph S2["Stage 2: Preprocessing & Automated QC"]
         C1 --> A2["Otsu Tissue Segmentation & Area Analysis"]
-        A2 --> B2["Laplacian Focus Quality & Marker/Bubble Filters"]
-        B2 --> C2["Calibrated Optical Density Macenko Stain Normalization"]
-        C2 --> D2["Pathologist QC Gate & Threshold Confirmation"]
+        A2 --> B2["5-Check Automated Pre-Flight QC Engine"]
+        B2 --> C2["Calibrated Optical Density Macenko Normalization"]
+        C2 --> D2["Pathologist QC Gate & Confirmation"]
     end
 
-    subgraph S3["Stage 3: Hotspot Triage (v4.2)"]
-        D2 --> A3["Tissue Grid Tiling (1.0 um/px @ 10x)"]
-        A3 --> B3["Vertex AI Path Foundation Embedding & Linear Probe"]
-        B3 --> C3["Spatial KDE Tumor Probability Contouring"]
-        C3 --> D3["Interactive Hotspot Polygon Review Workspace"]
+    subgraph S3["Stage 3: Tumor Bed Triage"]
+        D2 --> A3["10x Tissue Patch Grid Generation"]
+        A3 --> B3["Vertex AI Path Foundation ViT Embeddings"]
+        B3 --> C3["Calibrated Linear Probe & Viridis Heatmap"]
+        C3 --> D3["Interactive Hotspot ROI Review Workspace"]
     end
 
-    subgraph S4["Stage 4: Mitosis Counting (v4.3)"]
-        D3 --> A4["40x High-Power Sweep within Active Hotspots"]
-        A4 --> B4["YOLO Candidate Detection & Morphological Filters"]
-        B4 --> C4["2D Spatial Convolution (10 Standard HPFs = 2.157 mm2)"]
-        C4 --> D4["Pathologist Mitosis Review Gallery (Score 1/2/3)"]
+    subgraph S4["Stage 4: Mitosis Detection & Virtual HPFs"]
+        D3 --> A4["True 40x Optical Candidate Sweep"]
+        A4 --> B4["Van Diest Morphological Mimic Filtering & MedGemma Referee"]
+        B4 --> C4["Density-Conscious 10-HPF Spatial Convolution"]
+        C4 --> D4["Pathologist Mitosis Studio (Score 1/2/3)"]
     end
 
-    subgraph S5["Stage 5: Nottingham Histologic Grade (v4.4)"]
+    subgraph S5["Stage 5: Nottingham Histologic Grading"]
         D4 --> A5["24 Stratified 10x Evidence Patch Extraction"]
-        A5 --> B5["MedGemma 1.5 Tubule Formation & Pleomorphism Inference"]
+        A5 --> B5["MedGemma 1.5 Tubule & Pleomorphism Analysis"]
         B5 --> C5["Consensus Histologic Subtype Classification"]
-        C5 --> D5["Pure Zero-LLM Aggregation: Grade 1, 2, or 3 (Sum 3-9)"]
+        C5 --> D5["Deterministic Grade Aggregation (Grade 1-3)"]
     end
 
-    subgraph S6["Stage 6: CAP Synoptic Report (v4.5)"]
-        D5 --> A6["Deterministic Zero-LLM AJCC Staging Engine (pT, pN, Group)"]
+    subgraph S6["Stage 6: CAP Synoptic Report"]
+        D5 --> A6["Deterministic AJCC Staging Engine (pT, pN, Group)"]
         A6 --> B6["MedGemma 1.5 Narrative Synthesis with Guardrails"]
-        B6 --> C6["ReportLab Clinical 2-Column PDF Generator"]
-        C6 --> D6["Pathologist Attestation, NPI Signing & Versioned Amendments"]
+        B6 --> C6["ReportLab Platypus 3-Page Clinical PDF Engine"]
+        C6 --> D6["Pathologist Attestation, PIN Sign-Off & Versioned Amendments"]
     end
 
     S1 --> S2 --> S3 --> S4 --> S5 --> S6
@@ -150,263 +66,168 @@ flowchart TD
 
 ---
 
-## 📦 Consolidated Stage Specifications (v4.0 – v4.5)
+## 🔬 Stage Specifications
 
-### 🔬 Stage 1 (v4.0): Gigapixel Whole-Slide Image Ingestion
-* **High-Throughput Slide Ingest**: Decodes Aperio (`.svs`), Hamamatsu (`.ndpi`), and generic BigTIFF slides using `pyvips` and `openslide`.
-* **DeepZoom Tile Generator**: Generates multiscale DZI pyramid image pyramids uploaded directly to Google Cloud Storage (`oncogemma-dev-pyramids`).
-* **OpenSeadragon 5.0 High-DPI Viewer**: Smooth pan, zoom, sub-pixel coordinate conversion, and micro-magnification overlays.
-* **Audit Trail**: Every file upload and stage transition is logged to the `audit_events` ledger.
+### Stage 1: Whole-Slide Ingestion & Pyramid Generation
+* **Direct-to-GCS Resilient Ingestion**: Direct client-to-bucket chunked uploads via pre-signed Google Cloud Storage URLs bypass server payload ceilings, enabling seamless gigapixel slide intake with live progress tracking.
+* **Universal WSI Support**: Decodes Aperio (`.svs`), Hamamatsu (`.ndpi`), and generic BigTIFF slides using `pyvips` and `openslide` with global process locking.
+* **Calibrated Optical Resolution (MPP)**: Strictly validates micrometers-per-pixel metadata across slide headers. If missing, prompts the pathologist for manual calibration (`needs_mpp` state) rather than silently guessing.
+* **Full-Depth DZI Pyramids**: Automatically generates multi-resolution DeepZoom pyramids streamed to `oncogemma-dev-pyramids` to power responsive high-DPI viewing in OpenSeadragon.
+* **HIPAA De-Identification**: Unlinks non-essential TIFF IFD tags and wipes embedded patient labels before storage.
 
-### 🧪 Stage 2 (v4.1): Preprocessing & Automated QC Gate
-* **Tissue Segmentation**: Otsu thresholding in HSV color space to distinguish valid tissue parenchyma from background glass.
-* **Automated Quality Checks**:
-  * **Focus Quality**: Evaluated via Laplacian variance kernel ($	ext{Var}(
-abla^2 I)$). Flags blurred fields with $	ext{score} < 85.0$.
-  * **Artifact Detection**: Identifies surgical ink, coverslip bubbles, and tissue folds.
-* **Calibrated Optical Density Macenko Stain Normalization**:
-  * Converts RGB to Optical Density: $	ext{OD} = -\log_{10}((I + 1)/255)$.
-  * Computes calibrated singular vectors for Hematoxylin and Eosin ($W_{	ext{target}}$: Hematoxylin $[0.644, 0.717, 0.267]$, Eosin $[0.093, 0.954, 0.283]$).
-  * Concentration bounds $[0.75, 1.35]$ maintain authentic royal-purple nuclear chromatin and vibrant pink cytoplasm without artificial saturation.
+### Stage 2: Preprocessing & Automated QC Gate
+* **Tissue Segmentation**: Otsu thresholding in HSV color space differentiates cellular tissue parenchyma from background glass and empty lumina.
+* **5-Check Automated Pre-Flight QC**:
+  * **Tissue Coverage**: Verifies tissue area percentage against diagnostic thresholds.
+  * **Focus Sharpness**: Variance of Laplacian kernel detects blurred fields ($<45.0$).
+  * **Marker Pen Detection**: Segmented color-space analysis flags diagnostic interference from surgical ink.
+  * **Tissue Folds & Tears**: Morphological skeleton analysis identifies mechanical fold ridges.
+  * **Stain Sanity**: Assesses Hematoxylin-to-Eosin optical density balance and concentration boundaries.
+* **Fitted Macenko Stain Normalization**: Transforms slide optical density using fitted source stain matrices and calibrated reference targets ($W_{\text{target}}$: Hematoxylin $[0.644, 0.717, 0.267]$, Eosin $[0.093, 0.954, 0.283]$), ensuring consistent color fidelity across scanners.
 
-### 🎯 Stage 3 (v4.2): Hotspot Triage & Microscopic Morphology Engine
-* **Vertex AI Foundation Embedding**: Extracts feature representations from normalized $1.0\ \mu	ext{m/px}$ patches across the tissue bed.
-* **Calibrated Linear Probe**: Predicts tumor probability scores ($P(	ext{invasive carcinoma})$) per tile.
-* **Spatial KDE & Polygon Contouring**: Applies 2D Gaussian Kernel Density Estimation to contour the most proliferative, high-density tumor regions.
-* **Interactive Hotspot Workspace**: Allows pathologists to view heatmaps, adjust threshold gates, add custom regions of interest (ROIs), and exclude necrotic/in-situ areas.
+### Stage 3: Tumor Bed Triage & Hotspot Selection
+* **Live Google Path Foundation Integration**: Connected to a dedicated Vertex AI Vision Transformer (ViT) endpoint (`asia-south1`), streaming optical patches to produce 384-dimensional representation vectors.
+* **Calibrated Linear Probe**: Predicts tumor probability scores ($P(\text{invasive carcinoma})$) per tile to localize active tumor margins.
+* **Fluid Viridis Heatmap Overlay**: High-resolution RGBA probability overlay registered with slide coordinates. Pathologists adjust opacity dynamically (10%–100%) with non-destructive client-side rendering.
+* **Interactive Hotspot Workspace**: Allows pathologists to inspect candidate regions of interest (ROIs), adjust contour thresholds, manually add/delete ROIs, or confirm benign slides via explicit zero-tumor verification.
 
-### 🧬 Stage 4 (v4.3): High-Power Mitosis Detection & Virtual HPF Placement
-* **$40	imes$ High-Power Candidate Detection**: Scans $0.25\ \mu	ext{m/px}$ optical fields for mitotic candidates.
-* **Standardized 10-HPF Spatial Convolution**:
-  * Places 10 standard virtual High-Power Fields (each radius $= 262.0\ \mu	ext{m}$, area $= 0.2157	ext{ mm}^2$, total area $= 2.157	ext{ mm}^2$) matching standard clinical microscopy calibration ($FN = 22	ext{ mm}$ at $40	imes$).
-* **Pathologist Interactive Gallery**:
-  * Field-by-field candidate verification with synchronized macro biopsy minimap.
-  * Instantaneous Nottingham Mitotic Score calculation ($<8 	o 1$, $8	ext{--}15 	o 2$, $\ge 16 	o 3$).
+### Stage 4: High-Power Mitosis Studio & Virtual HPF Placement
+* **True 40× Optical Magnification ($0.25\text{--}0.28\,\mu\text{m/px}$)**: Extracts authentic high-power optical patches across standard $577\,\mu\text{m}$ fields, enabling clear visualization of nuclear chromatin, spindle poles, and cell boundaries.
+* **MICCAI MIDOG-Standard 20 µm NMS**: Implements physical micrometer Non-Maximum Suppression (intra-tile and global) to eliminate multi-pole duplicate detections.
+* **Van Diest & WHO Morphological Filtering**: Automatically suppresses apoptosis (retraction halos) and normal lymphocytes ($5\text{--}7\,\mu\text{m}$), verifying true mitotic features (spicules, jagged arms, envelope breakdown).
+* **MedGemma Multimodal Referee**: Mandatory cross-check adjudication on candidate figures using dual-magnification views ($40\times$ focus crop + $10\times$ HPF context).
+* **Tissue Density–Conscious HPF Selection**: Selects 10 standardized Virtual High-Power Fields ($2.157\,\text{mm}^2$ total area) restricted to $\ge 70\%$ tissue cellularity, preventing HPF placement in fat, glass, or necrosis.
+* **Interactive Pathologist Studio**: Ergonomic review canvas with spacebar magnification toggle ($10\times \leftrightarrow 40\times$), candidate auto-centering, and rapid keyboard hotkeys (<kbd>M</kbd> Confirm, <kbd>X</kbd> Reject).
 
-#### 📊 Stage 5 (v4.4): Nottingham Histological Grading (MedGemma 1.5)
-* **2D Continuous Tissue Density Hotspot Sampling**:
-  * Extracts 24 stratified $10\times$ evidence patches ($512\times 512\,\mu\text{m}$ @ $1.0\,\mu\text{m/px}$) directly within or immediately adjacent to confirmed Stage 3 hotspots.
-  * Employs 2D uniform filter density convolution over the tissue mask to locate peak cellularity points within each hotspot ($96\% - 100\%$ density), completely avoiding empty lumina, fat, or acellular stroma.
-  * Stratified greedy selection draws secondary high-density tumor subregions and invasive margin zones ($\ge 384\,\mu\text{m}$ separation).
-* **Multi-Modal AI Inference (MedGemma 1.5)**:
-  * **Tubule Formation**: Evaluates percentage of tumor forming definite glandular lumens ($>75\% \to 1$, $10\text{--}75\% \to 2$, $<10\% \to 3$).
-  * **Nuclear Pleomorphism**: Analyzes nuclear size, chromatin clumping, and nucleolar prominence (Small/Uniform $\to 1$, Moderate $\to 2$, Marked/Bizarre $\to 3$).
+### Stage 5: Nottingham Histologic Grading (MedGemma 1.5)
+* **Continuous Density Hotspot Sampling**: Extracts 24 stratified $10\times$ evidence patches ($512\times 512\,\mu\text{m}$) from peak cellularity zones of confirmed Stage 3 hotspots ($\ge 384\,\mu\text{m}$ separation).
+* **Multimodal Nottingham Evaluation**:
+  * **Tubule Formation**: Quantifies glandular/tubular lumen percentage ($>75\% \to 1$, $10\text{--}75\% \to 2$, $<10\% \to 3$).
+  * **Nuclear Pleomorphism**: Assesses nuclear variation, chromatin clump size, and nucleoli (Uniform $\to 1$, Moderate $\to 2$, Marked $\to 3$).
   * **Histologic Subtype**: Multi-patch consensus classification (IDC-NST vs. ILC vs. Special Types).
-* **Robust Task Disambiguation & Clean Findings Narrative**:
-  * Disambiguated prompt dispatch and regex cleaning preventing raw JSON leakage into diagnostic narratives.
-* **Pure Zero-LLM Deterministic Aggregation**:
+* **Dual-Level Pathologist Sign-Off Gating**: Requires explicit confirmation of individual evidence patches and overall histologic subtype prior to stage approval.
+* **Deterministic Grade Aggregation**:
   $$\text{Nottingham Sum} = \text{Score}_{\text{Tubule}} + \text{Score}_{\text{Pleo}} + \text{Score}_{\text{Mitosis}} \quad (\text{Range: } 3\text{--}9)$$
   $$\text{Grade} = \begin{cases} \text{Grade 1 (Well Differentiated)} & 3 \le \text{Sum} \le 5 \\ \text{Grade 2 (Moderately Differentiated)} & 6 \le \text{Sum} \le 7 \\ \text{Grade 3 (Poorly Differentiated)} & 8 \le \text{Sum} \le 9 \end{cases}$$
 
-### 📑 Stage 6 (v4.5): CAP Synoptic Report & AJCC 8th/9th Staging
-* **Deterministic Zero-LLM AJCC Staging**:
-  * **Pathologic T (pT)**: Calculated strictly from macroscopic tumor dimensions and chest wall/skin extension (pTis to pT4d).
-  * **Pathologic N (pN)**: Calculated strictly from positive regional lymph node counts (pNX to pN3a).
-  * **Anatomic Stage Grouping**: Pure code matrix mapping (Stage 0 to Stage IV).
-* **MedGemma 1.5 Clinical Narrative Synthesis**: Synthesizes formal microscopic description, clinical history, and diagnostic comments.
-* **Code-Level Consistency Guardrail**: Verifies that LLM narrative statements do not contradict verified Nottingham grades or node counts.
-* **ReportLab Clinical PDF Engine**: Generates institutional two-column surgical pathology reports embedding key visual evidence (WSI Heatmap, Top Mitotic HPF, and $10\times$ Grading Patch).
-* **Digital Attestation & Cryptographic Sign-Off**: Pathologist NPI, legal attestation, SHA-256 integrity digest, and formal versioned amendment workflows (`v1.0` $\to$ `v1.1`).
+### Stage 6: CAP Synoptic Reporting & Staging
+* **Deterministic Zero-LLM AJCC Staging**: Pure-code calculation of Pathologic T (pT), Pathologic N (pN), and Anatomic Stage Grouping (Stage 0 to IV) strictly following AJCC 8th/9th Edition criteria.
+* **MedGemma Narrative Synthesis with Guardrails**: Generates professional microscopic descriptions and clinical summaries, protected by validation guardrails that prevent numerical or grade contradictions.
+* **ReportLab Platypus 3-Page Clinical PDF**:
+  * **Page 1**: Case Demographics, Stamped Accession UUID, Final Synoptic Diagnosis, and CAP Elements Table.
+  * **Page 2**: Microscopic Findings, MedGemma Clinical Narrative, Key Visual Evidence (WSI Heatmap, Top Mitotic HPF, Grading Patch), and Pathologist Attestation Block.
+  * **Page 3**: Clinical Appendix & Provenance (RUO Amber Warning Banner, Model Fingerprints, Reviewer Audit Trail, and Version History).
+* **Digital Sign-Off & Immutability**: PIN-authenticated sign-off generates a cryptographic SHA-256 integrity seal. Signed reports are permanently locked; updates require the formal versioned amendment workflow (`v1.0` $\to$ `v1.1`).
 
 ---
 
-### 🛡️ Comprehensive Clinical Code Audit & Hardening (September 2026)
-* **Clinical Correctness & Zero Fabricated Defaults**:
-  * Eliminated hardcoded defaults (ER 95%, PR 80%, HER2 1+, tumor size 18.0 mm, negative 5 mm margins). Unassessed fields now render as `Not assessed` / `Pending`.
-  * Fixed unassessed tumor staging (`pTX`, `pNX`) in `calculate_ajcc_stage_group` to evaluate strictly to `Unknown` instead of defaulting to `IA`.
-  * Added dedicated Benign Pathology Synoptic Protocol preventing false Grade 2 carcinoma reports or `NoneType` crashes on non-invasive slides.
-  * Solved Stage 5 mitotic score double-counting across overlapping HPFs ($1.5r < 2r$) via spatial deduplication and calibrated area-normalized thresholds.
-* **Security, Role-Based Access Control (RBAC) & Audit Integrity**:
-  * Implemented strict RBAC (`admin`, `pathologist`, `technician`, `viewer`) on mutating and destructive endpoints (`DELETE /cases`, report signing/amendments).
-  * Prominent diagonal `DRAFT` watermark on unsigned/draft PDFs; suppressed fabricated pathologist signature blocks until authenticated electronic sign-off.
-  * Implemented immutable report versioning: amendments generate `version = current.version + 1` drafts while original signed reports remain permanently sealed.
-* **Ingest, Geometry & Full-Depth Pyramids**:
-  * Implemented `needs_mpp` state and interactive pathologist calibration; eliminated silent $0.25\,\mu\text{m/px}$ guessing.
-  * Removed quaternary flat pink pyramid generators; unreadable slides fail fast with true diagnostic error logs.
-  * Implemented byte-level TIFF IFD unlinking and PHI data zeroing before setting `label_stripped_at`.
-  * Removed arbitrary level 11/12 DZI pregeneration ceilings, generating full-depth pyramids to support instant high-magnification ($20\times/40\times$) review.
-* **State Machine Gating & Worker Concurrency (Batch 4)**:
-  * Implemented `SELECT ... FOR UPDATE SKIP LOCKED` in `poll_and_execute_single_task` with graceful SQLite fallback, eliminating multi-worker race conditions and duplicate task execution.
-  * Scoped startup reset of stuck running stages to orphaned jobs (>15 min) to prevent clobbering active worker tasks across rolling deployments.
-  * Eliminated silent import-time SQLite fallback in `db.py`: PostgreSQL connection failures fail fast with loud errors and return HTTP 503 on `/health` and `/healthz` (via active `SELECT 1` probes).
-  * Added SQLAlchemy connect listener enforcing `PRAGMA foreign_keys=ON` on all SQLite engines, and established `ON DELETE CASCADE` relationships across `Case` child entities (`Hotspot`, `Detection`, `HpfSite`).
-  * Enforced strict stage status gating (`awaiting_review` required to approve or confirm) and monotonic attempt incrementation (`attempt = max(existing) + 1`), preventing unique constraint collisions during slide re-scans.
-* **Stain Normalization & Clinical Pipeline Robustness (Batch 5)**:
-  * **Fitted Macenko Deconvolution (Issue #50)**: Fixed `PureNumpyMacenkoNormalizer.transform()` to deconvolve using the slide's fitted source stain matrix (`stain_matrix_src`, `max_conc_src`) rather than ignoring the fit and independently re-fitting SVD per tile; tile router and workers now restore complete source and target stain profiles from `stain_params.json`.
-  * **Tissue Mask Patch Sampling (Issues #436, #553)**: Replaced blind uniform slide footprint sampling with mask-guided coordinate sampling from `np.argwhere(tissue_mask_1bit)`; flagged degenerate fits with low tissue density and removed swallow-all exception handlers.
-  * **Full 5-Check QC Suite & PRD Calibration (Issues #48, #433)**: Restored PRD-mandated focus thresholds (`vol_threshold: 45.0`, `fail_blurry_ratio: 0.30`, `warn_blurry_ratio: 0.10`), removed placeholder calibration text, and fully implemented surgical pen mark detection, tissue fold morphological ridge detection, and H&E stain sanity validation.
-  * **Grading Resilience & Invalidation (Issues #145, #141, #143)**: Deterministically seeded 10x hotspot evidence patch selection using slide checksums, abolished fabricated sub-scores on VLM schema retry exhaustion in favor of flagging `needs_human=True` for pathologist review, and automatically reset stale `overrides` and `type_confirmed_by` upon grading stage re-runs.
-* **100% Offline Test Isolation & CI Reliability**:
-  * Implemented session-level test isolation in `conftest.py` with GCS mock `.prefixes` support, running all 100 tests across 18 test suites completely offline.
-
----
-
-## 📐 Mathematical Specification & Invariant Tables
-
-### Nottingham Combined Histologic Grade (Elston-Ellis Modification)
+## 📊 Nottingham Combined Histologic Grade Reference
 
 | Feature | Score 1 | Score 2 | Score 3 |
 | :--- | :--- | :--- | :--- |
 | **Tubule Formation** | $>75\%$ of tumor area | $10\% - 75\%$ of tumor area | $<10\%$ of tumor area |
 | **Nuclear Pleomorphism** | Small, regular, uniform | Moderate variation in size & shape | Marked variation, prominent nucleoli |
-| **Mitotic Count** ($2.157	ext{ mm}^2$) | $< 8$ mitotic figures | $8 - 15$ mitotic figures | $\ge 16$ mitotic figures |
+| **Mitotic Count** ($2.157\,\text{mm}^2$) | $< 8$ mitotic figures | $8 - 15$ mitotic figures | $\ge 16$ mitotic figures |
 
-$$	extbf{Combined Score: } 3	ext{--}5 \implies 	extbf{Grade 1} \quadert\quad 6	ext{--}7 \implies 	extbf{Grade 2} \quadert\quad 8	ext{--}9 \implies 	extbf{Grade 3}$$
+$$\textbf{Combined Nottingham Score: } 3\text{--}5 \implies \textbf{Grade 1} \quad\vert\quad 6\text{--}7 \implies \textbf{Grade 2} \quad\vert\quad 8\text{--}9 \implies \textbf{Grade 3}$$
 
 ---
 
-### AJCC 8th/9th Edition Breast Cancer Staging
+## 🛡️ Clinical Hardening & Audit Remediation (462 / 462 Findings Resolved)
 
-$$	ext{pT} = egin{cases} 
-	ext{pTis} & 	ext{Carcinoma in situ (DCIS, LCIS, Paget disease without tumor)} \
-	ext{pT1mi} & 	ext{Tumor } \le 1.0	ext{ mm} \
-	ext{pT1a} & 1.0 < 	ext{Tumor} \le 5.0	ext{ mm} \
-	ext{pT1b} & 5.0 < 	ext{Tumor} \le 10.0	ext{ mm} \
-	ext{pT1c} & 10.0 < 	ext{Tumor} \le 20.0	ext{ mm} \
-	ext{pT2} & 20.0 < 	ext{Tumor} \le 50.0	ext{ mm} \
-	ext{pT3} & 	ext{Tumor} > 50.0	ext{ mm} \
-	ext{pT4} & 	ext{Direct extension to chest wall (4a), skin ulceration (4b), both (4c), or inflammatory (4d)}
-\end{cases}$$
+Every documented finding from the comprehensive system audit has been systematically addressed and verified across 5 core pillars:
 
-$$	ext{pN} = egin{cases}
-	ext{pNX} & 	ext{Regional lymph nodes cannot be assessed (e.g. core biopsy)} \
-	ext{pN0} & 	ext{No regional lymph node metastasis} \
-	ext{pN1mi} & 	ext{Micrometastases only } (0.2	ext{ mm} - 2.0	ext{ mm}) \
-	ext{pN1a} & 1 - 3 	ext{ axillary lymph nodes positive} \
-	ext{pN2a} & 4 - 9 	ext{ axillary lymph nodes positive} \
-	ext{pN3a} & \ge 10 	ext{ axillary lymph nodes positive}
-\end{cases}$$
+1. **Clinical Correctness & Zero Fabricated Defaults**:
+   - Abolished hardcoded defaults across all endpoints (ER/PR, HER2, tumor sizes, margins). Unassessed fields format safely as `Not assessed / Pending`.
+   - Margin distances are strictly displayed for negative margins.
+   - Implemented dedicated Benign Pathology Synoptic Protocol to handle non-malignant cases safely.
+2. **Security, RBAC & Immutable Audit Ledger**:
+   - Role-Based Access Control (`admin`, `pathologist`, `technician`, `viewer`) enforces strict permissions on mutating routes.
+   - Re-authentication PIN required for digital signature; unsigned reports feature prominent `DRAFT` watermarks.
+   - Tamper-evident `audit_events` ledger records all diagnostic events with actor identity, stage timestamps, and deterministic tiebreaker ordering (`created_at.desc(), id.desc()`).
+3. **Concurrency, State Machine & Cloud Recovery**:
+   - Row-level database locking (`SELECT ... FOR UPDATE SKIP LOCKED` / SQLite fallback) prevents multi-worker race conditions.
+   - In-process background daemon recovers orphaned tasks (>300s) automatically.
+   - Autonomous state rehydration restores active cases from GCS artifacts across ephemeral container restarts.
+4. **Optical Accuracy & Diagnostic Precision**:
+   - Resolved HPF scale mismatch: calibrated patches align 1:1 with candidate beacons at $40\times$ ($577\,\mu\text{m}$ field).
+   - MIDOG $20\,\mu\text{m}$ spatial NMS and Van Diest criteria eliminate false duplicate figure counts.
+5. **Modernization & Code Hygiene (Batches 19–21)**:
+   - Full migration to Pydantic v2 (`SettingsConfigDict`, `ConfigDict(from_attributes=True)`), eliminating all `PydanticDeprecatedSince20` warnings.
+   - Strict CORS whitelist and Cloud Run subdomain regex (`allow_origin_regex=r"^https://.*\.run\.app$"`), closing wildcard credentials vulnerabilities (#3).
+   - Cleaned all dead imports and unused icons across all routers, pipeline modules, and frontend viewers.
+   - Removed artificial frontend shims (`next-shim.d.ts`), enabling authentic compile-time type safety.
 
 ---
 
 ## 🛠️ Technology Stack
 
-| Layer | Component | Description |
+| Layer | Technologies & Frameworks | Description |
 | :--- | :--- | :--- |
-| **Frontend** | Next.js 14 (App Router) | High-performance React UI with Tailwind CSS and Lucide icons |
-| | OpenSeadragon 5.0 | High-DPI gigapixel whole-slide viewer |
-| | Canvas & SVG Overlays | Sub-pixel annotation layers for hot spots and mitotic beacons |
-| **Backend** | FastAPI / Python 3.12 | Asynchronous RESTful microservice backend |
-| | SQLAlchemy ORM & Pydantic | Typed database persistence and strict schema validation |
-| | ReportLab | High-precision clinical surgical pathology PDF generation |
-| **AI & Pipeline** | MedGemma 1.5 | Multi-modal clinical vision-language model (Vertex AI) |
-| | Path Foundation | Digital pathology representation embeddings |
-| | Pure NumPy Stain Engine | High-speed, calibrated Optical Density Macenko normalizer |
-| | OpenSlide & PyVips | Multi-resolution WSI tile decoders |
-| **Cloud & Storage** | Google Cloud Storage | Distributed object store (`raw`, `pyramids`, `artifacts`) |
-| | Google Cloud Vertex AI | Managed endpoints for MedGemma and Path Foundation models |
+| **Frontend** | Next.js 14, React 18, Tailwind CSS, Lucide | High-performance clinical UI with WCAG accessibility |
+| **WSI Viewing** | OpenSeadragon 5.0, HTML5 Canvas | Sub-pixel whole-slide pyramid streaming and interactive reticles |
+| **Backend API** | FastAPI, Pydantic v2, Python 3.12 | Asynchronous REST control plane with strict schema enforcement |
+| **Database** | PostgreSQL (Cloud SQL) / SQLite, SQLAlchemy | Typed ORM persistence, CASCADE relationships, and audit ledger |
+| **AI / ML Models** | Google Path Foundation (ViT), MedGemma 1.5 | Foundation embeddings (Vertex AI) & vision-language grading |
+| **WSI Processing** | PyVips, OpenSlide, NumPy, Pillow | Gigapixel tile de-identification, decoding, and stain normalizer |
+| **PDF Engine** | ReportLab Platypus, Jinja2 | Deterministic 3-page CAP surgical pathology synoptic reports |
+| **Cloud Platform** | Google Cloud Run, Cloud Storage, Cloud Build | Serverless compute, distributed asset storage, automated CI/CD |
 
 ---
 
-## 🚀 Quick Start & Local Development
+## 🧪 Automated Testing & Quality Assurance
 
-### 1. Prerequisites
-* Python 3.11 or 3.12
-* Node.js 18+ and npm
-* `openslide` C-library installed on system PATH
-* Google Cloud CLI (`gcloud`) authenticated with access to GCS buckets
-
-### 2. Backend Setup
+Run the comprehensive test suite locally:
 ```bash
-# Navigate to backend directory
-cd backend
-
-# Create and activate virtual environment
-python -m venv venv
-# Windows:
-.\venv\Scripts\Activate.ps1
-# Linux/macOS:
-source venv/bin/activate
-
-# Install Python dependencies
-pip install -r requirements.txt
-
-# Start FastAPI application server
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+# Set in-memory test database and run all 30 test suites
+$env:DATABASE_URL="sqlite:///:memory:"; pytest backend/tests/ -q
 ```
 
-### 3. Background Processing Worker
-In a separate terminal window:
-```bash
-cd backend
-python worker/main.py
-```
-
-### 4. Frontend Setup
-In a third terminal window:
-```bash
-cd frontend
-
-# Install Node dependencies
-npm install
-
-# Start Next.js development server
-npm run dev
-```
-
-### 5. Access the Web Application
-Open [http://localhost:3000](http://localhost:3000) in your browser.
+### Test Coverage Summary: 226 / 226 Passing (100% Offline Isolated)
+* `test_api_auth.py` — Authentication, bearer tokens, RBAC roles, and `/health` aliases
+* `test_batch4_state_and_concurrency.py` — Row locking, worker skip_locked, orphan recovery, CASCADE deletes
+* `test_batch5_stain_and_qc.py` — Fitted Macenko deconvolution, tissue mask sampling, 5-check QC engine
+* `test_batch7_report_signing.py` — Report digital signatures, attestation hashes, prior stage gating, PIN validation
+* `test_batch8_grading_pipeline.py` — Tubule formation, nuclear pleomorphism, histologic typing, Nottingham grading
+* `test_batch9_mitosis_pipeline.py` — 40x tile extraction, YOLO candidate sweeping, HoVer-Net verification, HPF packing
+* `test_batch10_triage_pipeline.py` — Path Foundation feature embeddings, linear probe, viridis heatmap overlays
+* `test_batch11_pipeline_integrity.py` — End-to-end stage state transitions, retry semantics, input/output ref validation
+* `test_batch12_reporting_and_validation.py` — CAP synoptic element validation, AJCC 8th/9th staging, narrative consistency
+* `test_batch14_triage_edge_cases.py` — Zero tumor confirmation, manual hotspot edits, coordinate boundary clipping
+* `test_batch15_tiles_and_hpf.py` — DeepZoom tile generation, boundary clamping, Virtual HPF density sorting
+* `test_batch16_mitosis_pipeline.py` — MIDOG NMS, high-power reticle calibration, candidate proximity deduplication
+* `test_batch17_grading_staging.py` — Dual-level sign-off gating, histologic subtype confirmation, Nottingham invariants
+* `test_batch18_reporting_pdf_audit.py` — ReportLab 3-page layout, NumberedCanvas, RUO banners, audit order tiebreaker
+* `test_batch19_21_hardening.py` — Pydantic v2 migration, CORS security, health endpoints, zero deprecation warnings
+* `test_cap_reporting.py` — CAP synoptic PDF generation, benign protocols, digital signatures, amendments
+* `test_coords.py` — Micron-to-pixel coordinate transforms and geometric scaling
+* `test_grading.py` — Nottingham grading, MedGemma integration, spatial candidate deduplication
+* `test_grading_api.py` — Grading review, manual overrides, confirmation lifecycle
+* `test_hotspots.py` — Triage peak detection and tumor bed ROI extraction
+* `test_hpf.py` — High-Power Field greedy spatial packing and non-overlap invariants
+* `test_ingest_fixes.py` — De-identification, MPP validation, needs_mpp calibration state, full-depth DZI generation
+* `test_mitosis_api.py` — Mitosis review, candidate labeling, HPF synchronization, signed report immutability
+* `test_morphometrics.py` — Nuclear pleomorphism morphology, nuclear atypia scoring
+* `test_nms.py` — Non-Maximum Suppression algorithms across optical tiles
+* `test_qc_checks.py` — Tissue coverage, focus sharpness, marker pen, tissue folds, stain sanity
+* `test_scoring.py` — Nottingham histologic scoring tables, Elston-Ellis boundary metrics
+* `test_stain.py` — Pure NumPy Macenko optical density deconvolution
+* `test_triage_api.py` — Triage review endpoints, draft edit replay
+* `test_triage_worker.py` — Path Foundation embeddings, linear probe triage, GCS caching
 
 ---
 
-## 🧪 Comprehensive Automated Test Suite
+## 🚀 Cloud Build & Deployment
 
-Run the full end-to-end regression and mathematical invariant test suite:
+OncoGemma v5 builds and deploys via Google Cloud Build directly to Cloud Run:
+
 ```bash
-cd backend
-pytest tests/ -v
+# 1. Build and deploy backend API to Cloud Run
+gcloud builds submit --config ops/cloudbuild-api.yaml .
+
+# 2. Build and deploy frontend workspace to Cloud Run
+gcloud builds submit --config ops/cloudbuild-frontend.yaml .
 ```
-
-### Test Coverage Summary (226/226 Tests Passing Across 30 Suites)
-* `backend/tests/test_api_auth.py` (Authentication, bearer tokens, RBAC roles: admin, pathologist, technician, viewer, and `/health` aliases)
-* `backend/tests/test_batch4_state_and_concurrency.py` (Row locking, worker skip_locked, orphan recovery, SQLite foreign keys, case cascade deletes, attempt monotonicity)
-* `backend/tests/test_batch5_stain_and_qc.py` (Fitted Macenko deconvolution, tissue mask sampling, degenerate slide handling, 5-check automated QC suite)
-* `backend/tests/test_batch7_report_signing.py` (Report digital signatures, attestation hashes, prior stage gating, password/PIN validation)
-* `backend/tests/test_batch8_grading_pipeline.py` (Tubule formation, nuclear pleomorphism, histologic typing, and Nottingham grade scoring)
-* `backend/tests/test_batch9_mitosis_pipeline.py` (40x tile extraction, YOLO candidate sweeping, HoVer-Net verification, and HPF spatial packing)
-* `backend/tests/test_batch10_triage_pipeline.py` (Path Foundation feature embeddings, linear probe classification, and viridis heatmap overlays)
-* `backend/tests/test_batch11_pipeline_integrity.py` (End-to-end stage state transitions, retry semantics, and input/output ref validation)
-* `backend/tests/test_batch12_reporting_and_validation.py` (CAP synoptic element validation, AJCC 8th/9th staging rules, and narrative consistency)
-* `backend/tests/test_batch14_triage_edge_cases.py` (Zero tumor confirmation, manual hotspot additions/removals, and coordinate boundary clipping)
-* `backend/tests/test_batch15_tiles_and_hpf.py` (DeepZoom tile generation, boundary clamping, and Virtual HPF density sorting)
-* `backend/tests/test_batch16_mitosis_pipeline.py` (MIDOG NMS, high-power reticle calibration, and candidate proximity deduplication)
-* `backend/tests/test_batch17_grading_staging.py` (Dual-level sign-off gating, histologic subtype confirmation, and Nottingham invariants)
-* `backend/tests/test_batch18_reporting_pdf_audit.py` (ReportLab Platypus 3-page layout, NumberedCanvas, RUO banners, audit order tiebreaker)
-* `backend/tests/test_batch19_21_hardening.py` (Pydantic v2 migration, CORS whitelist & regex security, health check endpoints, zero deprecation warnings)
-* `backend/tests/test_cap_reporting.py` (CAP synoptic PDF generation, benign protocols, digital signatures, multi-version immutable amendments)
-* `backend/tests/test_coords.py` (Micron-to-pixel coordinate transforms and geometric scaling)
-* `backend/tests/test_grading.py` (Nottingham grading, MedGemma integration, spatial candidate deduplication across overlapping HPFs)
-* `backend/tests/test_grading_api.py` (Grading review, manual overrides, confirmation lifecycle)
-* `backend/tests/test_hotspots.py` (Triage peak detection and tumor bed ROI extraction)
-* `backend/tests/test_hpf.py` (High-Power Field greedy spatial packing and non-overlap invariants)
-* `backend/tests/test_ingest_fixes.py` (De-identification, MPP validation, needs_mpp calibration state, full-depth DZI generation)
-* `backend/tests/test_mitosis_api.py` (Mitosis review, candidate labeling, HPF synchronization, signed report immutability)
-* `backend/tests/test_morphometrics.py` (Nuclear pleomorphism morphology, nuclear atypia scoring)
-* `backend/tests/test_nms.py` (Non-Maximum Suppression algorithms across optical tiles)
-* `backend/tests/test_qc_checks.py` (Tissue coverage, focus sharpness, marker pen, tissue folds, and stain sanity checks)
-* `backend/tests/test_scoring.py` (Nottingham histologic scoring tables, Elston-Ellis boundary metrics)
-* `backend/tests/test_stain.py` (Pure NumPy Macenko optical density deconvolution)
-* `backend/tests/test_triage_api.py` (Triage review endpoints, draft edit replay)
-* `backend/tests/test_triage_worker.py` (Path Foundation embeddings, linear probe triage, GCS caching)
-
----
-
-### 🎨 Frontend UX, Accessibility & API Hygiene (Batch 6)
-* **DOM Nesting & Case Status Semantics (Issue #685)**: Decoupled interactive `<button>` elements from Next.js `<Link>` wrappers in `cases/page.tsx`, eliminating invalid HTML and erratic screen reader behavior. Case status pills now render dedicated semantic badges (`needs_rescan` in rose, `open` in sky, `done` in emerald).
-* **Single Authoritative Scoring Engine (Issue #227)**: Completely dropped client-side `computeClientScore` duplication in `MitosisViewer.tsx`. All mitotic figures, HPF tallies, and Nottingham scores derive strictly from `POST /api/v1/stages/mitosis/recompute`.
-* **High-Confidence Candidate Gating (Issue #667)**: Rendered an interactive warning banner in the 10-HPF completion summary when unreviewed candidates with $\ge 50\%$ confidence remain outside reviewed fields, backed by a one-click "Bulk Reject Remaining" CTA. Cleaned up dead icon and API imports.
-* **Server-Driven Nottingham Synthesis (Issue #483)**: Wired `recomputeGradingPreview` in `GradingReviewWorkspace.tsx` to dynamically query server-computed grades on override modifications, ensuring client calculations remain synchronized with `configs/scoring.yaml`.
-* **OpenSeadragon Pinning Event Integrity (Issues #223 & #656)**: Replaced non-existent `preventUserAction` with OSD's native `preventDefaultAction` and guarded with `!event.quick`, preventing unwanted zoom on pin clicks and phantom annotations on drag releases. Made hotspot polygons non-intercepting to eliminate slide pan/zoom dead zones.
-* **WAI-ARIA & Keyboard Accessibility (Issue #267)**: Standardized modal dialogs across `GradingReviewWorkspace.tsx` and `ReportWorkspace.tsx` with `role="dialog"`, `aria-modal="true"`, `aria-labelledby`, accessible button labels, and global <kbd>Escape</kbd> dismissal. Linked all synoptic form labels to controls via `htmlFor`/`id` and converted patch thumbnails into keyboard-focusable `<button>` elements.
-
----
-
-## 🔒 Security, Compliance & Auditability
-
-1. **Digital Attestation**: Final diagnostic sign-off is locked with the pathologist's credentials, NPI, and legal attestation text.
-2. **Cryptographic Checksums**: Generates a SHA-256 digest of all report parameters at the exact moment of signature.
-3. **Immutable Audit Ledger**: Every action (`case_created`, `qc_overridden`, `mitosis_reviewed`, `grade_approved`, `report_signed`, `report_amended`) is recorded in the `audit_events` table with user identity and timestamp.
-4. **Data Isolation**: 100% online cloud workflow utilizing partitioned Google Cloud Storage buckets (`oncogemma-dev-raw`, `oncogemma-dev-pyramids`, `oncogemma-dev-artifacts`).
 
 ---
 
