@@ -42,7 +42,9 @@ steps:
       - '--platform=managed'
       - '--allow-unauthenticated'
       - '--add-cloudsql-instances=$PROJECT_ID:$_REGION:oncogemma-dev-psql'
+      - '--update-env-vars=VERTEX_MITOSIS_ENDPOINT_ID=6276949705008087040,VERTEX_MITOSIS_LOCATION=us-central1,USE_GEMINI_FLASH_REFEREE=true,GEMINI_REFEREE_MODEL=gemini-2.5-flash'
     id: 'deploy-api'
+
 
   # 5. Deploy Next.js Frontend to Cloud Run
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
