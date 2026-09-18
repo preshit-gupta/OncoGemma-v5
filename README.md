@@ -110,11 +110,11 @@ flowchart TD
 * **Tissue Segmentation**: Otsu thresholding in HSV color space differentiates cellular tissue parenchyma from background glass and empty lumina.
 * **5-Check Automated Pre-Flight QC**:
   * **Tissue Coverage**: Verifies tissue area percentage against diagnostic thresholds.
-  * **Focus Sharpness**: Variance of Laplacian kernel detects blurred fields ($<45.0$).
+  * **Focus Sharpness**: Variance of Laplacian kernel detects blurred fields (< 45.0).
   * **Marker Pen Detection**: Segmented color-space analysis flags diagnostic interference from surgical ink.
   * **Tissue Folds & Tears**: Morphological skeleton analysis identifies mechanical fold ridges.
   * **Stain Sanity**: Assesses Hematoxylin-to-Eosin optical density balance and concentration boundaries.
-* **Fitted Macenko Stain Normalization**: Transforms slide optical density using fitted source stain matrices and calibrated reference targets ($W_{\text{target}}$: Hematoxylin $[0.644, 0.717, 0.267]$, Eosin $[0.093, 0.954, 0.283]$), ensuring consistent color fidelity across scanners.
+* **Fitted Macenko Stain Normalization**: Transforms slide optical density using fitted source stain matrices and calibrated reference targets (`W_target`: Hematoxylin `[0.644, 0.717, 0.267]`, Eosin `[0.093, 0.954, 0.283]`), ensuring consistent color fidelity across scanners.
 
 ---
 
@@ -135,7 +135,7 @@ flowchart TD
     K -->|"No + no_invasive_tumor=True"| M["Benign Protocol -> Skip to Stage 6 Report"]
 ```
 * **Live Google Path Foundation Integration**: Connected to a dedicated Vertex AI Vision Transformer (ViT) endpoint (`asia-south1`), streaming optical patches to produce 384-dimensional representation vectors.
-* **Calibrated Linear Probe**: Predicts tumor probability scores ($P(\text{invasive carcinoma})$) per tile to localize active tumor margins.
+* **Calibrated Linear Probe**: Predicts tumor probability scores P(invasive carcinoma) per tile to localize active tumor margins.
 * **Fluid Viridis Heatmap Overlay**: High-resolution RGBA probability overlay registered with slide coordinates. Pathologists adjust opacity dynamically (10%–100%) with non-destructive client-side rendering.
 * **Interactive Hotspot Workspace**: Allows pathologists to inspect candidate regions of interest (ROIs), adjust contour thresholds, manually add/delete ROIs, or confirm benign slides via explicit zero-tumor verification.
 
@@ -158,12 +158,12 @@ flowchart TD
     K -->|"Keyboard Hotkeys (M: Mitosis, X: Reject)"| M["Pathologist Confirmation Gate"]
     M --> N["Confirm 10 HPFs -> Queue Stage 5 Grading"]
 ```
-* **True 40× Optical Magnification ($0.25\text{--}0.28\,\mu\text{m/px}$)**: Extracts authentic high-power optical patches across standard $577\,\mu\text{m}$ fields, enabling clear visualization of nuclear chromatin, spindle poles, and cell boundaries.
+* **True 40× Optical Magnification (0.25–0.28 µm/px)**: Extracts authentic high-power optical patches across standard 577 µm fields, enabling clear visualization of nuclear chromatin, spindle poles, and cell boundaries.
 * **MICCAI MIDOG-Standard 20 µm NMS**: Implements physical micrometer Non-Maximum Suppression (intra-tile and global) to eliminate multi-pole duplicate detections.
-* **Van Diest & WHO Morphological Filtering**: Automatically suppresses apoptosis (retraction halos) and normal lymphocytes ($5\text{--}7\,\mu\text{m}$), verifying true mitotic features (spicules, jagged arms, envelope breakdown).
-* **MedGemma Multimodal Referee**: Mandatory cross-check adjudication on candidate figures using dual-magnification views ($40\times$ focus crop + $10\times$ HPF context).
-* **Tissue Density–Conscious HPF Selection**: Selects 10 standardized Virtual High-Power Fields ($2.157\,\text{mm}^2$ total area) restricted to $\ge 70\%$ tissue cellularity, preventing HPF placement in fat, glass, or necrosis.
-* **Interactive Pathologist Studio**: Ergonomic review canvas with spacebar magnification toggle ($10\times \leftrightarrow 40\times$), candidate auto-centering, and rapid keyboard hotkeys (<kbd>M</kbd> Confirm, <kbd>X</kbd> Reject).
+* **Van Diest & WHO Morphological Filtering**: Automatically suppresses apoptosis (retraction halos) and normal lymphocytes (5–7 µm), verifying true mitotic features (spicules, jagged arms, envelope breakdown).
+* **MedGemma Multimodal Referee**: Mandatory cross-check adjudication on candidate figures using dual-magnification views (40× focus crop + 10× HPF context).
+* **Tissue Density-Conscious HPF Selection**: Selects 10 standardized Virtual High-Power Fields (2.157 mm² total area) restricted to ≥ 70% tissue cellularity, preventing HPF placement in fat, glass, or necrosis.
+* **Interactive Pathologist Studio**: Ergonomic review canvas with spacebar magnification toggle (10× ↔ 40×), candidate auto-centering, and rapid keyboard hotkeys (<kbd>M</kbd> Confirm, <kbd>X</kbd> Reject).
 
 ---
 
@@ -187,15 +187,17 @@ flowchart TD
     K -->|"Dual-Level Sign-Off Gate"| L["Explicit Confirmation of Patches & Histologic Subtype"]
     L -->|"Commit to DB (CHECK Constraint Enforced)"| M["Persist to gradings Table + Audit Event -> Advance to Stage 6"]
 ```
-* **Continuous Density Hotspot Sampling**: Extracts 24 stratified $10\times$ evidence patches ($512\times 512\,\mu\text{m}$) from peak cellularity zones of confirmed Stage 3 hotspots ($\ge 384\,\mu\text{m}$ separation).
+* **Continuous Density Hotspot Sampling**: Extracts 24 stratified 10× evidence patches (512 × 512 µm) from peak cellularity zones of confirmed Stage 3 hotspots (≥ 384 µm separation).
 * **Multimodal Nottingham Evaluation**:
-  * **Tubule Formation**: Quantifies glandular/tubular lumen percentage ($>75\% \to 1$, $10\text{--}75\% \to 2$, $<10\% \to 3$).
-  * **Nuclear Pleomorphism**: Assesses nuclear variation, chromatin clump size, and nucleoli (Uniform $\to 1$, Moderate $\to 2$, Marked $\to 3$).
+  * **Tubule Formation**: Quantifies glandular/tubular lumen percentage (> 75% → Score 1, 10%–75% → Score 2, < 10% → Score 3).
+  * **Nuclear Pleomorphism**: Assesses nuclear variation, chromatin clump size, and nucleoli (Uniform → Score 1, Moderate → Score 2, Marked → Score 3).
   * **Histologic Subtype**: Multi-patch consensus classification (IDC-NST vs. ILC vs. Special Types).
 * **Dual-Level Pathologist Sign-Off Gating**: Requires explicit confirmation of individual evidence patches and overall histologic subtype prior to stage approval.
 * **Deterministic Grade Aggregation**:
-  $$\text{Nottingham Sum} = \text{Score}_{\text{Tubule}} + \text{Score}_{\text{Pleo}} + \text{Score}_{\text{Mitosis}} \quad (\text{Range: } 3\text{--}9)$$
-  $$\text{Grade} = \begin{cases} \text{Grade 1 (Well Differentiated)} & 3 \le \text{Sum} \le 5 \\ \text{Grade 2 (Moderately Differentiated)} & 6 \le \text{Sum} \le 7 \\ \text{Grade 3 (Poorly Differentiated)} & 8 \le \text{Sum} \le 9 \end{cases}$$
+  * **Nottingham Sum** = Tubule Score + Pleomorphism Score + Mitotic Score (Range: 3–9)
+  * **Grade 1 (Well Differentiated)**: Nottingham Sum 3–5
+  * **Grade 2 (Moderately Differentiated)**: Nottingham Sum 6–7
+  * **Grade 3 (Poorly Differentiated)**: Nottingham Sum 8–9
 
 ---
 
@@ -225,7 +227,7 @@ flowchart TD
   * **Page 1**: Case Demographics, Stamped Accession UUID, Final Synoptic Diagnosis, and CAP Elements Table.
   * **Page 2**: Microscopic Findings, MedGemma Clinical Narrative, Key Visual Evidence (WSI Heatmap, Top Mitotic HPF, Grading Patch), and Pathologist Attestation Block.
   * **Page 3**: Clinical Appendix & Provenance (RUO Amber Warning Banner, Model Fingerprints, Reviewer Audit Trail, and Version History).
-* **Digital Sign-Off & Immutability**: PIN-authenticated sign-off generates a cryptographic SHA-256 integrity seal. Signed reports are permanently locked; updates require the formal versioned amendment workflow (`v1.0` $\to$ `v1.1`).
+* **Digital Sign-Off & Immutability**: PIN-authenticated sign-off generates a cryptographic SHA-256 integrity seal. Signed reports are permanently locked; updates require the formal versioned amendment workflow (`v1.0` → `v1.1`).
 
 
 ---
@@ -234,11 +236,14 @@ flowchart TD
 
 | Feature | Score 1 | Score 2 | Score 3 |
 | :--- | :--- | :--- | :--- |
-| **Tubule Formation** | $>75\%$ of tumor area | $10\% - 75\%$ of tumor area | $<10\%$ of tumor area |
+| **Tubule Formation** | > 75% of tumor area | 10% – 75% of tumor area | < 10% of tumor area |
 | **Nuclear Pleomorphism** | Small, regular, uniform | Moderate variation in size & shape | Marked variation, prominent nucleoli |
-| **Mitotic Count** ($2.157\,\text{mm}^2$) | $< 8$ mitotic figures | $8 - 15$ mitotic figures | $\ge 16$ mitotic figures |
+| **Mitotic Count** (2.157 mm²) | < 8 mitotic figures | 8 – 15 mitotic figures | ≥ 16 mitotic figures |
 
-$$\textbf{Combined Nottingham Score: } 3\text{--}5 \implies \textbf{Grade 1} \quad\vert\quad 6\text{--}7 \implies \textbf{Grade 2} \quad\vert\quad 8\text{--}9 \implies \textbf{Grade 3}$$
+> **Combined Nottingham Score:**
+> * **3 – 5** ➔ **Grade 1** (Well Differentiated)
+> * **6 – 7** ➔ **Grade 2** (Moderately Differentiated)
+> * **8 – 9** ➔ **Grade 3** (Poorly Differentiated)
 
 ---
 
@@ -259,8 +264,8 @@ Every documented finding from the comprehensive system audit has been systematic
    - In-process background daemon recovers orphaned tasks (>300s) automatically.
    - Autonomous state rehydration restores active cases from GCS artifacts across ephemeral container restarts.
 4. **Optical Accuracy & Diagnostic Precision**:
-   - Resolved HPF scale mismatch: calibrated patches align 1:1 with candidate beacons at $40\times$ ($577\,\mu\text{m}$ field).
-   - MIDOG $20\,\mu\text{m}$ spatial NMS and Van Diest criteria eliminate false duplicate figure counts.
+   - Resolved HPF scale mismatch: calibrated patches align 1:1 with candidate beacons at 40× (577 µm field).
+   - MIDOG 20 µm spatial NMS and Van Diest criteria eliminate false duplicate figure counts.
 5. **Modernization & Code Hygiene (Batches 19–21)**:
    - Full migration to Pydantic v2 (`SettingsConfigDict`, `ConfigDict(from_attributes=True)`), eliminating all `PydanticDeprecatedSince20` warnings.
    - Strict CORS whitelist and Cloud Run subdomain regex (`allow_origin_regex=r"^https://.*\.run\.app$"`), closing wildcard credentials vulnerabilities (#3).
