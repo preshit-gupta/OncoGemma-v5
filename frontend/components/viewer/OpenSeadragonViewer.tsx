@@ -334,7 +334,8 @@ export function OpenSeadragonViewer({
   // Synchronously update opacities between Original and Normalized 10x layers
   const updateLayerOpacities = useCallback(() => {
     const is10xExceeded = currentMag > 10.0;
-    const showNorm = activeLayer === "norm" && !is10xExceeded;
+    const hasNorm = Boolean(normItemRef.current);
+    const showNorm = activeLayer === "norm" && !is10xExceeded && hasNorm;
 
     if (origItemRef.current && typeof origItemRef.current.setOpacity === "function") {
       origItemRef.current.setOpacity(showNorm ? 0.0 : 1.0);
@@ -482,14 +483,26 @@ export function OpenSeadragonViewer({
         return;
       }
 
-      // If overlay is disabled (!showOverlay) or no URI, cleanly remove all overlay items (index >= 1)
-      if (!showOverlay || !overlayImageUri) {
-        while (world.getItemCount() > 1) {
-          const item = world.getItemAt(world.getItemCount() - 1);
-          try {
-            world.removeItem(item);
-          } catch (_) {}
+      // Function to safely purge ONLY heatmap overlay items without touching orig/norm slide layers
+      const purgeHeatmapOverlays = (exceptItem?: any) => {
+        for (let i = world.getItemCount() - 1; i >= 0; i--) {
+          const item = world.getItemAt(i);
+          if (
+            item &&
+            item !== origItemRef.current &&
+            item !== normItemRef.current &&
+            item !== exceptItem
+          ) {
+            try {
+              world.removeItem(item);
+            } catch (_) {}
+          }
         }
+      };
+
+      // If overlay is disabled (!showOverlay) or no URI, cleanly remove all heatmap overlay items
+      if (!showOverlay || !overlayImageUri) {
+        purgeHeatmapOverlays();
         overlayItemRef.current = null;
         currentOverlayUriRef.current = null;
         isAddingOverlayRef.current = false;
@@ -509,13 +522,8 @@ export function OpenSeadragonViewer({
         (!overlayItemRef.current && !isAddingOverlayRef.current);
 
       if (needsLoad) {
-        // Clean up any stale overlay items before loading a new one
-        while (world.getItemCount() > 1) {
-          const item = world.getItemAt(world.getItemCount() - 1);
-          try {
-            world.removeItem(item);
-          } catch (_) {}
-        }
+        // Clean up any stale heatmap overlays before loading a new one
+        purgeHeatmapOverlays();
         overlayItemRef.current = null;
 
         isAddingOverlayRef.current = true;
@@ -565,15 +573,8 @@ export function OpenSeadragonViewer({
                 return;
               }
 
-              // Remove any other older overlay items so there is never a duplicate
-              for (let i = world.getItemCount() - 1; i >= 1; i--) {
-                const existingItem = world.getItemAt(i);
-                if (existingItem !== event.item) {
-                  try {
-                    world.removeItem(existingItem);
-                  } catch (_) {}
-                }
-              }
+              // Remove any other older heatmap overlays, keeping event.item, orig, and norm
+              purgeHeatmapOverlays(event.item);
 
               overlayItemRef.current = event.item;
               currentOverlayUriRef.current = uriToLoad;
