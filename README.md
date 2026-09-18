@@ -43,11 +43,12 @@ flowchart TD
     end
 
     subgraph S4["Stage 4: Mitosis Detection & Virtual HPFs"]
-        F3 --> A4["True 40x Optical Candidate Sweep"]
-        A4 --> B4["Van Diest Morphological Mimic Filtering & MedGemma Referee"]
+        F3 --> A4["Vertex AI MIDOG GPU Detector (0.25 µm/px 40x Sweep)"]
+        A4 --> B4["Gemini 2.5 Flash Van Diest Multimodal Referee"]
         B4 --> C4["Density-Conscious 10-HPF Spatial Convolution"]
-        C4 --> D4["Pathologist Mitosis Studio (Score 1/2/3)"]
+        C4 --> D4["Pathologist Mitosis Studio (Nottingham Score 1/2/3)"]
     end
+
 
     subgraph S5["Stage 5: Nottingham Histologic Grading"]
         D4 --> A5["24 Stratified 10x Evidence Patch Extraction"]
@@ -162,26 +163,31 @@ flowchart TD
 ### Stage 4: High-Power Mitosis Studio & Virtual HPF Placement
 ```mermaid
 flowchart TD
-    A["Confirmed Stage 3 Hotspots"] -->|"Enumerate 40x Tiles (0.25 µm/px)"| B["Macenko Stain Normalization Transform"]
-    B --> C["First-Pass Sweep: YOLOv8 Mitosis Detector (High Recall)"]
-    C -->|"Intra-Tile & Global 20 µm Spatial NMS"| D["Deduplicated Candidate Mitotic Centroids"]
-    D -->|"Extract 128x128 Focus Crops"| E["Second-Pass Verification: HoVer-Net Nuclear Segmenter"]
-    E -->|"Spicule Variance & Envelope Breakdown"| F["Candidate Scoring & Morphology Filters"]
-    F -->|"Apoptosis & Lymphocyte Rejection"| G["Van Diest Morphological Mimic Filter"]
-    G -->|"Dual-Magnification Inputs (40x Focus + 10x HPF)"| H["MedGemma 1.5 Multimodal Referee Adjudication"]
-    H -->|"Parenchymal Tissue Ratio >= 70%"| I["Density-Conscious 10 Virtual HPF Convolution (r=262 µm)"]
-    I -->|"Point-in-Circle Mitotic Figure Count"| J["Live Elston-Ellis Nottingham Mitotic Score"]
-    J --> K["Pathologist Mitosis Studio (MitosisViewer.tsx)"]
-    K -->|"Spacebar 10x <-> 40x Toggle & Reticle"| L["Sub-Cellular Chromatin & Spindle Pole Inspection"]
-    K -->|"Keyboard Hotkeys (M: Mitosis, X: Reject)"| M["Pathologist Confirmation Gate"]
-    M --> N["Confirm 10 HPFs -> Queue Stage 5 Grading"]
+    A["Confirmed Stage 3 Hotspots (hs_01 to hs_10)"] -->|"Enumerate 40x Tiles (0.25 µm/px)"| B["Macenko Stain Normalization Transform"]
+    B --> C["First-Pass Detector: Vertex AI MIDOG / KongNet GPU Endpoint"]
+    C -->|"Physical 20 µm Spatial NMS (Deduplicate Multi-Poles)"| D["Deduplicated Candidate Mitotic Figures"]
+    D -->|"Dual-Magnification Composite (40x Focus + 10x Architectural)"| E["Second-Pass Referee: Gemini 2.5 Flash Multimodal Engine"]
+    E -->|"Clinical Van Diest & WHO 5th Edition Gating"| F{"Referee Verdict"}
+    F -->|"Reject Pyknotic Fragments + Retraction Halos"| G1["Apoptotic Bodies Filtered"]
+    F -->|"Reject Intact Nuclear Membrane (<7 µm)"| G2["Resting Lymphocytes Filtered"]
+    F -->|"Confirmed: Envelope Dissolved + Spiculation"| H["Adjudicated Mitoses & Centroids"]
+    H -->|"Preserve Manual Pathologist Edits Across Pipeline Runs"| I["Deterministic SQLite / PostgreSQL Persistence"]
+    I -->|"Parenchymal Tissue Ratio >= 70%"| J["Density-Conscious 10 Virtual HPF Convolution (r=262 µm)"]
+    J -->|"Point-in-Circle Mitotic Count & Area Normalization"| K["Live Elston-Ellis Nottingham Mitotic Score"]
+    K --> L["Pathologist Mitosis Studio (MitosisViewer.tsx)"]
+    L -->|"Live Model Provenance (MIDOG Vertex AI + Gemini Flash)"| M["Interactive Review & Reticle Inspection"]
+    M -->|"Keyboard Hotkeys (M: Mitosis, X: Reject)"| N["Pathologist Confirmation Gate -> Queue Stage 5 Grading"]
 ```
-* **True 40× Optical Magnification (0.25–0.28 µm/px)**: Extracts authentic high-power optical patches across standard 577 µm fields, enabling clear visualization of nuclear chromatin, spindle poles, and cell boundaries.
-* **MICCAI MIDOG-Standard 20 µm NMS**: Implements physical micrometer Non-Maximum Suppression (intra-tile and global) to eliminate multi-pole duplicate detections.
-* **Van Diest & WHO Morphological Filtering**: Automatically suppresses apoptosis (retraction halos) and normal lymphocytes (5–7 µm), verifying true mitotic features (spicules, jagged arms, envelope breakdown).
-* **MedGemma Multimodal Referee**: Mandatory cross-check adjudication on candidate figures using dual-magnification views (40× focus crop + 10× HPF context).
-* **Tissue Density-Conscious HPF Selection**: Selects 10 standardized Virtual High-Power Fields (2.157 mm² total area) restricted to ≥ 70% tissue cellularity, preventing HPF placement in fat, glass, or necrosis.
-* **Interactive Pathologist Studio**: Ergonomic review canvas with spacebar magnification toggle (10× ↔ 40×), candidate auto-centering, and rapid keyboard hotkeys (<kbd>M</kbd> Confirm, <kbd>X</kbd> Reject).
+* **Cloud-Hosted Deep Learning Mitosis Detector (Vertex AI)**: Integrates a dedicated GPU-backed MICCAI MIDOG benchmark model (`midog-kongnet-v1-gpu-deploy` on NVIDIA Tesla T4, endpoint `6276949705008087040`) hosted on Google Cloud Vertex AI. Executes high-throughput 40× tile sweeps (`0.25 µm/px`), streaming JPEG payloads and returning deep-learning bounding boxes `(cx, cy, confidence)`.
+* **Physical 20 µm Spatial NMS**: Applies physical micrometer-scale Non-Maximum Suppression (both intra-tile and global slide coordinates) to eliminate duplicate detections on multi-polar dividing cells without relying on arbitrary pixel thresholds.
+* **Dual-Magnification Multimodal Referee (Gemini 2.5 Flash)**: Zero-shot visual adjudication applying strict **van Diest & WHO 5th Edition** criteria to dual-magnification composites:
+  * **40× High-Power Crop ($128 \times 128\,\mu\text{m}$)**: Evaluates sub-cellular features—nuclear envelope breakdown, hairy chromatin projections, and absence of nuclear membranes.
+  * **10× Context Field ($512 \times 512\,\mu\text{m}$)**: Evaluates architectural environment—differentiating invasive carcinoma nests from benign stroma, fat, or inflammation.
+* **Clinical Mimic Suppression**: Systematically rejects hyperchromatic resting lymphocytes (smooth contours, intact membranes, 5–7 µm diameter) and apoptotic bodies (pyknotic chromatin fragments surrounded by clear retraction halos).
+* **Pathologist Review Preservation & Immutability**: Pipeline re-runs strictly isolate and purge model-generated detections (`label_source == "model"`). Pathologist-confirmed mitoses, manual reclassifications, and user-added figures (`label_source == "pathologist"`) are permanently preserved in PostgreSQL/SQLite.
+* **Standardized 10 Virtual HPFs & Nottingham Scoring**: Places 10 standardized high-power circular fields ($r = 262\,\mu\text{m}$, total area $2.157\,\text{mm}^2$) strictly in high-cellularity zones ($\ge 70\%$ parenchyma). Computes standardized density ($\text{mitoses}/\text{mm}^2$) and deterministic Nottingham score: Score 1 ($<3.65/\text{mm}^2$), Score 2 ($3.65 - 7.30/\text{mm}^2$), Score 3 ($\ge 7.30/\text{mm}^2$).
+* **Truthful Model Provenance & Ergonomic Studio**: The UI exposes real-time model fingerprints (`vertex_ai_midog@6276949705008087040 | gemini-2.5-flash@van_diest`), displays an automatic amber fallback alert banner whenever running in heuristic fallback mode, and offers rapid review workflows with spacebar magnification toggle (10× ↔ 40×) and keyboard hotkeys (<kbd>M</kbd> Mitosis, <kbd>X</kbd> Reject).
+
 
 ---
 
