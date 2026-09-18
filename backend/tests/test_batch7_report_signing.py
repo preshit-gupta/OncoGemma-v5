@@ -409,13 +409,13 @@ def test_signed_report_immutability_put_and_worker():
     db.close()
 
     case_id = str(case_uid)
-    # 1. Attempting PUT on signed report must return 400
+    # 1. Attempting PUT on signed report must return 409 Conflict (#187)
     res_put = client.put(
         f"/api/v1/stages/report/{case_id}",
         json={"case_id": case_id, "tumor_size_mm": 25.0},
         headers={"X-User-Role": "pathologist"}
     )
-    assert res_put.status_code == 400
+    assert res_put.status_code == 409
     assert "already signed and locked" in res_put.json()["detail"]
 
     # 2. Worker execution on signed report must skip re-running and not overwrite

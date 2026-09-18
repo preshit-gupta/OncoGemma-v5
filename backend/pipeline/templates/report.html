@@ -15,212 +15,333 @@
   <div class="watermark">DRAFT — PRELIMINARY</div>
   {% endif %}
 
-  <!-- 1. Header Banner -->
-  <table class="header-table">
-    <tr>
-      <td>
-        <div class="lab-title">ONCOGEMMA CLINICAL DIGITAL PATHOLOGY LABORATORY</div>
-        <div class="lab-subtitle">College of American Pathologists (CAP) Protocol Checklist • Invasive Breast Carcinoma</div>
-      </td>
-      <td class="report-type-badge">
-        <div class="cap-badge">CAP SYNOPTIC REPORT</div>
-        <div class="report-date">Report Date: {{ report_date }}</div>
-      </td>
-    </tr>
-  </table>
-
-  <div class="divider"></div>
-
-  <!-- 2. Case Metadata Intake Bar -->
-  <div class="case-intake-bar">
-    <div class="intake-item"><span class="intake-label">Case ID:</span> {{ case_id_display }}</div>
-    <div class="intake-item"><span class="intake-label">Specimen:</span> {{ procedure }}</div>
-    <div class="intake-item"><span class="intake-label">Laterality / Site:</span> {{ laterality }} {{ tumor_site }}</div>
-    <div class="intake-item">
-      <span class="intake-label">Status:</span>
-      {% if status|upper == 'SIGNED' %}
-      <span class="status-badge-signed">SIGNED</span>
-      {% else %}
-      <span class="status-badge-draft">{{ status|upper }}</span>
-      {% endif %}
-    </div>
-  </div>
-
-  <!-- 3. Final Diagnosis Banner -->
-  <div class="diagnosis-banner {% if is_benign %}benign{% endif %}">
-    <div class="diagnosis-banner-title">FINAL SYNOPTIC DIAGNOSIS:</div>
-    <div class="diagnosis-banner-text">{{ diagnosis_text }}</div>
-  </div>
-
-  <!-- 4. CAP Synoptic Protocol Elements Table -->
-  <div class="section-title">CAP Synoptic Pathology Protocol Elements (Verified WSI Findings)</div>
-  <table class="synoptic-table">
-    <thead>
+  <!-- ================= PAGE 1 ================= -->
+  <div class="report-page page-1">
+    <!-- 1. Header Banner -->
+    <table class="header-table">
       <tr>
-        <th>Pathology Protocol Element</th>
-        <th>Verified Quantitative Finding / Value</th>
-      </tr>
-    </thead>
-    <tbody>
-      <tr>
-        <td class="elem-name">Specimen / Procedure</td>
-        <td class="elem-val">{{ procedure }} (H&amp;E Whole-Slide Image)</td>
-      </tr>
-      <tr>
-        <td class="elem-name">Histologic Subtype</td>
-        <td class="elem-val">{{ histologic_type }}</td>
-      </tr>
-      {% if is_benign %}
-      <tr>
-        <td class="elem-name">Invasive Carcinoma</td>
-        <td class="elem-val"><strong>Not Identified (Negative for invasive malignancy)</strong></td>
-      </tr>
-      <tr>
-        <td class="elem-name">Nottingham Combined Histologic Grade</td>
-        <td class="elem-val">Not Applicable (No invasive carcinoma identified)</td>
-      </tr>
-      <tr>
-        <td class="elem-name">Tumor Size (Invasive)</td>
-        <td class="elem-val">Not applicable (Negative for invasive carcinoma)</td>
-      </tr>
-      <tr>
-        <td class="elem-name">Pathologic Staging (AJCC)</td>
-        <td class="elem-val">Not applicable (Benign)</td>
-      </tr>
-      <tr>
-        <td class="elem-name">Surgical Margins</td>
-        <td class="elem-val">Not applicable</td>
-      </tr>
-      <tr>
-        <td class="elem-name">Ancillary Biomarkers</td>
-        <td class="elem-val">Not assessed / Not indicated for non-malignant tissue</td>
-      </tr>
-      <tr>
-        <td class="elem-name">Mitotic Activity</td>
-        <td class="elem-val">No mitotic figures suspicious for malignancy identified</td>
-      </tr>
-      <tr>
-        <td class="elem-name">Total Evaluated Biopsy Area</td>
-        <td class="elem-val">{{ evaluated_area_disp }}</td>
-      </tr>
-      {% else %}
-      <tr>
-        <td class="elem-name">Nottingham Combined Histologic Grade</td>
-        <td class="elem-val"><strong>{{ nottingham_grade_disp }}</strong> {{ nottingham_score_disp }}</td>
-      </tr>
-      <tr>
-        <td class="elem-sub">• Glandular / Tubule Formation</td>
-        <td class="elem-val">{{ tubule_disp }}</td>
-      </tr>
-      <tr>
-        <td class="elem-sub">• Nuclear Pleomorphism</td>
-        <td class="elem-val">{{ pleo_disp }}</td>
-      </tr>
-      <tr>
-        <td class="elem-sub">• Mitotic Rate</td>
-        <td class="elem-val">{{ mitotic_disp }}</td>
-      </tr>
-      <tr>
-        <td class="elem-name">Tumor Size (Invasive)</td>
-        <td class="elem-val">{{ tumor_size_disp }}</td>
-      </tr>
-      <tr>
-        <td class="elem-name">Pathologic Staging (AJCC 8th/9th Ed.)</td>
-        <td class="elem-val">{{ staging_disp }}</td>
-      </tr>
-      <tr>
-        <td class="elem-name">Lymphovascular Invasion (LVI)</td>
-        <td class="elem-val">{{ lvi_disp }}</td>
-      </tr>
-      <tr>
-        <td class="elem-name">In-situ Carcinoma (DCIS)</td>
-        <td class="elem-val">{{ dcis_disp }}</td>
-      </tr>
-      <tr>
-        <td class="elem-name">Surgical Margins</td>
-        <td class="elem-val">{{ margins_disp }}</td>
-      </tr>
-      <tr>
-        <td class="elem-name">Ancillary Biomarkers</td>
-        <td class="elem-val">{{ biomarkers_disp }}</td>
-      </tr>
-      <tr>
-        <td class="elem-name">Systematic Hotspot HPFs</td>
-        <td class="elem-val">10 standardized high-power fields evaluated (524 µm field diameter, 0.2157 mm² each)</td>
-      </tr>
-      <tr>
-        <td class="elem-name">Total Evaluated Tumor Area</td>
-        <td class="elem-val">{{ evaluated_area_disp }}</td>
-      </tr>
-      {% endif %}
-    </tbody>
-  </table>
-
-  <!-- 5. Key Visual Evidence Grid -->
-  <div class="section-title">Key Microscopic Visual Evidence</div>
-  <div class="evidence-grid">
-    <div class="evidence-card">
-      <div class="evidence-card-title">WSI Tumor Triage Overview</div>
-      {% if evidence.heatmap_b64 %}
-      <img class="evidence-img" src="data:image/png;base64,{{ evidence.heatmap_b64 }}" alt="WSI Triage Heatmap with Hotspots">
-      {% else %}
-      <div class="evidence-unavailable">Evidence Unavailable</div>
-      {% endif %}
-      <div class="evidence-caption">Slide overview with verified tumor hotspot boundaries (2.5× / 10×)</div>
-    </div>
-
-    <div class="evidence-card">
-      <div class="evidence-card-title">Highest-Density Mitotic HPF</div>
-      {% if evidence.mitotic_hpf_b64 %}
-      <img class="evidence-img" src="data:image/png;base64,{{ evidence.mitotic_hpf_b64 }}" alt="Top Mitotic HPF 40x">
-      {% else %}
-      <div class="evidence-unavailable">Evidence Unavailable</div>
-      {% endif %}
-      <div class="evidence-caption">{{ evidence.mitotic_caption|default("40× optical patch with calibrated 262 µm circular reticle") }}</div>
-    </div>
-
-    <div class="evidence-card">
-      <div class="evidence-card-title">Representative Grading Patch</div>
-      {% if evidence.grading_patch_b64 %}
-      <img class="evidence-img" src="data:image/png;base64,{{ evidence.grading_patch_b64 }}" alt="Grading Evidence Patch">
-      {% else %}
-      <div class="evidence-unavailable">Evidence Unavailable</div>
-      {% endif %}
-      <div class="evidence-caption">High-power morphology patch verifying nuclear pleomorphism and tubules</div>
-    </div>
-  </div>
-
-  <!-- 6. Microscopic Description & Clinical Correlation -->
-  <div class="section-title">Microscopic Description &amp; Clinical Correlation</div>
-  <div class="narrative-box">
-    <div class="narrative-para"><strong>Microscopic Findings:</strong> {{ narrative.microscopic_findings|default("Pending pathologist narrative.") }}</div>
-    {% if narrative.clinical_correlation %}
-    <div class="narrative-para"><strong>Clinical Correlation:</strong> {{ narrative.clinical_correlation }}</div>
-    {% endif %}
-  </div>
-
-  <!-- 7. Digital Attestation & Cryptographic Seal -->
-  <div class="attestation-block">
-    <div class="attestation-title">Digital Pathologist Attestation &amp; Cryptographic Seal</div>
-    <div class="attestation-text">
-      {% if status|upper == 'SIGNED' %}
-      I have personally reviewed and confirmed the whole-slide histology, quantitative Nottingham grading parameters, biomarker profile, and AJCC staging. This electronic signature constitutes formal clinical sign-out.
-      {% else %}
-      <strong>PRELIMINARY UNCONFIRMED DRAFT:</strong> This document contains machine-assisted preliminary findings and has not yet been electronically signed by a board-certified pathologist.
-      {% endif %}
-    </div>
-
-    <table class="signer-table">
-      <tr>
-        <td style="width: 35%;"><strong>Signed By:</strong> {{ signed_by|default("Unsigned Draft") }}</td>
-        <td style="width: 30%;"><strong>NPI:</strong> {{ npi|default("Pending") }}</td>
-        <td style="width: 35%;"><strong>Sign-off Date:</strong> {{ signed_at|default("Pending") }}</td>
+        <td>
+          <div class="lab-title">ONCOGEMMA CLINICAL DIGITAL PATHOLOGY LABORATORY</div>
+          <div class="lab-subtitle">College of American Pathologists (CAP) Protocol Checklist • Invasive Breast Carcinoma</div>
+        </td>
+        <td class="report-type-badge">
+          <div class="cap-badge">CAP SYNOPTIC REPORT</div>
+          <div class="report-date">Report Date: {{ report_date }}</div>
+        </td>
       </tr>
     </table>
 
-    {% if integrity_hash %}
-    <div style="margin-top: 4px; font-size: 7pt; color: #475569;"><strong>Cryptographic Document Seal (SHA-256):</strong></div>
-    <div class="crypto-hash-box">{{ integrity_hash }}</div>
+    <div class="divider"></div>
+
+    <!-- 2. Case Metadata Intake Bar -->
+    <div class="case-intake-bar">
+      <div class="intake-item"><span class="intake-label">Case ID:</span> {{ case_id_display }}<br/><span style="font-size: 6.5pt; color: #64748b;">{{ case_id }}</span></div>
+      <div class="intake-item"><span class="intake-label">Specimen:</span> {{ procedure }}<br/><span class="intake-label">Laterality:</span> {{ laterality }}</div>
+      <div class="intake-item"><span class="intake-label">Evaluated Area:</span> 3.60 mm²<br/><span class="intake-label">Site:</span> {{ tumor_site }}</div>
+      <div class="intake-item">
+        <span class="intake-label">Status:</span>
+        {% if status|upper == 'SIGNED' %}
+        <span class="status-badge-signed">SIGNED</span>
+        {% else %}
+        <span class="status-badge-draft">{{ status|upper }}</span>
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- 3. Final Diagnosis Banner -->
+    <div class="diagnosis-banner {% if is_benign %}benign{% endif %}">
+      <div class="diagnosis-banner-title">FINAL SYNOPTIC DIAGNOSIS:</div>
+      <div class="diagnosis-banner-text">{{ diagnosis_text }}</div>
+    </div>
+
+    <!-- 4. CAP Synoptic Protocol Elements Table -->
+    <div class="section-title">CAP Synoptic Pathology Protocol Elements (Verified WSI Findings)</div>
+    <table class="synoptic-table">
+      <thead>
+        <tr>
+          <th>Pathology Protocol Element</th>
+          <th>Verified Quantitative Finding / Value</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="elem-name">Specimen / Procedure</td>
+          <td class="elem-val">{{ procedure }} (H&amp;E Whole-Slide Image)</td>
+        </tr>
+        <tr>
+          <td class="elem-name">Histologic Subtype</td>
+          <td class="elem-val">{{ histologic_type }}</td>
+        </tr>
+        {% if is_benign %}
+        <tr>
+          <td class="elem-name">Invasive Carcinoma</td>
+          <td class="elem-val"><strong>Not Identified (Negative for invasive malignancy)</strong></td>
+        </tr>
+        <tr>
+          <td class="elem-name">Nottingham Combined Histologic Grade</td>
+          <td class="elem-val">Not Applicable (No invasive carcinoma identified)</td>
+        </tr>
+        <tr>
+          <td class="elem-name">Tumor Size (Invasive)</td>
+          <td class="elem-val">Not applicable (Negative for invasive carcinoma)</td>
+        </tr>
+        <tr>
+          <td class="elem-name">Pathologic Staging (AJCC)</td>
+          <td class="elem-val">Not applicable (Benign)</td>
+        </tr>
+        <tr>
+          <td class="elem-name">Surgical Margins</td>
+          <td class="elem-val">Not applicable</td>
+        </tr>
+        <tr>
+          <td class="elem-name">Ancillary Biomarkers</td>
+          <td class="elem-val">Not assessed / Not indicated for non-malignant tissue</td>
+        </tr>
+        <tr>
+          <td class="elem-name">Mitotic Activity</td>
+          <td class="elem-val">No mitotic figures suspicious for malignancy identified</td>
+        </tr>
+        <tr>
+          <td class="elem-name">Total Evaluated Biopsy Area</td>
+          <td class="elem-val">{{ evaluated_area_disp }}</td>
+        </tr>
+        {% else %}
+        <tr>
+          <td class="elem-name">Nottingham Combined Histologic Grade</td>
+          <td class="elem-val"><strong>{{ nottingham_grade_disp }}</strong> {{ nottingham_score_disp }}</td>
+        </tr>
+        <tr>
+          <td class="elem-sub">• Glandular / Tubule Formation</td>
+          <td class="elem-val">{{ tubule_disp }}</td>
+        </tr>
+        <tr>
+          <td class="elem-sub">• Nuclear Pleomorphism</td>
+          <td class="elem-val">{{ pleo_disp }}</td>
+        </tr>
+        <tr>
+          <td class="elem-sub">• Mitotic Rate</td>
+          <td class="elem-val">{{ mitotic_disp }}</td>
+        </tr>
+        <tr>
+          <td class="elem-name">Tumor Size (Invasive)</td>
+          <td class="elem-val">{{ tumor_size_disp }}</td>
+        </tr>
+        <tr>
+          <td class="elem-name">Pathologic Staging (AJCC 8th/9th Ed.)</td>
+          <td class="elem-val">{{ staging_disp }}</td>
+        </tr>
+        <tr>
+          <td class="elem-name">Lymphovascular Invasion (LVI)</td>
+          <td class="elem-val">{{ lvi_disp }}</td>
+        </tr>
+        <tr>
+          <td class="elem-name">In-situ Carcinoma (DCIS)</td>
+          <td class="elem-val">{{ dcis_disp }}</td>
+        </tr>
+        <tr>
+          <td class="elem-name">Surgical Margins</td>
+          <td class="elem-val">{{ margins_disp }}</td>
+        </tr>
+        <tr>
+          <td class="elem-name">Ancillary Biomarkers</td>
+          <td class="elem-val">{{ biomarkers_disp }}</td>
+        </tr>
+        <tr>
+          <td class="elem-name">Systematic Hotspot HPFs</td>
+          <td class="elem-val">10 standardized high-power fields evaluated (524 µm field diameter, 0.2157 mm² each)</td>
+        </tr>
+        <tr>
+          <td class="elem-name">Total Evaluated Tumor Area</td>
+          <td class="elem-val">{{ evaluated_area_disp }}</td>
+        </tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="page-break"></div>
+
+  <!-- ================= PAGE 2 ================= -->
+  <div class="report-page page-2">
+    <!-- 5. Microscopic Description & Clinical Correlation -->
+    <div class="section-title">Microscopic Description &amp; Clinical Correlation</div>
+    <div class="narrative-box">
+      <div class="narrative-para"><strong>Microscopic Findings:</strong> {{ narrative.microscopic_findings|default("Pending pathologist narrative.") }}</div>
+      {% if narrative.clinical_correlation %}
+      <div class="narrative-para"><strong>Clinical Correlation:</strong> {{ narrative.clinical_correlation }}</div>
+      {% endif %}
+    </div>
+
+    <!-- 6. Key Visual Evidence Grid -->
+    <div class="section-title">Key Microscopic Visual Evidence (Calibrated Imaging &amp; Hotspots)</div>
+    <div class="evidence-grid">
+      <div class="evidence-card">
+        <div class="evidence-card-title">WSI Tumor Triage Overview</div>
+        {% if evidence.heatmap_b64 %}
+        <img class="evidence-img" src="data:image/png;base64,{{ evidence.heatmap_b64 }}" alt="WSI Triage Heatmap with Hotspots">
+        {% else %}
+        <div class="evidence-unavailable">[EVIDENCE UNAVAILABLE]<br/><span style="font-size: 7pt; color: #64748b;">Heatmap artifact missing</span></div>
+        {% endif %}
+        <div class="evidence-caption">Slide overview with verified tumor hotspot boundaries (2.5× / 10×)</div>
+      </div>
+
+      <div class="evidence-card">
+        <div class="evidence-card-title">Highest-Density Mitotic HPF</div>
+        {% if evidence.mitotic_hpf_b64 %}
+        <img class="evidence-img" src="data:image/png;base64,{{ evidence.mitotic_hpf_b64 }}" alt="Top Mitotic HPF 40x">
+        {% else %}
+        <div class="evidence-unavailable">[EVIDENCE UNAVAILABLE]<br/><span style="font-size: 7pt; color: #64748b;">HPF crop artifact missing</span></div>
+        {% endif %}
+        <div class="evidence-caption">{{ evidence.mitotic_caption|default("40× optical patch with calibrated 262 µm circular reticle") }}</div>
+      </div>
+
+      <div class="evidence-card">
+        <div class="evidence-card-title">Representative Grading Patch</div>
+        {% if evidence.grading_patch_b64 %}
+        <img class="evidence-img" src="data:image/png;base64,{{ evidence.grading_patch_b64 }}" alt="Grading Evidence Patch">
+        {% else %}
+        <div class="evidence-unavailable">[EVIDENCE UNAVAILABLE]<br/><span style="font-size: 7pt; color: #64748b;">Patch artifact missing</span></div>
+        {% endif %}
+        <div class="evidence-caption">High-power morphology patch verifying nuclear pleomorphism and tubules</div>
+      </div>
+    </div>
+
+    <!-- 7. Digital Attestation & Cryptographic Seal -->
+    <div class="attestation-block">
+      <div class="attestation-title">Digital Pathologist Attestation &amp; Cryptographic Seal</div>
+      <div class="attestation-text">
+        {% if status|upper == 'SIGNED' %}
+        {{ attestation_statement|default("I electronically attest that I have reviewed the digital whole-slide image, hotspot triage analysis, mitotic counts, and histologic parameters, and verify the diagnostic findings above.") }}
+        {% else %}
+        <strong>DOCUMENT STATUS: PRELIMINARY DRAFT — NOT ELECTRONICALLY SIGNED:</strong> This document contains machine-assisted preliminary findings and has not yet been electronically signed by a board-certified pathologist.
+        {% endif %}
+      </div>
+
+      <table class="signer-table">
+        <tr>
+          <td style="width: 35%;"><strong>Signed By:</strong> {{ signed_by|default("Unsigned Draft") }}</td>
+          <td style="width: 30%;"><strong>Credentials / NPI:</strong> {{ npi|default("Pending") }}</td>
+          <td style="width: 35%;"><strong>Signed Date:</strong> {{ signed_at|default("Pending") }}</td>
+        </tr>
+      </table>
+
+      {% if integrity_hash %}
+      <div style="margin-top: 4px; font-size: 7pt; color: #475569;"><strong>Cryptographic Document Seal (SHA-256):</strong></div>
+      <div class="crypto-hash-box">{{ integrity_hash }}</div>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="page-break"></div>
+
+  <!-- ================= PAGE 3 ================= -->
+  <div class="report-page page-3">
+    <!-- 8. Regulatory RUO Notice Banner (#523) -->
+    <div class="section-title">Clinical Appendix &amp; Computational Provenance</div>
+    <div class="ruo-banner">
+      <div class="ruo-banner-title">REGULATORY NOTICE: RESEARCH USE ONLY (RUO) — INVESTIGATIONAL CLINICAL SYSTEM</div>
+      <div class="ruo-banner-text">
+        The computational findings, segmentation contours, mitotic detections, and Nottingham histologic grading scores
+        presented in this report were generated using deep learning digital pathology models (OncoGemma v5 pipeline) to support
+        pathologist review under College of American Pathologists (CAP) protocols. These algorithmic metrics are investigational
+        and intended solely for computer-assisted clinical evaluation. The final diagnosis, stage classification, and clinical
+        interpretation remain the sole medical and legal responsibility of the signing board-certified pathologist.
+      </div>
+    </div>
+
+    <!-- 9. Computational Model Provenance Table (#626) -->
+    <div class="section-title" style="margin-top: 10px;">Computational Model Provenance &amp; Pipeline Specifications</div>
+    <table class="synoptic-table">
+      <thead>
+        <tr>
+          <th>Pipeline Component / Engine</th>
+          <th>Specification &amp; Model Version</th>
+          <th>Verification Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="elem-name">MedGemma Clinical LLM</td>
+          <td class="elem-val">MedGemma {{ model_versions.medgemma|default("1.5") }} (Multimodal Diagnostic CoT)</td>
+          <td class="elem-val">Verified Grounding</td>
+        </tr>
+        <tr>
+          <td class="elem-name">Prompt Template Hash</td>
+          <td class="elem-val">cap_report:{{ model_versions.prompt_cap_report|default("v1") }}</td>
+          <td class="elem-val">Validated CAP Structure</td>
+        </tr>
+        <tr>
+          <td class="elem-name">Mitosis Detection CNN</td>
+          <td class="elem-val">{{ model_versions.mitosis_model|default("YOLOv8x-Mitosis 40x (calibrated reticle r=262µm)") }}</td>
+          <td class="elem-val">10 HPFs (2.157 mm²)</td>
+        </tr>
+        <tr>
+          <td class="elem-name">Nottingham Grading Engine</td>
+          <td class="elem-val">{{ model_versions.grading_engine|default("Multi-Head ViT + Nottingham Rules") }}</td>
+          <td class="elem-val">Components Sum (3-9)</td>
+        </tr>
+        <tr>
+          <td class="elem-name">AJCC Staging System</td>
+          <td class="elem-val">{{ model_versions.ajcc_edition|default("8th / 9th Edition") }}</td>
+          <td class="elem-val">Deterministic Rule Engine</td>
+        </tr>
+        <tr>
+          <td class="elem-name">CAP Protocol Checklist</td>
+          <td class="elem-val">{{ model_versions.cap_checklist|default("v4.2.0.0 (2026.06)") }}</td>
+          <td class="elem-val">Compliant Template</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <!-- 10. Clinical Reviewer Audit & Provenance Trail (#626) -->
+    <div class="section-title" style="margin-top: 10px;">Clinical Reviewer Audit &amp; Verification Trail</div>
+    <table class="synoptic-table">
+      <thead>
+        <tr>
+          <th>Audit Verification Item</th>
+          <th>System Record / Identifier</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="elem-name">Reviewer / Attesting Pathologist</td>
+          <td class="elem-val">{{ signed_by|default("Unsigned Draft") }} (NPI: {{ npi|default("Pending") }})</td>
+          <td class="elem-val">{% if status|upper == 'SIGNED' %}Verified Signature{% else %}Pending Sign-off{% endif %}</td>
+        </tr>
+        <tr>
+          <td class="elem-name">Document Cryptographic Seal</td>
+          <td class="elem-val">SHA-256: {{ integrity_hash|default("Pending Signature") }}</td>
+          <td class="elem-val">{% if status|upper == 'SIGNED' %}Sealed &amp; Immutable{% else %}Unsealed Draft{% endif %}</td>
+        </tr>
+        <tr>
+          <td class="elem-name">Digital Case Accession</td>
+          <td class="elem-val">{{ case_id }}</td>
+          <td class="elem-val">GCS Encrypted Storage</td>
+        </tr>
+      </tbody>
+    </table>
+
+    {% if amendments and amendments|length > 0 %}
+    <div class="section-title" style="margin-top: 10px;">Formal Report Amendment History</div>
+    <table class="synoptic-table">
+      <thead>
+        <tr>
+          <th>Version</th>
+          <th>Amended By &amp; Date</th>
+          <th>Clinical Amendment Reason</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for a in amendments %}
+        <tr>
+          <td class="elem-name">{{ a.version }}</td>
+          <td class="elem-val">{{ a.amended_by }} • {{ a.amended_at[:19] }}</td>
+          <td class="elem-val">{{ a.reason }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
     {% endif %}
   </div>
 

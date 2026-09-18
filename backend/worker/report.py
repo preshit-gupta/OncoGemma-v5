@@ -4,6 +4,7 @@ import json
 import asyncio
 import tempfile
 import shutil
+import hashlib
 from typing import Tuple, Dict, Any
 from datetime import datetime, timezone
 from sqlalchemy import select
@@ -11,10 +12,8 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.gcs import (
-    get_gcs_client,
     upload_blob_from_bytes,
-    download_blob_as_bytes,
-    download_blob_to_filename
+    download_blob_as_bytes
 )
 from app.models.stage_execution import StageExecution
 from app.models.case import Case
@@ -29,25 +28,28 @@ from pipeline.staging import (
     calculate_ajcc_pt_stage,
     calculate_ajcc_pn_stage,
     calculate_ajcc_stage_group,
-    validate_staging_invariants,
     validate_narrative_consistency
 )
 from pipeline.medgemma import MedGemmaClient, load_prompt_template
-from pipeline.report_pdf import generate_clinical_cap_pdf
-import hashlib
+from pipeline.report_pdf import generate_clinical_cap_pdf, build_report_pdf_context
 
 
 def run_report(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str, str]]:
     """
     Executes Stage 6 (Report Generation) pipeline:
-    1. Gathers clinical, grading, and staging parameters.
-    2. Runs MedGemma CAP-compliant synoptic report generation.
-    3. Renders high-fidelity clinical PDF using GCS-backed evidence assets.
-    4. Uploads final PDF directly to GCS artifacts bucket.
-    5. Cleans up temporary scratch directory.
+    1. Gathers clinical, grading, and staging parameters in an isolated DB read transaction (#289).
+    2. Closes read transaction before invoking MedGemma and ReportLab rendering.
+    3. Runs MedGemma CAP-compliant synoptic report generation.
+    4. Validates narrative consistency against structured parameters (#748).
+    5. Renders high-fidelity clinical PDF using GCS-backed evidence assets via shared context builder (#629).
+    6. Writes atomic machine-readable JSON report blob to GCS (#706).
+    7. Uploads final PDF directly to GCS artifacts bucket.
+    8. Opens discrete write transaction to persist report state and audit event (#289).
+    9. Cleans up temporary scratch directory.
     """
     case_id = str(stage_exec.case_id)
     case_uid = stage_exec.case_id
+    stage_exec_id = stage_exec.id
     
     print(f"[Stage 6 Worker] Generating CAP-compliant report for Case {case_id}...")
 
@@ -149,19 +151,53 @@ def run_report(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str, 
             "stage_group": stage_grp
         }
 
+    version_num = report_record.version or 1
+    procedure = report_record.procedure
+    laterality = report_record.laterality
+    tumor_site = report_record.tumor_site
+    lvi_status = report_record.lvi_status
+    dcis_present = report_record.dcis_present
+    margins = report_record.margins
+    lymph_nodes = report_record.lymph_nodes
+    biomarkers = report_record.biomarkers
+    staging_dict = report_record.staging
 
-    # 4. Synthesize Grounded Narrative via MedGemma 1.5
+    # Prepare evidence geometry primitives for burn-in (#504)
+    top_hpf = max(hpfs, key=lambda h: h.mitotic_count) if hpfs else None
+    evidence_geometry = {
+        "hotspots": [
+            {
+                "id": h.id,
+                "seq": getattr(h, "seq", i + 1),
+                "polygon_coords_um": getattr(h, "polygon_um", getattr(h, "polygon_coords_um", None)),
+                "polygon_um": getattr(h, "polygon_um", None),
+                "center_um": getattr(h, "center_um", None)
+            }
+            for i, h in enumerate(hotspots)
+        ],
+        "top_hpf": {
+            "seq": top_hpf.seq,
+            "mitotic_count": top_hpf.mitotic_count,
+            "center_um": top_hpf.center_um,
+            "radius_um": getattr(top_hpf, "radius_um", 262.0)
+        } if top_hpf else None
+    }
+
+    # Commit initial DB setup and release transaction before MedGemma & PDF compilation (#289)
+    db.commit()
+
+    # 4. Synthesize Grounded Narrative via MedGemma 1.5 (Outside DB transaction)
     prompt_tpl, prompt_hash = load_prompt_template("cap_report", "v1")
     medgemma_client = MedGemmaClient()
 
     case_summary_payload = {
         "case_id": case_id,
-        "procedure": report_record.procedure,
-        "laterality": report_record.laterality,
-        "tumor_site": report_record.tumor_site,
-        "histologic_type": report_record.histologic_type,
+        "procedure": procedure,
+        "laterality": laterality,
+        "tumor_site": tumor_site,
+        "histologic_type": histologic_type,
         "tumor_size_mm": tumor_size,
-        "lvi_status": report_record.lvi_status,
+        "lvi_status": lvi_status,
         "nottingham_grade": {
             "grade": grade_val,
             "tubule_score": tubule_score,
@@ -170,8 +206,8 @@ def run_report(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str, 
             "mitotic_score": mitotic_score,
             "nottingham_sum": nottingham_sum
         },
-        "staging": report_record.staging,
-        "biomarkers": report_record.biomarkers
+        "staging": staging_dict,
+        "biomarkers": biomarkers
     }
 
     try:
@@ -182,7 +218,7 @@ def run_report(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str, 
 
     if is_benign:
         narrative_dict = {
-            "diagnosis_line": f"{report_record.laterality.upper()} BREAST, BIOPSY: BENIGN BREAST TISSUE, NEGATIVE FOR INVASIVE CARCINOMA.",
+            "diagnosis_line": f"{laterality.upper()} BREAST, BIOPSY: BENIGN BREAST TISSUE, NEGATIVE FOR INVASIVE CARCINOMA.",
             "microscopic_findings": "Sections show benign breast parenchyma without evidence of cytologic atypia, architectural disruption, or invasive carcinoma. No mitotic figures suspicious for malignancy identified.",
             "clinical_correlation": "Negative for invasive or in-situ carcinoma. Follow-up as clinically indicated."
         }
@@ -190,21 +226,18 @@ def run_report(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str, 
         narrative_dict = loop.run_until_complete(
             medgemma_client.generate_cap_report_narrative(case_summary_payload, prompt_tpl)
         )
-        # Check narrative consistency against structured parameters (#176)
+        # Check narrative consistency against structured parameters (#748)
         consistency_warnings = validate_narrative_consistency(narrative_dict, case_summary_payload)
         if consistency_warnings:
             print(f"[Stage 6 Worker] Narrative consistency warnings for Case {case_id}: {consistency_warnings}")
-    report_record.narrative = narrative_dict
 
-    # 5. Generate Clinical PDF via temporary scratch directory
+    # 5. Generate Clinical PDF via temporary scratch directory (Outside DB transaction)
     scratch_dir = tempfile.mkdtemp(prefix="og_report_")
 
     try:
-        version_num = report_record.version or 1
         pdf_filename = f"CAP_Report_{case_id[:8]}_v{version_num}.pdf"
         pdf_out_path = os.path.join(scratch_dir, pdf_filename)
         
-        # Download evidence files if available in GCS
         evidence_paths = {}
         for hm in [f"cases/{case_id}/triage/heatmap_triage.png", f"cases/{case_id}/triage/heatmap.png"]:
             try:
@@ -241,93 +274,116 @@ def run_report(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str, 
             f"cases/{case_id}/grading_patches/p_001.png"
         ]:
             try:
-                patch_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, gp)
-                patch_path = os.path.join(scratch_dir, "grading_patch.png")
-                with open(patch_path, "wb") as f:
-                    f.write(patch_bytes)
-                evidence_paths["grading_patch"] = patch_path
+                gp_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, gp)
+                gp_path = os.path.join(scratch_dir, "grading_patch.png")
+                with open(gp_path, "wb") as f:
+                    f.write(gp_bytes)
+                evidence_paths["grading_patch"] = gp_path
                 break
             except Exception:
                 pass
 
-        report_render_dict = {
+        model_versions = {
+            "medgemma": "1.5",
+            "prompt_cap_report": prompt_hash[:12],
+            "cap_checklist": "v4.2.0.0 (2026.06)",
+            "ajcc_edition": "8th / 9th Edition",
+            "grading_engine": "Multi-Head ViT + Nottingham Rules",
+            "mitosis_model": "YOLOv8x-Mitosis 40x (calibrated reticle r=262µm)"
+        }
+
+        # Build standardized context using shared builder (#629)
+        raw_report_data = {
             "case_id": case_id,
-            "procedure": report_record.procedure,
-            "laterality": report_record.laterality,
-            "tumor_site": report_record.tumor_site,
-            "histologic_type": report_record.histologic_type,
+            "procedure": procedure,
+            "laterality": laterality,
+            "tumor_site": tumor_site,
+            "histologic_type": histologic_type,
             "tumor_size_mm": tumor_size,
-            "lvi_status": report_record.lvi_status,
-            "dcis_present": report_record.dcis_present,
-            "margins": report_record.margins,
-            "lymph_nodes": report_record.lymph_nodes,
-            "biomarkers": report_record.biomarkers,
-            "staging": report_record.staging,
+            "lvi_status": lvi_status,
+            "dcis_present": dcis_present,
+            "margins": margins,
+            "lymph_nodes": lymph_nodes,
+            "biomarkers": biomarkers,
+            "staging": staging_dict,
             "nottingham_grade": case_summary_payload["nottingham_grade"],
             "narrative": narrative_dict,
-            "status": report_record.status,
-            "signed_by": report_record.signed_by,
-            "npi": report_record.npi,
-            "signed_at": report_record.signed_at.isoformat() if report_record.signed_at else None,
-            "integrity_hash": report_record.integrity_hash
+            "status": "draft",
+            "model_versions": model_versions
         }
 
-        # Construct authentic evidence geometry for burn-in (#504)
-        top_hpf = max(hpfs, key=lambda h: h.mitotic_count) if hpfs else None
-        evidence_geometry = {
-            "hotspots": [
-                {
-                    "id": h.id,
-                    "seq": getattr(h, "seq", i + 1),
-                    "polygon_coords_um": getattr(h, "polygon_um", getattr(h, "polygon_coords_um", None)),
-                    "polygon_um": getattr(h, "polygon_um", None),
-                    "center_um": getattr(h, "center_um", None)
-                }
-                for i, h in enumerate(hotspots)
-            ],
-            "top_hpf": {
-                "seq": top_hpf.seq,
-                "mitotic_count": top_hpf.mitotic_count,
-                "center_um": top_hpf.center_um,
-                "radius_um": getattr(top_hpf, "radius_um", 262.0)
-            } if top_hpf else None
-        }
+        pdf_context = build_report_pdf_context(
+            report=raw_report_data,
+            evidence_paths=evidence_paths,
+            evidence_geometry=evidence_geometry,
+            model_versions=model_versions
+        )
 
         generate_clinical_cap_pdf(
-            report_data=report_render_dict,
+            report_data=pdf_context,
             output_path=pdf_out_path,
             evidence_paths=evidence_paths,
-            evidence_geometry=evidence_geometry
+            evidence_geometry=evidence_geometry,
+            model_versions=model_versions
         )
 
         with open(pdf_out_path, "rb") as pdf_file:
             pdf_content = pdf_file.read()
 
+        pdf_sha256 = hashlib.sha256(pdf_content).hexdigest()
+
         # Upload versioned PDF
-        versioned_path = f"cases/{case_id}/report/v{version_num}/{pdf_filename}"
+        versioned_pdf_path = f"cases/{case_id}/report/v{version_num}/{pdf_filename}"
         upload_blob_from_bytes(
             settings.GCS_ARTIFACTS_BUCKET,
-            versioned_path,
+            versioned_pdf_path,
             pdf_content,
             "application/pdf"
         )
 
-        # Upload unversioned latest pointer
-        latest_path = f"cases/{case_id}/report/CAP_Report_{case_id[:8]}.pdf"
+        # Upload unversioned latest PDF pointer
+        latest_pdf_path = f"cases/{case_id}/report/CAP_Report_{case_id[:8]}.pdf"
         upload_blob_from_bytes(
             settings.GCS_ARTIFACTS_BUCKET,
-            latest_path,
+            latest_pdf_path,
             pdf_content,
             "application/pdf"
         )
 
-        report_record.pdf_sha256 = hashlib.sha256(pdf_content).hexdigest()
-        gcs_pdf_uri = f"gs://{settings.GCS_ARTIFACTS_BUCKET}/{versioned_path}"
-        report_record.pdf_path = gcs_pdf_uri
-        stage_exec.status = "awaiting_review"
-        stage_exec.output_ref = gcs_pdf_uri
+        # Upload atomic machine-readable JSON blob to GCS (#706)
+        output_json_bytes = json.dumps(pdf_context, indent=2, default=str).encode("utf-8")
+        versioned_json_path = f"cases/{case_id}/report/v{version_num}/output.json"
+        latest_json_path = f"cases/{case_id}/report/output.json"
 
-        # Audit event
+        upload_blob_from_bytes(
+            settings.GCS_ARTIFACTS_BUCKET,
+            versioned_json_path,
+            output_json_bytes,
+            "application/json"
+        )
+        upload_blob_from_bytes(
+            settings.GCS_ARTIFACTS_BUCKET,
+            latest_json_path,
+            output_json_bytes,
+            "application/json"
+        )
+
+        gcs_pdf_uri = f"gs://{settings.GCS_ARTIFACTS_BUCKET}/{versioned_pdf_path}"
+
+        # 6. Discrete write transaction to persist report state and audit event (#289)
+        report_curr = db.scalars(
+            select(Report).where(Report.case_id == case_uid).order_by(Report.version.desc())
+        ).first()
+        if report_curr:
+            report_curr.narrative = narrative_dict
+            report_curr.pdf_sha256 = pdf_sha256
+            report_curr.pdf_path = gcs_pdf_uri
+
+        stage_curr = db.get(StageExecution, stage_exec_id)
+        if stage_curr:
+            stage_curr.status = "awaiting_review"
+            stage_curr.output_ref = gcs_pdf_uri
+
         audit_evt = AuditEvent(
             case_id=case_id,
             actor="system_worker",
@@ -338,18 +394,12 @@ def run_report(stage_exec: StageExecution, db: Session) -> Tuple[str, Dict[str, 
                 "pt_stage": pt_stage,
                 "pn_stage": pn_stage,
                 "stage_group": stage_grp,
-                "pdf_path": gcs_pdf_uri
+                "pdf_path": gcs_pdf_uri,
+                "output_json": f"gs://{settings.GCS_ARTIFACTS_BUCKET}/{versioned_json_path}"
             }
         )
         db.add(audit_evt)
         db.commit()
-
-        model_versions = {
-            "medgemma": "1.5",
-            "prompt_cap_report": prompt_hash[:12],
-            "cap_checklist": "2026.06",
-            "ajcc": "8th/9th"
-        }
 
         print(f"[Stage 6 Worker] Report generation completed for Case {case_id}. Uploaded to GCS {gcs_pdf_uri}. Ready for Pathologist Review.")
         return gcs_pdf_uri, model_versions

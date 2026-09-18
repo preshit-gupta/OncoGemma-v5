@@ -334,3 +334,36 @@ body {
   word-break: break-all;
   margin-top: 4px;
 }
+
+/* Page Breaks for Multi-Page Print / WeasyPrint */
+.page-break {
+  page-break-after: always;
+  break-after: page;
+  height: 0;
+  margin: 0;
+  padding: 0;
+}
+
+/* RUO Banner (#523) */
+.ruo-banner {
+  background-color: #fefce8;
+  border: 1px solid #eab308;
+  border-radius: 4px;
+  padding: 8px 12px;
+  margin-bottom: 8px;
+}
+
+.ruo-banner-title {
+  font-size: 8pt;
+  font-weight: 800;
+  color: #92400e;
+  text-transform: uppercase;
+  margin-bottom: 3px;
+}
+
+.ruo-banner-text {
+  font-size: 7.5pt;
+  color: #78350f;
+  line-height: 1.35;
+}
+

@@ -42,7 +42,7 @@ from pipeline.staging import (
     validate_narrative_consistency
 )
 from pipeline.medgemma import MedGemmaClient, load_prompt_template
-from pipeline.report_pdf import generate_clinical_cap_pdf, render_report_html
+from pipeline.report_pdf import generate_clinical_cap_pdf, render_report_html, build_report_pdf_context
 
 router = APIRouter(prefix="/api/v1/stages/report", tags=["report"])
 
@@ -112,7 +112,7 @@ def to_uuid(val: Any) -> uuid.UUID:
     try:
         return uuid.UUID(str(val))
     except Exception:
-        return val
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Case {val} not found")
 
 
 def _ensure_report_record(case_uid: uuid.UUID, db: Session) -> Report:
@@ -173,36 +173,8 @@ def _ensure_report_record(case_uid: uuid.UUID, db: Session) -> Report:
 
 
 def _build_render_dict(case_id: str, report: Report, grading: Optional[Grading]) -> Dict[str, Any]:
-    ng_data = {
-        "grade": grading.grade if grading and grading.grade else None,
-        "tubule_score": grading.tubule_score if grading and grading.tubule_score else None,
-        "tubule_percent": grading.tubule_percent if grading and grading.tubule_percent is not None else None,
-        "pleo_score": grading.pleo_score if grading and grading.pleo_score else None,
-        "mitotic_score": grading.mitotic_score if grading and grading.mitotic_score else None,
-        "nottingham_sum": grading.nottingham_sum if grading and grading.nottingham_sum else None
-    }
-
-    return {
-        "case_id": str(case_id),
-        "procedure": report.procedure,
-        "laterality": report.laterality,
-        "tumor_site": report.tumor_site,
-        "histologic_type": report.histologic_type,
-        "tumor_size_mm": report.tumor_size_mm,
-        "lvi_status": report.lvi_status,
-        "dcis_present": report.dcis_present,
-        "margins": report.margins,
-        "lymph_nodes": report.lymph_nodes,
-        "biomarkers": report.biomarkers,
-        "staging": report.staging,
-        "nottingham_grade": ng_data,
-        "narrative": report.narrative,
-        "status": report.status,
-        "signed_by": report.signed_by,
-        "npi": report.npi,
-        "signed_at": report.signed_at.isoformat() if report.signed_at else None,
-        "integrity_hash": report.integrity_hash
-    }
+    """Unified authoritative PDF render dictionary context (#629)."""
+    return build_report_pdf_context(report=report, grading=grading)
 
 
 def _collect_evidence_artifacts(case_id: str, scratch_dir: str, db: Session):
@@ -443,7 +415,7 @@ def update_report_data(
 
     if report.status in ("signed", "amended"):
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=status.HTTP_409_CONFLICT,
             detail="Report is already signed and locked. Please use the /amend endpoint to submit a formal versioned amendment."
         )
 
@@ -510,82 +482,6 @@ def update_report_data(
     return _build_report_response_dict(payload.case_id, db)
 
 
-@router.post("/resynthesize-narrative")
-def resynthesize_narrative(payload: UpdateReportPayload, db: Session = Depends(get_db)):
-    """
-    Triggers grounded narrative re-generation via MedGemma 1.5.
-    """
-    case_uid = to_uuid(payload.case_id)
-    report = _ensure_report_record(case_uid, db)
-    grading = db.scalars(select(Grading).where(Grading.case_id == case_uid)).first()
-
-    if report.status == "signed":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Cannot modify a signed report narrative directly. Use amendment workflow."
-        )
-
-    # Aggregate latest context payload
-    ng_data = {
-        "grade": grading.grade if grading and grading.grade else 2,
-        "tubule_score": grading.tubule_score if grading and grading.tubule_score else 2,
-        "tubule_percent": grading.tubule_percent if grading and grading.tubule_percent is not None else 45.0,
-        "pleo_score": grading.pleo_score if grading and grading.pleo_score else 2,
-        "mitotic_score": grading.mitotic_score if grading and grading.mitotic_score else 2,
-        "nottingham_sum": grading.nottingham_sum if grading and grading.nottingham_sum else 6
-    }
-
-    tumor_size = payload.tumor_size_mm if payload.tumor_size_mm is not None else report.tumor_size_mm
-    nodes_info = (payload.lymph_nodes.model_dump() if payload.lymph_nodes else report.lymph_nodes) or {}
-    n_exam = nodes_info.get("examined_count", 0)
-    n_pos = nodes_info.get("positive_count", 0)
-
-    pt_stage = calculate_ajcc_pt_stage(tumor_size)
-    pn_stage = calculate_ajcc_pn_stage(n_exam, n_pos)
-    stage_grp = calculate_ajcc_stage_group(pt_stage, pn_stage)
-
-    staging_dict = {
-        "ajcc_version": "8th/9th Edition",
-        "pt_stage": pt_stage,
-        "pn_stage": pn_stage,
-        "pm_stage": "cM0",
-        "stage_group": stage_grp
-    }
-
-    case_summary = {
-        "case_id": str(payload.case_id),
-        "procedure": payload.procedure or report.procedure,
-        "laterality": payload.laterality or report.laterality,
-        "tumor_site": payload.tumor_site or report.tumor_site,
-        "histologic_type": report.histologic_type,
-        "tumor_size_mm": tumor_size,
-        "lvi_status": payload.lvi_status or report.lvi_status,
-        "nottingham_grade": ng_data,
-        "staging": staging_dict,
-        "biomarkers": payload.biomarkers.model_dump() if payload.biomarkers else report.biomarkers
-    }
-
-    import asyncio
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-    prompt_tpl, _ = load_prompt_template("cap_report", "v1")
-    medgemma = MedGemmaClient()
-    new_narrative = loop.run_until_complete(
-        medgemma.generate_cap_report_narrative(case_summary, prompt_tpl)
-    )
-
-    report.narrative = new_narrative
-    report.status = "in_review"
-    db.commit()
-    db.refresh(report)
-
-    return _build_report_response_dict(payload.case_id, db)
-
-
 @router.post("/{case_id}/regenerate-narrative")
 async def regenerate_report_narrative(case_id: str, db: Session = Depends(get_db)):
     """
@@ -593,17 +489,17 @@ async def regenerate_report_narrative(case_id: str, db: Session = Depends(get_db
     """
     case_uid = to_uuid(case_id)
     report = _ensure_report_record(case_uid, db)
-    if report.status == "signed":
-        raise HTTPException(status_code=400, detail="Cannot regenerate narrative on a signed and locked report.")
+    if report.status in ("signed", "amended"):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Cannot regenerate narrative on a signed and locked report.")
 
     grading = db.scalars(select(Grading).where(Grading.case_id == case_uid)).first()
     ng_data = {
-        "grade": grading.grade if grading and grading.grade else 2,
-        "tubule_score": grading.tubule_score if grading and grading.tubule_score else 2,
-        "tubule_percent": grading.tubule_percent if grading and grading.tubule_percent is not None else 45.0,
-        "pleo_score": grading.pleo_score if grading and grading.pleo_score else 2,
-        "mitotic_score": grading.mitotic_score if grading and grading.mitotic_score else 2,
-        "nottingham_sum": grading.nottingham_sum if grading and grading.nottingham_sum else 6
+        "grade": grading.grade if grading and grading.grade else None,
+        "tubule_score": grading.tubule_score if grading and grading.tubule_score else None,
+        "tubule_percent": grading.tubule_percent if grading and grading.tubule_percent is not None else None,
+        "pleo_score": grading.pleo_score if grading and grading.pleo_score else None,
+        "mitotic_score": grading.mitotic_score if grading and grading.mitotic_score else None,
+        "nottingham_sum": grading.nottingham_sum if grading and grading.nottingham_sum else None
     }
 
     case_payload = {
@@ -637,25 +533,40 @@ async def regenerate_report_narrative(case_id: str, db: Session = Depends(get_db
 @router.get("/{case_id}/pdf")
 def get_report_pdf(case_id: str, db: Session = Depends(get_db)):
     """
-    Stream server-generated clinical PDF report directly, freshly rendering latest data to ensure 1-page compliance.
+    Stream server-generated clinical PDF report directly (#631).
+    Signed/amended reports return immutable Cache-Control headers and preserve existing sealed PDF bytes.
+    Draft reports are freshly rendered with no-cache headers.
     """
     case_uid = to_uuid(case_id)
     report = _ensure_report_record(case_uid, db)
     grading = db.scalars(select(Grading).where(Grading.case_id == case_uid)).first()
 
     blob_name = f"cases/{case_id}/report/CAP_Report_{str(case_id)[:8]}.pdf"
+    is_signed = report.status in ("signed", "amended")
+
+    cache_headers = {
+        "Content-Disposition": f'inline; filename="CAP_Report_{str(case_id)[:8]}.pdf"',
+        "Cache-Control": "private, max-age=86400, immutable" if is_signed else "private, no-cache, no-store, must-revalidate",
+    }
+    if not is_signed:
+        cache_headers["Pragma"] = "no-cache"
+        cache_headers["Expires"] = "0"
+
     try:
+        if is_signed:
+            # For signed/amended reports, return existing sealed PDF from GCS directly if available
+            try:
+                pdf_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, blob_name)
+                return Response(content=pdf_bytes, media_type="application/pdf", headers=cache_headers)
+            except Exception:
+                pass
+
         render_and_upload_report_pdf(str(case_id), report, grading, db)
         pdf_bytes = download_blob_as_bytes(settings.GCS_ARTIFACTS_BUCKET, blob_name)
         return Response(
             content=pdf_bytes,
             media_type="application/pdf",
-            headers={
-                "Content-Disposition": f'inline; filename="CAP_Report_{str(case_id)[:8]}.pdf"',
-                "Cache-Control": "no-cache, no-store, must-revalidate",
-                "Pragma": "no-cache",
-                "Expires": "0"
-            }
+            headers=cache_headers
         )
     except Exception as e:
         print(f"[PDF Render Error] {e}")
@@ -664,11 +575,7 @@ def get_report_pdf(case_id: str, db: Session = Depends(get_db)):
             return Response(
                 content=pdf_bytes,
                 media_type="application/pdf",
-                headers={
-                    "Content-Disposition": f'inline; filename="CAP_Report_{str(case_id)[:8]}.pdf"',
-                    "Cache-Control": "no-cache, no-store, must-revalidate",
-                    "Pragma": "no-cache"
-                }
+                headers=cache_headers
             )
         except Exception:
             raise HTTPException(status_code=500, detail=f"Failed to render PDF: {e}")
@@ -947,7 +854,7 @@ def amend_signed_report(
     case_uid = to_uuid(payload.case_id)
     current_report = _ensure_report_record(case_uid, db)
     if current_report.status != "signed" and current_report.status != "amended":
-        raise HTTPException(status_code=400, detail="Only finalized/signed reports can be amended.")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only finalized/signed reports can be amended.")
 
     now_utc = datetime.now(timezone.utc)
     now_iso = now_utc.isoformat()

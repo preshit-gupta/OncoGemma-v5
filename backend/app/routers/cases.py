@@ -516,6 +516,17 @@ def approve_case_stage(
         payload={"approved_by": user.id, "next_stage": next_stage_name}
     )
     db.add(audit)
+
+    if new_stage and next_stage_name:
+        audit_started = AuditEvent(
+            case_id=str(case_id),
+            actor=user.id,
+            event_type="stage_started",
+            stage=next_stage_name,
+            payload={"triggered_by_approval_of": stage_name, "attempt": new_stage.attempt}
+        )
+        db.add(audit_started)
+
     db.commit()
 
     if new_stage:

@@ -405,9 +405,9 @@ def test_stage_6_full_workflow():
     assert s_exec.status == "confirmed"
     db2.close()
     
-    # 7. Attempting PUT on signed report is blocked
+    # 7. Attempting PUT on signed report is blocked with 409 Conflict (#187)
     res_blocked = client.put(f"/api/v1/stages/report/{case_id}", json=update_payload, headers=headers)
-    assert res_blocked.status_code == 400
+    assert res_blocked.status_code == 409
     assert "already signed and locked" in res_blocked.json()["detail"]
     
     # 8. POST amend signed report
@@ -583,10 +583,10 @@ def test_draft_watermark_and_attestation_suppression(tmp_path):
 
     import pypdf
     draft_reader = pypdf.PdfReader(draft_pdf)
-    draft_text = draft_reader.pages[0].extract_text()
+    draft_text = "".join(page.extract_text() or "" for page in draft_reader.pages)
 
     signed_reader = pypdf.PdfReader(signed_pdf)
-    signed_text = signed_reader.pages[0].extract_text()
+    signed_text = "".join(page.extract_text() or "" for page in signed_reader.pages)
 
     # Draft PDF contains preliminary notice and watermark text, suppressing attestation block
     assert "DRAFT" in draft_text

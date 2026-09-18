@@ -413,6 +413,13 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
 
   return (
     <div className="flex-1 flex flex-col h-full overflow-hidden bg-slate-950 text-slate-100">
+      {/* RUO Disclaimer Banner (#523) */}
+      <div className="bg-amber-50 border border-amber-300 rounded-lg px-4 py-2 flex items-center gap-2 mb-4">
+        <AlertTriangle className="w-5 h-5 text-amber-600 flex-shrink-0" />
+        <span className="text-sm text-amber-800 font-medium">
+          Research Use Only (RUO) — Not for clinical diagnostic use. All AI-generated outputs require independent pathologist verification.
+        </span>
+      </div>
       {/* Top Action & Status Bar */}
       <div className="bg-slate-900 border-b border-slate-800 px-6 py-3.5 flex items-center justify-between z-10 shrink-0">
         <div className="flex items-center space-x-3">
