@@ -7,7 +7,7 @@ import shutil
 from typing import Any, Dict, Tuple
 import numpy as np
 from PIL import Image
-from sqlalchemy import select, delete
+from sqlalchemy import select, delete, not_
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -304,10 +304,16 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
                 print(f"[Worker:Mitosis Warning] Skipping candidate {cand['id']} - could not extract optical crop from slide")
                 continue
 
-            # Run HoVer-Net nuclear instance verification (#124)
+            # Run nuclear instance verification (HoVer-Net if weights loaded, or pass through to multimodal referee)
             ver_enabled = ver_cfg.get("enabled", True)
-            if not ver_enabled:
-                cand["ver_conf"] = None
+            if not ver_enabled or verifier.model is None:
+                # When neural verifier weights are absent, do NOT let flawed OpenCV heuristics discard true mitoses.
+                # Compute lightweight morphological features for contours, but keep candidate eligible for refereeing.
+                ver_conf, contour = verifier.verify(crop_rgb) if ver_enabled else (0.50, None)
+                cand["ver_conf"] = float(ver_conf)
+                if contour:
+                    cand["contour"] = contour
+                # Keep candidate as unreviewed so multimodal referee evaluates it
                 cand["label"] = "unreviewed"
             else:
                 ver_conf, contour = verifier.verify(crop_rgb)
@@ -333,7 +339,7 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
             cand["crop_uri"] = f"gs://{settings.GCS_ARTIFACTS_BUCKET}/cases/{case_id}/mitosis/crops/{crop_id}.png"
             cand["crop_orig_uri"] = f"gs://{settings.GCS_ARTIFACTS_BUCKET}/cases/{case_id}/mitosis/crops/{crop_id}_orig.png"
 
-            # MedGemma Multimodal Referee Cross-Check (Mandatory for ALL auto-confirmed & unreviewed candidates)
+            # Multimodal Referee Cross-Check (Mandatory for ALL auto-confirmed & unreviewed candidates)
             cand["medgemma_verdict"] = None
             cand["medgemma_rationale"] = None
             cand["medgemma_confidence"] = None
@@ -355,19 +361,20 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
                     cand["medgemma_rationale"] = mg_resp.rationale
                     cand["medgemma_confidence"] = mg_resp.confidence
 
+                    referee_src = "gemini_referee" if getattr(settings, "USE_GEMINI_FLASH_REFEREE", True) else "medgemma"
                     if mg_resp.verdict == "CONFIRMED":
                         cand["label"] = "mitosis"
-                        cand["label_source"] = "medgemma_confirmed"
-                        cand["ver_conf"] = max(cand["ver_conf"], 0.88)
+                        cand["label_source"] = f"{referee_src}_confirmed"
+                        cand["ver_conf"] = max(cand.get("ver_conf") or 0.5, 0.88)
                     elif mg_resp.verdict in ("REJECTED_APOPTOSIS", "REJECTED_LYMPHOCYTE", "REJECTED_RESTING_NUCLEUS"):
                         cand["label"] = "not_mitosis"
-                        cand["label_source"] = f"medgemma_{mg_resp.verdict.lower()}"
-                        cand["ver_conf"] = min(cand["ver_conf"], 0.12)
+                        cand["label_source"] = f"{referee_src}_{mg_resp.verdict.lower()}"
+                        cand["ver_conf"] = min(cand.get("ver_conf") or 0.5, 0.12)
                     else: # EQUIVOCAL
                         cand["label"] = "unreviewed"
-                        cand["label_source"] = "medgemma_equivocal"
+                        cand["label_source"] = f"{referee_src}_equivocal"
                 except Exception as mge:
-                    print(f"[Worker:Mitosis] MedGemma referee note for {cand['id']}: {mge}")
+                    print(f"[Worker:Mitosis] Referee note for {cand['id']}: {mge}")
 
         # Post-referee physical NMS (20 um) to eliminate any residual coinciding/overlapping detections
         candidates = apply_global_nms(candidates, nms_radius_um=nms_radius_um)
@@ -522,7 +529,7 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
             db.scalars(
                 select(Detection).where(
                     Detection.case_id == case_obj.id,
-                    (Detection.label_source.startswith("pathologist")) | (Detection.label_source != "model")
+                    (Detection.label_source == "pathologist") | (Detection.label_source.startswith("pathologist"))
                 )
             ).all()
         )
@@ -557,11 +564,12 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
             radius_um=radius_um
         )
 
-        # Persist to Database: preserve all pathologist annotations, only delete unreviewed model detections (#464)
+        # Persist to Database: strictly preserve all pathologist annotations, delete previous model/referee detections (#464)
         db.execute(
             delete(Detection).where(
                 Detection.case_id == case_obj.id,
-                Detection.label_source == "model"
+                Detection.label_source != "pathologist",
+                not_(Detection.label_source.startswith("pathologist"))
             )
         )
         db.execute(delete(HpfSite).where(HpfSite.case_id == case_obj.id))
@@ -599,9 +607,16 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
             db.add(hpf_row)
 
         # Build output.json structure
+        ref_model = getattr(settings, "GEMINI_REFEREE_MODEL", "gemini-2.5-flash")
+        referee_version = (
+            f"{ref_model}@van_diest"
+            if getattr(settings, "USE_GEMINI_FLASH_REFEREE", True)
+            else f"medgemma@{settings.VERTEX_MEDGEMMA_MODEL_VERSION}"
+        )
         model_versions = {
             "detector": detector.model_version,
-            "verifier": verifier.model_version
+            "verifier": verifier.model_version,
+            "referee": referee_version
         }
 
         output_payload = {

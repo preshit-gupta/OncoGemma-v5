@@ -12,7 +12,7 @@ import base64
 import hashlib
 import asyncio
 from typing import List, Dict, Any, Optional, Literal, Tuple
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from app.core.config import settings
 
@@ -60,7 +60,45 @@ class MitosisConfirmationResponse(BaseModel):
     envelope_dissolved: bool = Field(default=False, description="Whether nuclear envelope is dissolved")
     spiculation_detected: bool = Field(default=False, description="Whether chromosome spiculation is detected")
     confidence: Literal["low", "medium", "high"] = Field(default="medium")
-    rationale: str = Field(default="", max_length=300, description="Brief morphological rationale")
+    rationale: str = Field(default="", max_length=500, description="Brief morphological rationale")
+
+    @field_validator("verdict", mode="before")
+    @classmethod
+    def sanitize_verdict(cls, v: Any) -> str:
+        if not isinstance(v, str):
+            return "EQUIVOCAL"
+        vu = v.upper().strip()
+        if "CONFIRM" in vu:
+            return "CONFIRMED"
+        if "APOPT" in vu:
+            return "REJECTED_APOPTOSIS"
+        if "LYMPH" in vu:
+            return "REJECTED_LYMPHOCYTE"
+        if "REST" in vu:
+            return "REJECTED_RESTING_NUCLEUS"
+        if "REJECT" in vu or "NOT" in vu or "FALSE" in vu or "CANNOT" in vu:
+            return "REJECTED_RESTING_NUCLEUS"
+        return "EQUIVOCAL"
+
+    @field_validator("envelope_dissolved", "spiculation_detected", mode="before")
+    @classmethod
+    def sanitize_bool(cls, v: Any) -> bool:
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            return v.lower().strip() in ("true", "yes", "1", "positive", "detected", "dissolved")
+        return bool(v)
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def sanitize_conf(cls, v: Any) -> str:
+        if isinstance(v, str):
+            vl = v.lower().strip()
+            if "high" in vl:
+                return "high"
+            if "low" in vl:
+                return "low"
+        return "medium"
 
 
 class FindingsNarrativeResponse(BaseModel):
@@ -460,25 +498,171 @@ class MedGemmaClient:
                 
         raise SchemaRetryExhaustedError(f"Histologic type classification failed after {self.max_retries + 1} attempts: {last_error}")
 
+    async def _call_gemini_flash(
+        self,
+        prompt: str,
+        images_bytes: List[bytes]
+    ) -> str:
+        """
+        Direct multimodal call to Gemini 1.5 Flash for high-acuity zero-shot visual refereeing.
+        Supports:
+          1. google-genai SDK (if installed and GEMINI_API_KEY is configured)
+          2. Direct Google Generative Language API via httpx (if GEMINI_API_KEY is configured)
+          3. Vertex AI Generative Models (vertexai.generative_models) via GCP credentials
+        """
+        model_name = getattr(settings, "GEMINI_REFEREE_MODEL", "gemini-1.5-flash")
+        api_key = getattr(settings, "GEMINI_API_KEY", None)
+
+        # 1. Try google-genai SDK if GEMINI_API_KEY is available
+        if api_key:
+            try:
+                from google import genai
+                from google.genai import types
+                client = genai.Client(api_key=api_key)
+                contents = [prompt]
+                for img_b in images_bytes:
+                    contents.append(types.Part.from_bytes(data=img_b, mime_type="image/png"))
+                response = await asyncio.to_thread(
+                    client.models.generate_content,
+                    model=model_name,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        temperature=0.0,
+                        response_mime_type="application/json"
+                    )
+                )
+                if response and response.text:
+                    return response.text
+            except ImportError:
+                pass
+            except Exception as e:
+                print(f"[Gemini Flash GenAI SDK note] {e}. Trying direct HTTP...")
+
+            # 2. Try direct Generative Language API via httpx
+            try:
+                import httpx
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+                parts = [{"text": prompt}]
+                for img_b in images_bytes:
+                    parts.append({
+                        "inline_data": {
+                            "mime_type": "image/png",
+                            "data": base64.b64encode(img_b).decode("utf-8")
+                        }
+                    })
+                payload = {
+                    "contents": [{"parts": parts}],
+                    "generationConfig": {
+                        "temperature": 0.0,
+                        "responseMimeType": "application/json"
+                    }
+                }
+                async with httpx.AsyncClient(timeout=20.0) as http_client:
+                    r = await http_client.post(url, json=payload)
+                    if r.status_code == 200:
+                        data = r.json()
+                        text = data["candidates"][0]["content"]["parts"][0]["text"]
+                        return text
+                    else:
+                        print(f"[Gemini Flash HTTP Error] Status {r.status_code}: {r.text}")
+            except Exception as e:
+                print(f"[Gemini Flash HTTP note] {e}")
+
+        # 3. Try google-genai SDK via Vertex AI (uses GCP ADC credentials, project, and location)
+        try:
+            from google import genai
+            from google.genai import types
+            v_client = genai.Client(vertexai=True, project=self.project, location=self.location)
+            contents = [prompt]
+            for img_b in images_bytes:
+                contents.append(types.Part.from_bytes(data=img_b, mime_type="image/png"))
+
+            candidate_models = [model_name]
+            for fallback in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]:
+                if fallback not in candidate_models:
+                    candidate_models.append(fallback)
+
+            for m in candidate_models:
+                try:
+                    resp = await asyncio.to_thread(
+                        v_client.models.generate_content,
+                        model=m,
+                        contents=contents,
+                        config=types.GenerateContentConfig(
+                            temperature=0.0,
+                            response_mime_type="application/json"
+                        )
+                    )
+                    if resp and resp.text:
+                        return resp.text
+                except Exception as ex_m:
+                    print(f"[Vertex AI Gemini Flash model {m} attempt failed]: {ex_m}")
+                    continue
+        except Exception as e:
+            print(f"[Vertex AI Gemini Flash GenAI SDK note] {e}")
+
+        # 4. Fallback to legacy vertexai.generative_models
+        try:
+            import vertexai
+            from vertexai.generative_models import GenerativeModel, Part
+            vertexai.init(project=self.project, location=self.location)
+            for m in [model_name, "gemini-1.5-flash", "gemini-1.5-flash-002"]:
+                try:
+                    v_model = GenerativeModel(m)
+                    parts = [prompt]
+                    for img_b in images_bytes:
+                        parts.append(Part.from_data(data=img_b, mime_type="image/png"))
+                    resp = await asyncio.to_thread(
+                        v_model.generate_content,
+                        parts,
+                        generation_config={"temperature": 0.0, "response_mime_type": "application/json"}
+                    )
+                    if resp and resp.text:
+                        return resp.text
+                except Exception:
+                    continue
+        except Exception as e:
+            print(f"[Legacy Vertex AI note] {e}")
+
+        raise RuntimeError("Gemini Flash multimodal referee could not be reached via API key or Vertex AI.")
+
     async def evaluate_mitosis_confirmation(
         self,
         candidate_crop_bytes: bytes,
         hpf_context_bytes: Optional[bytes] = None,
         prompt_tpl: Optional[str] = None
     ) -> MitosisConfirmationResponse:
-        """Multi-image referee evaluation of candidate mitotic figure via MedGemma 1.5."""
+        """Multi-image referee evaluation of candidate mitotic figure via Gemini 1.5 Flash / MedGemma."""
         if not prompt_tpl:
             try:
                 prompt_tpl, _ = load_prompt_template("mitosis_confirmation", "v1")
             except Exception:
-                prompt_tpl = "Adjudicate candidate mitotic figure according to van Diest / WHO criteria."
+                prompt_tpl = (
+                    "You are an expert digital pathology AI adjudicator. "
+                    "Evaluate the candidate mitotic figure using strict van Diest & WHO criteria. "
+                    "Return JSON with verdict ('CONFIRMED'|'REJECTED_APOPTOSIS'|'REJECTED_LYMPHOCYTE'|'REJECTED_RESTING_NUCLEUS'|'EQUIVOCAL'), "
+                    "envelope_dissolved (boolean), spiculation_detected (boolean), confidence ('low'|'medium'|'high'), rationale (string)."
+                )
 
         b64_crop = base64.b64encode(candidate_crop_bytes).decode("utf-8")
         images = [b64_crop]
+        images_bytes = [candidate_crop_bytes]
         if hpf_context_bytes:
             b64_context = base64.b64encode(hpf_context_bytes).decode("utf-8")
             images.append(b64_context)
+            images_bytes.append(hpf_context_bytes)
 
+        # 1. Primary: Try Gemini 1.5 Flash Multimodal API if enabled
+        use_flash = getattr(settings, "USE_GEMINI_FLASH_REFEREE", True)
+        if use_flash:
+            try:
+                raw_text = await self._call_gemini_flash(prompt_tpl, images_bytes)
+                parsed = self._extract_json_from_text(raw_text)
+                return MitosisConfirmationResponse.model_validate(parsed)
+            except Exception as e:
+                print(f"[Mitosis Referee Note] Gemini Flash referee fell through: {e}. Trying Vertex AI custom endpoint...")
+
+        # 2. Secondary: Try custom Vertex AI Endpoint (e.g. MedGemma 1.5)
         last_error = None
         for attempt in range(self.max_retries + 1):
             try:
@@ -489,6 +673,7 @@ class MedGemmaClient:
                 last_error = e
                 await asyncio.sleep(0.05 * (attempt + 1))
 
+        # 3. Tertiary: Local morphometric fallback
         return self._morphometric_mitosis_fallback(candidate_crop_bytes)
 
     def evaluate_mitosis_confirmation_sync(
@@ -497,7 +682,7 @@ class MedGemmaClient:
         hpf_context_bytes: Optional[bytes] = None,
         prompt_tpl: Optional[str] = None
     ) -> MitosisConfirmationResponse:
-        """Synchronous referee evaluation for candidate mitotic figure via MedGemma 1.5."""
+        """Synchronous referee evaluation for candidate mitotic figure via Gemini Flash / MedGemma."""
         try:
             # Check if there is an active event loop in this thread
             try:
@@ -539,15 +724,15 @@ class MedGemmaClient:
                     verdict="CONFIRMED",
                     envelope_dissolved=True,
                     spiculation_detected=True,
-                    confidence="high",
-                    rationale="Dissolved nuclear envelope with prominent basophilic chromosome projections."
+                    confidence="medium",
+                    rationale="Morphometric criteria met: irregular chromatin contour with high OD."
                 )
             elif prob <= 0.09:
                 return MitosisConfirmationResponse(
                     verdict="REJECTED_APOPTOSIS",
                     envelope_dissolved=False,
                     spiculation_detected=False,
-                    confidence="high",
+                    confidence="medium",
                     rationale="Pyknotic chromatin body surrounded by clear apoptotic retraction halo."
                 )
             elif prob <= 0.14:
@@ -555,7 +740,7 @@ class MedGemmaClient:
                     verdict="REJECTED_LYMPHOCYTE",
                     envelope_dissolved=False,
                     spiculation_detected=False,
-                    confidence="high",
+                    confidence="medium",
                     rationale="Small smooth continuous round nuclear envelope; mature resting lymphocyte."
                 )
             elif prob <= 0.25:
@@ -563,7 +748,7 @@ class MedGemmaClient:
                     verdict="REJECTED_RESTING_NUCLEUS",
                     envelope_dissolved=False,
                     spiculation_detected=False,
-                    confidence="medium",
+                    confidence="low",
                     rationale="Continuous smooth elliptical envelope with non-dividing chromatin."
                 )
             else:

@@ -47,6 +47,21 @@ class Settings(BaseSettings):
     MEDGEMMA_MAX_RETRIES: int = int(os.getenv("MEDGEMMA_MAX_RETRIES", "2"))
     USE_MOCK_VERTEX_AI: bool = os.getenv("USE_MOCK_VERTEX_AI", "false").lower() in ("true", "1")
 
+    # Vertex AI Endpoint Configuration - YOLO Mitosis Sweeper (Stage 4)
+    VERTEX_MITOSIS_ENDPOINT_ID: str | None = os.getenv(
+        "VERTEX_MITOSIS_ENDPOINT_ID",
+        None
+    )
+    VERTEX_MITOSIS_LOCATION: str = os.getenv(
+        "VERTEX_MITOSIS_LOCATION",
+        "us-central1"
+    )
+
+    # Gemini Multimodal Referee Configuration (Stage 4)
+    GEMINI_API_KEY: str | None = os.getenv("GEMINI_API_KEY", None)
+    USE_GEMINI_FLASH_REFEREE: bool = os.getenv("USE_GEMINI_FLASH_REFEREE", "true").lower() in ("true", "1")
+    GEMINI_REFEREE_MODEL: str = os.getenv("GEMINI_REFEREE_MODEL", "gemini-2.5-flash")
+
     # Database
     DATABASE_URL: str = os.getenv(
         "DATABASE_URL",

@@ -242,7 +242,11 @@ def get_mitosis_stage_data(case_id: str, db: Session = Depends(get_db)):
         "hpfs": hpfs,
         "summary": summary,
         "slide": slide_info,
-        "model_versions": stage_exec.model_versions or {"detector": "midog22_yolov8x@v1.0", "verifier": "hovernet_v1.2"},
+        "model_versions": stage_exec.model_versions or {
+            "detector": "od_heuristic@dev",
+            "verifier": "morphometric_heuristic@dev",
+            "referee": "unconfigured"
+        },
         "reviewed_at": stage_exec.reviewed_at.isoformat() if stage_exec.reviewed_at else None,
         "reviewed_by": stage_exec.reviewed_by
     }

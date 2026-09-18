@@ -637,6 +637,18 @@ export function MitosisViewer({
         </div>
       )}
 
+      {/* Honest Model Fallback Warning Banner */}
+      {data?.model_versions?.detector === "od_heuristic@dev" && (
+        <div className="px-4 py-2 bg-amber-950/90 border-b border-amber-800/80 text-amber-200 text-xs flex items-center justify-between shrink-0">
+          <div className="flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+            <span>
+              <strong>Algorithmic Fallback Active:</strong> Running on first-principles Optical Density heuristics (<code className="bg-amber-900/60 px-1 py-0.5 rounded text-amber-300 font-mono">od_heuristic@dev</code>). Deep learning YOLO/MIDOG weights or Vertex AI endpoint (<code className="bg-amber-900/60 px-1 py-0.5 rounded text-amber-300 font-mono">VERTEX_MITOSIS_ENDPOINT_ID</code>) are unconfigured. Mitosis candidates require pathologist verification.
+            </span>
+          </div>
+        </div>
+      )}
+
       {/* TOP HEADER: Clean Navigation & Mitotic Score Summary */}
       <header className="px-4 py-2 bg-slate-900/95 border-b border-slate-800 shrink-0 flex flex-col gap-2 shadow-md">
         <div className="flex items-center justify-between">
@@ -740,6 +752,12 @@ export function MitosisViewer({
               <div>
                 <span className="text-slate-500 block text-[10px] uppercase font-semibold">WHO Scoring Rules</span>
                 <span className="text-slate-400">&lt;3.65/mm² = 1 | 3.65-7.30 = 2 | ≥7.30 = 3</span>
+              </div>
+              <div>
+                <span className="text-slate-500 block text-[10px] uppercase font-semibold">Model Provenance</span>
+                <span className="text-slate-400 font-mono text-[11px]">
+                  Det: {data?.model_versions?.detector || "od_heuristic"} | Ref: {data?.model_versions?.referee || "gemini-1.5-flash"}
+                </span>
               </div>
             </div>
             <button

@@ -4,9 +4,20 @@ Performs 40x high-magnification tile extraction, Macenko stain normalization,
 YOLO candidate sweeping, and physical micrometer cross-tile NMS.
 """
 import os
+import io
 import math
+import base64
 from typing import Protocol, List, Tuple, Dict, Any, Optional
 import numpy as np
+from PIL import Image
+
+try:
+    from app.core.config import settings
+except ImportError:
+    try:
+        from backend.app.core.config import settings
+    except ImportError:
+        settings = None
 
 class MitosisDetector(Protocol):
     def detect(self, tile_rgb: np.ndarray) -> List[Tuple[float, float, float]]:
@@ -21,10 +32,15 @@ class YoloMitosisDetector:
     """
     YOLO-family Mitosis Object Detector (trained on MIDOG / MIDOG++).
     Provides high-recall sweeping for dark, dense hyperchromatic nuclear structures.
+    Supports:
+      1. Remote Vertex AI custom prediction endpoint (e.g. YOLOv8-MIDOG container)
+      2. Local PyTorch / Ultralytics weights checkpoint
+      3. First-principles optical density fallback (od_heuristic@dev)
     """
     def __init__(
         self,
         weights_path: Optional[str] = None,
+        endpoint_id: Optional[str] = None,
         conf_threshold: float = 0.35,
         device: str = "cpu",
         max_candidates_per_tile: int = 64,
@@ -34,13 +50,34 @@ class YoloMitosisDetector:
         self.conf_threshold = conf_threshold
         self.device = device
         self.weights_path = weights_path
+        self.endpoint_id = endpoint_id or (getattr(settings, "VERTEX_MITOSIS_ENDPOINT_ID", None) if settings else None)
+        self.endpoint_location = getattr(settings, "VERTEX_MITOSIS_LOCATION", "us-central1") if settings else "us-central1"
+        self.project_id = getattr(settings, "GCP_PROJECT_ID", "oncogemma-dev") if settings else "oncogemma-dev"
         self.max_candidates_per_tile = max_candidates_per_tile
         self.batch_size = batch_size
         self.fp16 = fp16
         self.model = None
+        self.vertex_endpoint = None
         self.model_version = "od_heuristic@dev"
 
-        if weights_path and os.path.exists(weights_path):
+        # 1. Connect to remote Vertex AI Endpoint if configured
+        if self.endpoint_id:
+            try:
+                from google.cloud import aiplatform
+                aiplatform.init(project=self.project_id, location=self.endpoint_location)
+                self.vertex_endpoint = aiplatform.Endpoint(
+                    endpoint_name=self.endpoint_id,
+                    project=self.project_id,
+                    location=self.endpoint_location
+                )
+                self.model_version = f"vertex_ai_midog@{self.endpoint_id}"
+                print(f"[MitosisDetector] Connected to Vertex AI Mitosis Endpoint: {self.endpoint_id}")
+            except Exception as e:
+                print(f"[MitosisDetector Warning] Failed to connect to Vertex AI Endpoint {self.endpoint_id}: {e}")
+                self.vertex_endpoint = None
+
+        # 2. If not using remote endpoint, load local weights if present
+        if self.vertex_endpoint is None and weights_path and os.path.exists(weights_path):
             try:
                 # Try loading via Ultralytics YOLO first if available
                 try:
@@ -64,10 +101,53 @@ class YoloMitosisDetector:
                 self.model = None
                 self.model_version = "od_heuristic@dev"
 
+    def _detect_vertex_ai(self, tile_rgb: np.ndarray) -> List[Tuple[float, float, float]]:
+        """Queries remote Google Cloud Vertex AI endpoint for mitosis predictions."""
+        if self.vertex_endpoint is None:
+            return []
+        try:
+            img = Image.fromarray(tile_rgb)
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=90)
+            b64_str = base64.b64encode(buf.getvalue()).decode("utf-8")
+            instances = [{
+                "image_bytes": b64_str,
+                "confidence_threshold": self.conf_threshold
+            }]
+            response = self.vertex_endpoint.predict(instances=instances)
+            detections = []
+            if response and response.predictions:
+                preds = response.predictions[0]
+                boxes = preds.get("boxes", preds) if isinstance(preds, dict) else preds
+                for b in boxes:
+                    if isinstance(b, dict):
+                        cx = float(b.get("cx", (b.get("x1", 0) + b.get("x2", 0)) / 2.0))
+                        cy = float(b.get("cy", (b.get("y1", 0) + b.get("y2", 0)) / 2.0))
+                        conf = float(b.get("confidence", b.get("conf", 0.5)))
+                    elif isinstance(b, (list, tuple)) and len(b) >= 5:
+                        cx = float((b[0] + b[2]) / 2.0)
+                        cy = float((b[1] + b[3]) / 2.0)
+                        conf = float(b[4])
+                    else:
+                        continue
+                    if conf >= self.conf_threshold:
+                        detections.append((cx, cy, conf))
+            return detections[:self.max_candidates_per_tile]
+        except Exception as e:
+            print(f"[MitosisDetector Vertex AI Error] {e}. Falling back to visual feature extractor.")
+            return []
+
     def detect(self, tile_rgb: np.ndarray) -> List[Tuple[float, float, float]]:
         """
         Sweeps 40x tile (1024x1024 px) for mitotic candidates.
         """
+        # 1. Try Vertex AI Endpoint first if configured
+        if self.vertex_endpoint is not None:
+            vertex_results = self._detect_vertex_ai(tile_rgb)
+            if vertex_results:
+                return vertex_results
+
+        # 2. Try Local YOLO Model if loaded
         if self.model is not None:
             try:
                 # If Ultralytics YOLO predict interface exists
