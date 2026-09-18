@@ -527,7 +527,7 @@ export function TriageViewer({
         )}
 
         {/* Heatmap & Hotspot Locations Mask Floating Toolbar */}
-        <div className="absolute top-4 left-4 z-20 bg-slate-900/95 backdrop-blur border border-slate-800 rounded-lg p-3 shadow-xl flex flex-col space-y-2.5">
+        <div className="absolute top-16 left-4 z-20 bg-slate-900/95 backdrop-blur border border-slate-800 rounded-lg p-3 shadow-xl flex flex-col space-y-2.5">
           {/* Row 1: Tumor Heatmap Toggle */}
           <div className="flex items-center space-x-3 justify-between">
             <div className="flex items-center space-x-2 text-xs font-semibold text-slate-200">

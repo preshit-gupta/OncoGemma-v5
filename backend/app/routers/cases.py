@@ -495,16 +495,17 @@ def approve_case_stage(
             .order_by(StageExecution.attempt.desc())
         )
         existing_next = db.scalars(stmt_next).first()
-        next_attempt = (existing_next.attempt + 1) if existing_next else 1
+        if not existing_next or existing_next.status == "failed":
+            next_attempt = (existing_next.attempt + 1) if existing_next else 1
 
-        new_stage = StageExecution(
-            case_id=case_id,
-            stage=next_stage_name,
-            attempt=next_attempt,
-            status="queued",
-            input_ref={"slide_id": str(slide_obj.id), "gcs_uri_original": slide_obj.gcs_uri_original}
-        )
-        db.add(new_stage)
+            new_stage = StageExecution(
+                case_id=case_id,
+                stage=next_stage_name,
+                attempt=next_attempt,
+                status="queued",
+                input_ref={"slide_id": str(slide_obj.id), "gcs_uri_original": slide_obj.gcs_uri_original}
+            )
+            db.add(new_stage)
 
     case_obj.status = "open"
     

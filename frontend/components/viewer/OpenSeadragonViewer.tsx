@@ -145,6 +145,16 @@ export function OpenSeadragonViewer({
   const isBaseSlideOpenRef = useRef<boolean>(false);
   const rafPendingRef = useRef<number | null>(null);
 
+  const showOverlayRef = useRef<boolean>(showOverlay);
+  useEffect(() => {
+    showOverlayRef.current = showOverlay;
+  }, [showOverlay]);
+
+  const overlayOpacityRef = useRef<number>(overlayOpacity);
+  useEffect(() => {
+    overlayOpacityRef.current = overlayOpacity;
+  }, [overlayOpacity]);
+
   // Programmatic smooth camera fly-to when focusPointUm changes
   useEffect(() => {
     if (!focusPointUm || !viewerRef.current?.viewport) return;
@@ -472,22 +482,24 @@ export function OpenSeadragonViewer({
         return;
       }
 
-      const targetOpacity = showOverlay ? overlayOpacity : 0.0;
-
-      // If overlay URI is cleared / null, remove existing overlay item
-      if (!overlayImageUri) {
-        if (overlayItemRef.current) {
+      // If overlay is disabled (!showOverlay) or no URI, cleanly remove all overlay items (index >= 1)
+      if (!showOverlay || !overlayImageUri) {
+        while (world.getItemCount() > 1) {
+          const item = world.getItemAt(world.getItemCount() - 1);
           try {
-            world.removeItem(overlayItemRef.current);
+            world.removeItem(item);
           } catch (_) {}
-          overlayItemRef.current = null;
         }
+        overlayItemRef.current = null;
         currentOverlayUriRef.current = null;
+        isAddingOverlayRef.current = false;
         if (typeof viewer.forceRedraw === "function") {
           viewer.forceRedraw();
         }
         return;
       }
+
+      const targetOpacity = overlayOpacity;
 
       // Check if we need to load or reload the overlay
       const isOverlayInWorld = overlayItemRef.current && typeof world.getIndexOfItem === "function" && world.getIndexOfItem(overlayItemRef.current) !== -1;
@@ -497,12 +509,14 @@ export function OpenSeadragonViewer({
         (!overlayItemRef.current && !isAddingOverlayRef.current);
 
       if (needsLoad) {
-        if (overlayItemRef.current) {
+        // Clean up any stale overlay items before loading a new one
+        while (world.getItemCount() > 1) {
+          const item = world.getItemAt(world.getItemCount() - 1);
           try {
-            world.removeItem(overlayItemRef.current);
+            world.removeItem(item);
           } catch (_) {}
-          overlayItemRef.current = null;
         }
+        overlayItemRef.current = null;
 
         isAddingOverlayRef.current = true;
         const uriToLoad = overlayImageUri;
@@ -537,6 +551,30 @@ export function OpenSeadragonViewer({
           success: (event: any) => {
             try {
               isAddingOverlayRef.current = false;
+
+              // If user toggled off while download was in flight, remove it immediately
+              if (!showOverlayRef.current) {
+                try {
+                  world.removeItem(event.item);
+                } catch (_) {}
+                overlayItemRef.current = null;
+                currentOverlayUriRef.current = null;
+                if (typeof viewer.forceRedraw === "function") {
+                  viewer.forceRedraw();
+                }
+                return;
+              }
+
+              // Remove any other older overlay items so there is never a duplicate
+              for (let i = world.getItemCount() - 1; i >= 1; i--) {
+                const existingItem = world.getItemAt(i);
+                if (existingItem !== event.item) {
+                  try {
+                    world.removeItem(existingItem);
+                  } catch (_) {}
+                }
+              }
+
               overlayItemRef.current = event.item;
               currentOverlayUriRef.current = uriToLoad;
 
@@ -546,8 +584,9 @@ export function OpenSeadragonViewer({
                 world.setItemIndex(event.item, count - 1);
               }
 
+              const latestOpacity = showOverlayRef.current ? overlayOpacityRef.current : 0.0;
               if (event.item && typeof event.item.setOpacity === "function") {
-                event.item.setOpacity(targetOpacity);
+                event.item.setOpacity(latestOpacity);
               }
               if (typeof viewer.forceRedraw === "function") {
                 viewer.forceRedraw();
@@ -564,7 +603,7 @@ export function OpenSeadragonViewer({
           }
         });
       } else {
-        // Overlay already loaded: smoothly update overlay item opacity and trigger redraw
+        // Overlay already loaded: update overlay item opacity and trigger redraw
         if (overlayItemRef.current && typeof overlayItemRef.current.setOpacity === "function") {
           try {
             overlayItemRef.current.setOpacity(targetOpacity);

@@ -89,13 +89,13 @@ export default function CaseWorkspacePage({ params }: { params: { id: string } }
     const reportStage = getLatestStage(stages, "report");
 
     if (!hasUserNavigated) {
-      if (reportStage && (reportStage.status === "running" || reportStage.status === "done" || reportStage.status === "confirmed" || reportStage.status === "awaiting_review")) {
+      if (reportStage && (reportStage.status === "running" || reportStage.status === "done" || reportStage.status === "confirmed" || reportStage.status === "awaiting_review") && gradingStage?.status === "confirmed") {
         setActiveStage("report");
-      } else if (gradingStage && (gradingStage.status === "running" || gradingStage.status === "done" || gradingStage.status === "confirmed" || gradingStage.status === "awaiting_review")) {
+      } else if (gradingStage && (gradingStage.status === "running" || gradingStage.status === "done" || gradingStage.status === "confirmed" || gradingStage.status === "awaiting_review") && mitosisStage?.status === "confirmed") {
         setActiveStage("grading");
-      } else if (mitosisStage && (mitosisStage.status === "running" || mitosisStage.status === "done" || mitosisStage.status === "confirmed" || mitosisStage.status === "awaiting_review")) {
+      } else if (mitosisStage && (mitosisStage.status === "running" || mitosisStage.status === "done" || mitosisStage.status === "confirmed" || mitosisStage.status === "awaiting_review") && triageStage?.status === "confirmed") {
         setActiveStage("mitosis");
-      } else if (triageStage && (triageStage.status === "running" || triageStage.status === "done" || triageStage.status === "confirmed" || triageStage.status === "awaiting_review") && (prepStage?.status === "confirmed" || prepStage?.status === "done")) {
+      } else if (triageStage && (triageStage.status === "running" || triageStage.status === "done" || triageStage.status === "confirmed" || triageStage.status === "awaiting_review") && prepStage?.status === "confirmed") {
         setActiveStage("triage");
       } else if (prepStage && (prepStage.status === "running" || prepStage.status === "done" || prepStage.status === "confirmed" || prepStage.status === "awaiting_review" || prepStage.status === "queued")) {
         setActiveStage("preprocess");
