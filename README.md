@@ -148,14 +148,16 @@ flowchart TD
     Q -->|"Yes: Malignant Pathway"| R["Confirm Hotspots -> Queue Stage 4 Mitosis (10 HPFs Forwarded)"]
     Q -->|"No + no_invasive_tumor=True"| S["Benign Protocol -> Skip to Stage 6 Report"]
 ```
-* **Tissue Mask Opening & Debris Pruning**: Applies morphological opening (`scipy.ndimage.binary_opening`) and component size thresholding ($\ge 25$ cells) to prune isolated dust specks, glass margin shearing, and mechanical slide artifacts before patch placement.
-* **Smart Scout Non-Overlapping Grid**: Partitions slide into discrete 224 × 224 µm (887 × 887 px) tiles with strict zero geometric overlap ($\text{Intersection} = \emptyset$). Samples up to 2,048 patches with 80% cellularity-guided allocation targeting dense epithelial carcinoma nests and 20% slide-wide spatial context.
-* **Google Path Foundation & Cellularity (OD) Fusion**: Queries dedicated Vertex AI Vision Transformer (ViT) endpoint (`asia-south1`) to extract 384-dimensional representation vectors. Fuses representation probe probabilities (35%) with authentic histological nuclear cellularity ($OD_{\text{norm}}$, 65%) and Euclidean margin distance transforms (`dist_from_edge`), elevating dense interior tumor nests to 0.75 – 0.95 while penalizing border specks and acellular stroma.
+* **Tissue Mask Opening & Debris Pruning**: Applies morphological opening (`scipy.ndimage.binary_opening`) and component size thresholding (≥ 25 cells) to prune isolated dust specks, glass margin shearing, and mechanical slide artifacts before patch placement.
+* **Smart Scout Non-Overlapping Grid**: Partitions slide into discrete 224 × 224 µm (887 × 887 px) tiles with strict zero geometric overlap (`Intersection = ∅`). Samples up to 2,048 patches with 80% cellularity-guided allocation targeting dense epithelial carcinoma nests and 20% slide-wide spatial context.
+* **Google Path Foundation & Cellularity (OD) Fusion**: Queries dedicated Vertex AI Vision Transformer (ViT) endpoint (`asia-south1`) to extract 384-dimensional representation vectors. Fuses representation probe probabilities (35%) with authentic histological nuclear cellularity (`OD_norm`, 65%) and Euclidean margin distance transforms (`dist_from_edge`), elevating dense interior tumor nests to 0.75 – 0.95 while penalizing border specks and acellular stroma.
 * **Edge-Damped Candidate Extraction**: Replaces bare division smoothing with edge-damped confidence weighting:
-  $$S_{\text{smoothed}} = \left(\frac{P_{\text{smooth}}}{\max(W_{\text{smooth}}, 0.35)}\right) \cdot \min\left(1.0, \frac{W_{\text{smooth}}}{0.50}\right)$$
-  *(where $P_{\text{smooth}}$ is the distance-weighted tumor probability sum, and $W_{\text{smooth}}$ is the spatial kernel weight sum)*, anchoring hotspot centers within cohesive biopsy core interiors rather than on fragile shearing margins.
 
+  $$S = \left(\frac{P}{\max(W, 0.35)}\right) \cdot \min\left(1.0, \frac{W}{0.50}\right)$$
+
+  Anchors hotspot centers within cohesive biopsy core interiors rather than on fragile shearing margins (where $P$ is the distance-weighted tumor probability sum and $W$ is the spatial kernel weight sum).
 * **Strict MedGemma 1.5 Multimodal Visual Referee**: Evaluates 10× candidate crops (512 × 512 µm) using visual pathology prompting with strict morphological gating: immediately rejects peripheral edge crops (< 40% tissue coverage) as `adipose` / background and hypocellular collagen (< 5% basophilic nuclei) as `benign_stroma`, safeguarding that only bona fide invasive carcinoma nests are retained.
+
 
 * **Prioritized Top 10 Hotspots & DB Synchronization**: Ranks verified invasive carcinoma first, assigns standardized identifiers `hs_01` through `hs_10` with attached `medgemma_rationale`, and syncs GCS artifacts with PostgreSQL `hotspots` table to unblock Stage 4 Mitosis.
 * **Ergonomic UI & Fluid Heatmap**: Non-overlapping floating controls ensure heatmap toggles, hotspot visibility, and layer switchers remain unobstructed. Heatmap toggle reliably flushes canvas overlay; Microscopic Morphology Inspector modal exposes referee diagnostics.
@@ -187,7 +189,8 @@ flowchart TD
   * **10× Context Field (512 × 512 µm)**: Evaluates architectural environment—differentiating invasive carcinoma nests from benign stroma, fat, or inflammation.
 * **Clinical Mimic Suppression**: Systematically rejects hyperchromatic resting lymphocytes (smooth contours, intact membranes, 5–7 µm diameter) and apoptotic bodies (pyknotic chromatin fragments surrounded by clear retraction halos).
 * **Pathologist Review Preservation & Immutability**: Pipeline re-runs strictly isolate and purge model-generated detections (`label_source == "model"`). Pathologist-confirmed mitoses, manual reclassifications, and user-added figures (`label_source == "pathologist"`) are permanently preserved in PostgreSQL/SQLite.
-* **Standardized 10 Virtual HPFs & Nottingham Scoring**: Places 10 standardized high-power circular fields ($r = 262\ \mu\text{m}$, total area 2.157 mm²) strictly in high-cellularity zones ($\ge 70\%$ parenchyma). Computes standardized density ($\text{mitoses}/\text{mm}^2$) and deterministic Nottingham score: Score 1 ($< 3.65/\text{mm}^2$), Score 2 ($3.65 - 7.30/\text{mm}^2$), Score 3 ($\ge 7.30/\text{mm}^2$).
+* **Standardized 10 Virtual HPFs & Nottingham Scoring**: Places 10 standardized high-power circular fields (radius $r = 262$ µm, total area 2.157 mm²) strictly in high-cellularity zones (≥ 70% parenchyma). Computes standardized density (mitoses/mm²) and deterministic Nottingham score: Score 1 (< 3.65 / mm²), Score 2 (3.65 – 7.30 / mm²), Score 3 (≥ 7.30 / mm²).
+
 * **Truthful Model Provenance & Ergonomic Studio**: The UI exposes real-time model fingerprints (`vertex_ai_midog@6276949705008087040 | gemini-2.5-flash@van_diest`), displays an automatic amber fallback alert banner whenever running in heuristic fallback mode, and offers rapid review workflows with spacebar magnification toggle (10× ↔ 40×) and keyboard hotkeys (<kbd>M</kbd> Mitosis, <kbd>X</kbd> Reject).
 
 
