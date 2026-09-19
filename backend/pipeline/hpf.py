@@ -290,7 +290,12 @@ def greedy_place_hpfs(
                 score_field = working_density * eligible
                 max_val = np.max(score_field)
                 if max_val <= 0.0:
-                    break
+                    # Tissue coverage fallback: place within densest tissue of hotspot
+                    tissue_scores = coverage_grid * eligible
+                    if np.max(tissue_scores) <= 0.0:
+                        break
+                    score_field = tissue_scores
+                    max_val = np.max(score_field)
 
                 gy, gx = np.unravel_index(np.argmax(score_field), score_field.shape)
                 cx_um = float(origin_x + gx * stride)
@@ -315,13 +320,20 @@ def greedy_place_hpfs(
                         "source": "model"
                     })
                     _suppress(gy, gx, r_sep_cells)
+                    # Also zero out local coverage to avoid placing overlapping field
+                    y_min = max(0, int(gy - r_sep_cells))
+                    y_max = min(ny, int(gy + r_sep_cells + 1))
+                    x_min = max(0, int(gx - r_sep_cells))
+                    x_max = min(nx, int(gx + r_sep_cells + 1))
+                    coverage_grid[y_min:y_max, x_min:x_max] = 0.0
                 else:
                     # Suppress single cell to prevent infinite loop on invalid peak
                     working_density[gy, gx] = 0.0
+                    coverage_grid[gy, gx] = 0.0
 
-    # Pass 3: Search within valid tissue mask (never in empty glass)
-    # Issue #747: Only run unconstrained tissue search if hotspots were NOT explicitly provided
-    if len(placed_hpfs) < count and hotspot_polygons_um is None:
+    # Pass 3: Search within valid tissue mask across the entire tumor bed (never on empty glass)
+    # Strictly guarantees standardized 10 HPFs (>2.0 mm²) even if hotspots are narrow or restricted
+    if len(placed_hpfs) < count:
         for sep_req in (relaxed_min_separation_um, radius_um * 1.0):
             r_relax_cells = sep_req / stride
             while len(placed_hpfs) < count:
@@ -329,7 +341,11 @@ def greedy_place_hpfs(
                 score_field = working_density * eligible * (1.0 + 0.1 * coverage_grid)
                 max_val = np.max(score_field)
                 if max_val <= 0.0:
-                    break
+                    tissue_scores = coverage_grid * eligible
+                    if np.max(tissue_scores) <= 0.0:
+                        break
+                    score_field = tissue_scores
+                    max_val = np.max(score_field)
 
                 gy, gx = np.unravel_index(np.argmax(score_field), score_field.shape)
                 cx_um = float(origin_x + gx * stride)
@@ -354,8 +370,14 @@ def greedy_place_hpfs(
                         "source": "model"
                     })
                     _suppress(gy, gx, r_relax_cells)
+                    y_min = max(0, int(gy - r_relax_cells))
+                    y_max = min(ny, int(gy + r_relax_cells + 1))
+                    x_min = max(0, int(gx - r_relax_cells))
+                    x_max = min(nx, int(gx + r_relax_cells + 1))
+                    coverage_grid[y_min:y_max, x_min:x_max] = 0.0
                 else:
                     working_density[gy, gx] = 0.0
+                    coverage_grid[gy, gx] = 0.0
 
     return placed_hpfs[:count]
 

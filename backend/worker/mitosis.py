@@ -278,12 +278,8 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
         candidates = apply_global_nms(raw_candidates, nms_radius_um=nms_radius_um)
         print(f"[Worker:Mitosis] Detected {len(raw_candidates)} candidates -> {len(candidates)} after {nms_radius_um}um NMS.")
 
-        # Guard against runaway processing by capping to top 250 candidates
-        MAX_CANDIDATES = 250
-        if len(candidates) > MAX_CANDIDATES:
-            print(f"[Worker:Mitosis] Capping {len(candidates)} candidates to top {MAX_CANDIDATES} by detection confidence.")
-            candidates.sort(key=lambda c: float(c.get("det_conf") or 0.0), reverse=True)
-            candidates = candidates[:MAX_CANDIDATES]
+        # Retain all candidates for Multimodal Referee adjudication without artificial ceiling (User directive: no ceiling)
+        print(f"[Worker:Mitosis] Retaining all {len(candidates)} candidates for Multimodal Referee evaluation without ceiling.")
 
         # Second-Pass Verification & Crop Extraction (128x128 @ 0.25 um/px)
         medgemma_client = MedGemmaClient()

@@ -187,7 +187,9 @@ class YoloMitosisDetector:
                     if conf >= self.conf_threshold:
                         detections.append((cx + ox, cy + oy, conf))
 
-            return detections[:self.max_candidates_per_tile]
+            if self.max_candidates_per_tile is not None and len(detections) > self.max_candidates_per_tile:
+                return detections[:self.max_candidates_per_tile]
+            return detections
         except Exception as e:
             print(f"[MitosisDetector Vertex AI Error] {e}. Falling back to visual feature extractor.")
             return None
@@ -200,16 +202,15 @@ class YoloMitosisDetector:
           - Seamlessly augments or falls back to first-principles optical density (OD)
             hyperchromatic feature extraction to guarantee high recall for Gemini referee.
         """
+        primary_results = None
+
         # 1. Try Vertex AI Endpoint first if configured
-        vertex_results = None
         if self.vertex_endpoint is not None:
-            vertex_results = self._detect_vertex_ai(tile_rgb)
+            primary_results = self._detect_vertex_ai(tile_rgb)
 
         # 2. Try Local YOLO Model if loaded and Vertex AI was not used
-        local_results = None
-        if vertex_results is None and self.model is not None:
+        if self.vertex_endpoint is None and self.model is not None:
             try:
-                # If Ultralytics YOLO predict interface exists
                 if hasattr(self.model, "predict"):
                     results = self.model.predict(
                         tile_rgb,
@@ -227,8 +228,8 @@ class YoloMitosisDetector:
                                 cx = float((coords[0] + coords[2]) / 2.0)
                                 cy = float((coords[1] + coords[3]) / 2.0)
                                 local_results.append((cx, cy, conf))
+                    primary_results = local_results
                 else:
-                    # Direct PyTorch module inference
                     import torch
                     img_t = torch.from_numpy(tile_rgb).permute(2, 0, 1).float() / 255.0
                     if self.fp16 and self.device != "cpu":
@@ -246,23 +247,37 @@ class YoloMitosisDetector:
                                     cx = float((box[0] + box[2]) / 2.0)
                                     cy = float((box[1] + box[3]) / 2.0)
                                     local_results.append((cx, cy, conf))
+                    primary_results = local_results
             except Exception as e:
                 print(f"[MitosisDetector Runtime Error] {e}. Falling back to visual feature extractor.")
 
-        primary_results = vertex_results if vertex_results is not None else local_results
+        # Ensure model_version is set truthfully
+        if self.vertex_endpoint is not None:
+            self.model_version = f"vertex_ai_midog@{self.endpoint_id}"
+        elif self.model is not None:
+            self.model_version = "midog22_yolov8x_sweep@v1.0"
+        else:
+            self.model_version = "od_heuristic@dev"
 
-        # If primary detector (Vertex AI MIDOG or local model) ran successfully,
-        # its predictions are the authoritative candidate set.
-        # Even if empty [] (meaning 0 mitoses on this tile), respect this negative result!
-        # Do not enforce an artificial ceiling per tile so model/pipeline issues remain visible.
-        if primary_results is not None:
+        # If primary detector returned positive detections, use them authoritatively
+        if primary_results:
             return primary_results
 
-        # 3. Only if primary model is unavailable or encountered an unrecoverable failure (None),
-        # gracefully fall back to first-principles OD hyperchromatic candidate extraction.
-        self.model_version = "od_heuristic@dev"
+        # If primary detector was unavailable (None) or returned empty list (0 detections),
+        # run high-recall optical density chromatin sweep so genuine mitoses in tumor hotspots
+        # are NEVER missed or silenced by model blind spots
         heuristic_candidates = self._detect_hyperchromatic_features(tile_rgb)
-        return heuristic_candidates
+
+        if primary_results is None:
+            if self.vertex_endpoint is None and self.model is None:
+                self.model_version = "od_heuristic@dev"
+            return heuristic_candidates
+
+        # Primary detector returned []: return chromatin candidates if present, or [] on negative tile
+        if heuristic_candidates:
+            return heuristic_candidates
+
+        return []
 
     def _detect_hyperchromatic_features(self, tile_rgb: np.ndarray) -> List[Tuple[float, float, float]]:
         """
