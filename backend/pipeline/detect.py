@@ -101,24 +101,71 @@ class YoloMitosisDetector:
                 self.model = None
                 self.model_version = "od_heuristic@dev"
 
-    def _detect_vertex_ai(self, tile_rgb: np.ndarray) -> List[Tuple[float, float, float]]:
-        """Queries remote Google Cloud Vertex AI endpoint for mitosis predictions."""
+    def _detect_vertex_ai(self, tile_rgb: np.ndarray) -> Optional[List[Tuple[float, float, float]]]:
+        """Queries remote Google Cloud Vertex AI endpoint for mitosis predictions.
+
+        Dynamically sub-patches large tiles (e.g. 1024x1024) into 512x512 sub-patches
+        conforming to the MIDOG KongNet detector contract, batches them in a single predict call,
+        remaps detected bounding-box coordinates to the tile reference frame, and checks for
+        endpoint error responses to enable graceful fallback.
+        """
         if self.vertex_endpoint is None:
-            return []
+            return None
         try:
-            img = Image.fromarray(tile_rgb)
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=90)
-            b64_str = base64.b64encode(buf.getvalue()).decode("utf-8")
-            instances = [{
-                "image_bytes": b64_str,
-                "confidence_threshold": self.conf_threshold
-            }]
+            h, w, _ = tile_rgb.shape
+            target_patch_size = 512
+            instances = []
+            offsets = []  # List of tuples: (ox, oy, ph, pw)
+
+            if h <= target_patch_size and w <= target_patch_size:
+                if h == target_patch_size and w == target_patch_size:
+                    patch = tile_rgb
+                else:
+                    padded = np.full((target_patch_size, target_patch_size, 3), 255, dtype=tile_rgb.dtype)
+                    padded[:h, :w] = tile_rgb
+                    patch = padded
+                img = Image.fromarray(patch)
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=90)
+                b64_str = base64.b64encode(buf.getvalue()).decode("utf-8")
+                instances.append({
+                    "image_bytes": b64_str,
+                    "confidence_threshold": self.conf_threshold
+                })
+                offsets.append((0, 0, h, w))
+            else:
+                for y in range(0, h, target_patch_size):
+                    for x in range(0, w, target_patch_size):
+                        sub = tile_rgb[y:min(y + target_patch_size, h), x:min(x + target_patch_size, w)]
+                        ph, pw, _ = sub.shape
+                        if ph != target_patch_size or pw != target_patch_size:
+                            padded = np.full((target_patch_size, target_patch_size, 3), 255, dtype=tile_rgb.dtype)
+                            padded[:ph, :pw] = sub
+                            sub = padded
+                        img = Image.fromarray(sub)
+                        buf = io.BytesIO()
+                        img.save(buf, format="JPEG", quality=90)
+                        b64_str = base64.b64encode(buf.getvalue()).decode("utf-8")
+                        instances.append({
+                            "image_bytes": b64_str,
+                            "confidence_threshold": self.conf_threshold
+                        })
+                        offsets.append((x, y, ph, pw))
+
             response = self.vertex_endpoint.predict(instances=instances)
+            if not response or not hasattr(response, "predictions") or not response.predictions:
+                print("[MitosisDetector Vertex AI] Empty response from endpoint. Falling back to feature extractor.")
+                return None
+
             detections = []
-            if response and response.predictions:
-                preds = response.predictions[0]
+            for idx, (preds, (ox, oy, ph, pw)) in enumerate(zip(response.predictions, offsets)):
+                if isinstance(preds, dict) and preds.get("error"):
+                    print(f"[MitosisDetector Vertex AI Warning] Endpoint error on patch #{idx}: {preds.get('error')}. Falling back.")
+                    return None
+
                 boxes = preds.get("boxes", preds) if isinstance(preds, dict) else preds
+                if not isinstance(boxes, (list, tuple)):
+                    continue
                 for b in boxes:
                     if isinstance(b, dict):
                         cx = float(b.get("cx", (b.get("x1", 0) + b.get("x2", 0)) / 2.0))
@@ -130,8 +177,16 @@ class YoloMitosisDetector:
                         conf = float(b[4])
                     else:
                         continue
+
+                    # Discard any candidate located in the padded margin
+                    if pw < target_patch_size and cx >= pw:
+                        continue
+                    if ph < target_patch_size and cy >= ph:
+                        continue
+
                     if conf >= self.conf_threshold:
-                        detections.append((cx, cy, conf))
+                        detections.append((cx + ox, cy + oy, conf))
+
             return detections[:self.max_candidates_per_tile]
         except Exception as e:
             print(f"[MitosisDetector Vertex AI Error] {e}. Falling back to visual feature extractor.")
@@ -145,7 +200,14 @@ class YoloMitosisDetector:
         if self.vertex_endpoint is not None:
             vertex_results = self._detect_vertex_ai(tile_rgb)
             if vertex_results is not None:
-                return vertex_results
+                if len(vertex_results) > 0:
+                    return vertex_results
+                # If Vertex AI successfully ran without error but returned 0 candidates,
+                # use first-principles optical density features as a high-recall candidate safety net
+                heuristic_candidates = self._detect_hyperchromatic_features(tile_rgb)
+                if heuristic_candidates:
+                    return heuristic_candidates[:self.max_candidates_per_tile]
+                return []
 
         # 2. Try Local YOLO Model if loaded
         if self.model is not None:

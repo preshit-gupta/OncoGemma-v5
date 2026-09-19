@@ -206,3 +206,92 @@ def test_mitosis_confirmation_long_rationale_sanitization():
     assert len(resp.rationale) > 500
     assert len(resp.rationale) <= 4000
 
+
+def test_yolo_detector_vertex_ai_1024_subpatching():
+    """Verify 1024x1024 tile is sliced into 4x 512x512 sub-patches and coordinates are properly remapped."""
+    with patch("google.cloud.aiplatform.Endpoint") as mock_endpoint_cls, \
+         patch("google.cloud.aiplatform.init"):
+        mock_endpoint = MagicMock()
+        mock_endpoint_cls.return_value = mock_endpoint
+
+        # Return 1 box from patch (0,0) and 1 box from patch (512, 512)
+        mock_endpoint.predict.return_value = MagicMock(
+            predictions=[
+                {"boxes": [{"cx": 100.0, "cy": 120.0, "confidence": 0.88}]},  # patch (0, 0)
+                {"boxes": []},                                                  # patch (512, 0)
+                {"boxes": []},                                                  # patch (0, 512)
+                {"boxes": [{"cx": 50.0, "cy": 60.0, "confidence": 0.92}]}     # patch (512, 512)
+            ]
+        )
+
+        detector = YoloMitosisDetector(endpoint_id="projects/123/locations/us-central1/endpoints/456")
+        tile_1024 = np.ones((1024, 1024, 3), dtype=np.uint8) * 200
+        detections = detector.detect(tile_1024)
+
+        # Verify 4 instances were submitted in the single batch call
+        call_kwargs = mock_endpoint.predict.call_args[1]
+        assert len(call_kwargs["instances"]) == 4
+
+        # Verify remapped coordinates
+        assert len(detections) == 2
+        # Patch (0, 0): cx=100.0, cy=120.0
+        assert detections[0] == (100.0, 120.0, 0.88)
+        # Patch (512, 512): cx=50.0 + 512 = 562.0, cy=60.0 + 512 = 572.0
+        assert detections[1] == (562.0, 572.0, 0.92)
+
+
+def test_yolo_detector_vertex_ai_error_triggers_fallback():
+    """Verify that an endpoint error response causes _detect_vertex_ai to return None and fallback to heuristic."""
+    with patch("google.cloud.aiplatform.Endpoint") as mock_endpoint_cls, \
+         patch("google.cloud.aiplatform.init"):
+        mock_endpoint = MagicMock()
+        mock_endpoint_cls.return_value = mock_endpoint
+
+        # Endpoint returns an error payload (the exact error observed in RCA)
+        mock_endpoint.predict.return_value = MagicMock(
+            predictions=[{
+                "boxes": [],
+                "error": "Expected dimensions (512, 512), but got (1024, 1024)."
+            }]
+        )
+
+        detector = YoloMitosisDetector(endpoint_id="projects/123/locations/us-central1/endpoints/456")
+
+        # Test _detect_vertex_ai directly returns None on error
+        dummy_tile = np.ones((512, 512, 3), dtype=np.uint8) * 200
+        assert detector._detect_vertex_ai(dummy_tile) is None
+
+
+def test_yolo_detector_vertex_ai_non_standard_tile_padding():
+    """Verify non-standard tile sizes (e.g. 768x768) are padded to multiples of 512 and margin candidates filtered."""
+    with patch("google.cloud.aiplatform.Endpoint") as mock_endpoint_cls, \
+         patch("google.cloud.aiplatform.init"):
+        mock_endpoint = MagicMock()
+        mock_endpoint_cls.return_value = mock_endpoint
+
+        # 768x768 slices into 4 patches (2x2 grid) of 512x512
+        # Patch 3 (bottom-right) covers valid region [0:256, 0:256], and padding [256:512, 256:512]
+        mock_endpoint.predict.return_value = MagicMock(
+            predictions=[
+                {"boxes": []},
+                {"boxes": []},
+                {"boxes": []},
+                {"boxes": [
+                    {"cx": 100.0, "cy": 100.0, "confidence": 0.85},  # inside valid region (100 < 256)
+                    {"cx": 350.0, "cy": 350.0, "confidence": 0.90}   # in padded margin (350 >= 256) -> should be discarded
+                ]}
+            ]
+        )
+
+        detector = YoloMitosisDetector(endpoint_id="projects/123/locations/us-central1/endpoints/456")
+        tile_768 = np.ones((768, 768, 3), dtype=np.uint8) * 200
+        detections = detector.detect(tile_768)
+
+        call_kwargs = mock_endpoint.predict.call_args[1]
+        assert len(call_kwargs["instances"]) == 4
+
+        # Only the candidate in the valid region should survive: 512 + 100 = 612
+        assert len(detections) == 1
+        assert detections[0] == (612.0, 612.0, 0.85)
+
+
