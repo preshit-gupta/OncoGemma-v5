@@ -195,23 +195,19 @@ class YoloMitosisDetector:
     def detect(self, tile_rgb: np.ndarray) -> List[Tuple[float, float, float]]:
         """
         Sweeps 40x tile (1024x1024 px) for mitotic candidates.
+        Uses two-stage high-recall sweeping:
+          - Queries Vertex AI Endpoint (MIDOG/KongNet/YOLO) if configured
+          - Seamlessly augments or falls back to first-principles optical density (OD)
+            hyperchromatic feature extraction to guarantee high recall for Gemini referee.
         """
         # 1. Try Vertex AI Endpoint first if configured
+        vertex_results = None
         if self.vertex_endpoint is not None:
             vertex_results = self._detect_vertex_ai(tile_rgb)
-            if vertex_results is not None:
-                # Valid endpoint response: trust model output (even if empty for negative tiles)
-                return vertex_results
 
-            # Only fall back to optical density heuristics if Vertex AI encountered an error / exception
-            print("[MitosisDetector] Vertex AI inference returned None (error). Falling back to visual feature extractor.")
-            heuristic_candidates = self._detect_hyperchromatic_features(tile_rgb)
-            if heuristic_candidates:
-                return heuristic_candidates[:self.max_candidates_per_tile]
-            return []
-
-        # 2. Try Local YOLO Model if loaded
-        if self.model is not None:
+        # 2. Try Local YOLO Model if loaded and Vertex AI was not used
+        local_results = None
+        if vertex_results is None and self.model is not None:
             try:
                 # If Ultralytics YOLO predict interface exists
                 if hasattr(self.model, "predict"):
@@ -222,7 +218,7 @@ class YoloMitosisDetector:
                         verbose=False,
                         half=self.fp16
                     )
-                    detections = []
+                    local_results = []
                     for r in results:
                         if hasattr(r, "boxes") and r.boxes is not None:
                             for box in r.boxes:
@@ -230,33 +226,54 @@ class YoloMitosisDetector:
                                 conf = float(box.conf[0].item())
                                 cx = float((coords[0] + coords[2]) / 2.0)
                                 cy = float((coords[1] + coords[3]) / 2.0)
-                                detections.append((cx, cy, conf))
-                    return detections[:self.max_candidates_per_tile]
-
-                # Direct PyTorch module inference
-                import torch
-                img_t = torch.from_numpy(tile_rgb).permute(2, 0, 1).float() / 255.0
-                if self.fp16 and self.device != "cpu":
-                    img_t = img_t.half()
-                img_t = img_t.unsqueeze(0).to(self.device)
-                with torch.no_grad():
-                    preds = self.model(img_t)
-                detections = []
-                if isinstance(preds, (list, tuple)) and len(preds) > 0:
-                    raw_boxes = preds[0]
-                    if hasattr(raw_boxes, "shape") and len(raw_boxes.shape) >= 2 and raw_boxes.shape[-1] >= 5:
-                        for box in raw_boxes:
-                            conf = float(box[4])
-                            if conf >= self.conf_threshold:
-                                cx = float((box[0] + box[2]) / 2.0)
-                                cy = float((box[1] + box[3]) / 2.0)
-                                detections.append((cx, cy, conf))
-                return detections[:self.max_candidates_per_tile]
+                                local_results.append((cx, cy, conf))
+                else:
+                    # Direct PyTorch module inference
+                    import torch
+                    img_t = torch.from_numpy(tile_rgb).permute(2, 0, 1).float() / 255.0
+                    if self.fp16 and self.device != "cpu":
+                        img_t = img_t.half()
+                    img_t = img_t.unsqueeze(0).to(self.device)
+                    with torch.no_grad():
+                        preds = self.model(img_t)
+                    local_results = []
+                    if isinstance(preds, (list, tuple)) and len(preds) > 0:
+                        raw_boxes = preds[0]
+                        if hasattr(raw_boxes, "shape") and len(raw_boxes.shape) >= 2 and raw_boxes.shape[-1] >= 5:
+                            for box in raw_boxes:
+                                conf = float(box[4])
+                                if conf >= self.conf_threshold:
+                                    cx = float((box[0] + box[2]) / 2.0)
+                                    cy = float((box[1] + box[3]) / 2.0)
+                                    local_results.append((cx, cy, conf))
             except Exception as e:
                 print(f"[MitosisDetector Runtime Error] {e}. Falling back to visual feature extractor.")
 
-        # Algorithmic optical density & hyperchromatic nuclear detection fallback
-        return self._detect_hyperchromatic_features(tile_rgb)
+        primary_results = vertex_results if vertex_results is not None else local_results
+
+        # 3. Always extract OD hyperchromatic features for fallback and hybrid recall assurance
+        heuristic_candidates = self._detect_hyperchromatic_features(tile_rgb)
+
+        if primary_results is not None and len(primary_results) > 0:
+            if not heuristic_candidates:
+                return primary_results[:self.max_candidates_per_tile]
+
+            # Combine primary model detections with OD candidates, deduplicating within 40px radius (~10 um)
+            combined = list(primary_results)
+            for hc in heuristic_candidates:
+                if not any(math.hypot(hc[0] - pc[0], hc[1] - pc[1]) < 40.0 for pc in primary_results):
+                    combined.append(hc)
+            combined.sort(key=lambda c: c[2], reverse=True)
+            return combined[:self.max_candidates_per_tile]
+
+        # If primary model detector returned empty [] or failed, fall back to OD heuristic
+        if heuristic_candidates:
+            return heuristic_candidates[:self.max_candidates_per_tile]
+
+        if primary_results is not None:
+            return primary_results
+
+        return []
 
     def _detect_hyperchromatic_features(self, tile_rgb: np.ndarray) -> List[Tuple[float, float, float]]:
         """
