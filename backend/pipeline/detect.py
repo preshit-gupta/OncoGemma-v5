@@ -43,7 +43,7 @@ class YoloMitosisDetector:
         endpoint_id: Optional[str] = None,
         conf_threshold: float = 0.35,
         device: str = "cpu",
-        max_candidates_per_tile: int = 12,
+        max_candidates_per_tile: Optional[int] = None,
         batch_size: int = 16,
         fp16: bool = False
     ):
@@ -254,15 +254,15 @@ class YoloMitosisDetector:
         # If primary detector (Vertex AI MIDOG or local model) ran successfully,
         # its predictions are the authoritative candidate set.
         # Even if empty [] (meaning 0 mitoses on this tile), respect this negative result!
-        # NEVER pollute deep-learning predictions with uncalibrated optical density blobs.
+        # Do not enforce an artificial ceiling per tile so model/pipeline issues remain visible.
         if primary_results is not None:
-            return primary_results[:self.max_candidates_per_tile]
+            return primary_results
 
         # 3. Only if primary model is unavailable or encountered an unrecoverable failure (None),
         # gracefully fall back to first-principles OD hyperchromatic candidate extraction.
         self.model_version = "od_heuristic@dev"
         heuristic_candidates = self._detect_hyperchromatic_features(tile_rgb)
-        return heuristic_candidates[:self.max_candidates_per_tile]
+        return heuristic_candidates
 
     def _detect_hyperchromatic_features(self, tile_rgb: np.ndarray) -> List[Tuple[float, float, float]]:
         """
@@ -334,9 +334,10 @@ class YoloMitosisDetector:
             for c in candidates:
                 if not any(math.hypot(c[0] - s[0], c[1] - s[1]) < 80.0 for s in suppressed):
                     suppressed.append(c)
-            if len(suppressed) > self.max_candidates_per_tile:
+            if self.max_candidates_per_tile is not None and len(suppressed) > self.max_candidates_per_tile:
                 print(f"[MitosisDetector] Capping {len(suppressed)} tile candidates to max limit {self.max_candidates_per_tile}")
-            return suppressed[:self.max_candidates_per_tile]
+                return suppressed[:self.max_candidates_per_tile]
+            return suppressed
         except ImportError:
             # Fallback if OpenCV is not available
             stride = 48
@@ -358,7 +359,9 @@ class YoloMitosisDetector:
             for c in candidates:
                 if not any(math.hypot(c[0] - s[0], c[1] - s[1]) < 80.0 for s in suppressed):
                     suppressed.append(c)
-            return suppressed[:12]
+            if self.max_candidates_per_tile is not None and len(suppressed) > self.max_candidates_per_tile:
+                return suppressed[:self.max_candidates_per_tile]
+            return suppressed
 
 
 def apply_global_nms(

@@ -183,11 +183,9 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
         # Initialize detectors & verifiers with weights from config
         det_weights = det_cfg.get("weights_path")
         ver_weights = ver_cfg.get("weights_path")
-        max_cands_per_tile = det_cfg.get("max_candidates_per_tile", 12)
         detector = YoloMitosisDetector(
             weights_path=det_weights,
-            conf_threshold=det_thresh,
-            max_candidates_per_tile=max_cands_per_tile
+            conf_threshold=det_thresh
         )
         verifier = HoVerNetMitosisVerifier(weights_path=ver_weights, threshold=ver_thresh)
 
@@ -360,14 +358,10 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
         # Multimodal Referee Cross-Check (Concurrent via ThreadPoolExecutor)
         from concurrent.futures import ThreadPoolExecutor
 
-        referee_candidates = [
-            c for c in candidates if c.get("label") in ("unreviewed", "mitosis")
-        ]
-        # Prioritize candidates by detection confidence
-        referee_candidates.sort(key=lambda c: float(c.get("det_conf") or 0.0), reverse=True)
-
-        MAX_REFEREE_CANDIDATES = 100
-        candidates_to_referee = referee_candidates[:MAX_REFEREE_CANDIDATES]
+        # Every candidate passes through the Multimodal Referee (Gemini / MedGemma)
+        # No candidate is left unrefereed
+        candidates_to_referee = list(candidates)
+        candidates_to_referee.sort(key=lambda c: float(c.get("det_conf") or 0.0), reverse=True)
 
         # Pre-extract dual-magnification views sequentially under OpenSlide lock
         # This completely eliminates lock contention and LANCZOS overhead across concurrent threads!
