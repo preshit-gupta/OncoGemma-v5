@@ -295,3 +295,27 @@ def test_yolo_detector_vertex_ai_non_standard_tile_padding():
         assert detections[0] == (612.0, 612.0, 0.85)
 
 
+def test_yolo_detector_vertex_ai_zero_detections_trusted():
+    """Verify that when Vertex AI succeeds with 0 detections on a negative tile, detect() returns [] without falling back to heuristic."""
+    with patch("google.cloud.aiplatform.Endpoint") as mock_endpoint_cls, \
+         patch("google.cloud.aiplatform.init"):
+        mock_endpoint = MagicMock()
+        mock_endpoint_cls.return_value = mock_endpoint
+
+        # Return 0 boxes across all patches
+        mock_endpoint.predict.return_value = MagicMock(
+            predictions=[
+                {"boxes": []},
+                {"boxes": []},
+                {"boxes": []},
+                {"boxes": []}
+            ]
+        )
+
+        detector = YoloMitosisDetector(endpoint_id="projects/123/locations/us-central1/endpoints/456")
+        tile_1024 = np.ones((1024, 1024, 3), dtype=np.uint8) * 200
+        detections = detector.detect(tile_1024)
+        assert detections == []
+
+
+

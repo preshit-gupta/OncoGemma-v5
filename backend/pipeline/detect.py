@@ -200,14 +200,15 @@ class YoloMitosisDetector:
         if self.vertex_endpoint is not None:
             vertex_results = self._detect_vertex_ai(tile_rgb)
             if vertex_results is not None:
-                if len(vertex_results) > 0:
-                    return vertex_results
-                # If Vertex AI successfully ran without error but returned 0 candidates,
-                # use first-principles optical density features as a high-recall candidate safety net
-                heuristic_candidates = self._detect_hyperchromatic_features(tile_rgb)
-                if heuristic_candidates:
-                    return heuristic_candidates[:self.max_candidates_per_tile]
-                return []
+                # Valid endpoint response: trust model output (even if empty for negative tiles)
+                return vertex_results
+
+            # Only fall back to optical density heuristics if Vertex AI encountered an error / exception
+            print("[MitosisDetector] Vertex AI inference returned None (error). Falling back to visual feature extractor.")
+            heuristic_candidates = self._detect_hyperchromatic_features(tile_rgb)
+            if heuristic_candidates:
+                return heuristic_candidates[:self.max_candidates_per_tile]
+            return []
 
         # 2. Try Local YOLO Model if loaded
         if self.model is not None:

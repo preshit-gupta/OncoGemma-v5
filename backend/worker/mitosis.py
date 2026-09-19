@@ -275,6 +275,13 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
         candidates = apply_global_nms(raw_candidates, nms_radius_um=nms_radius_um)
         print(f"[Worker:Mitosis] Detected {len(raw_candidates)} candidates -> {len(candidates)} after {nms_radius_um}um NMS.")
 
+        # Guard against runaway processing by capping to top 250 candidates
+        MAX_CANDIDATES = 250
+        if len(candidates) > MAX_CANDIDATES:
+            print(f"[Worker:Mitosis] Capping {len(candidates)} candidates to top {MAX_CANDIDATES} by detection confidence.")
+            candidates.sort(key=lambda c: float(c.get("det_conf") or 0.0), reverse=True)
+            candidates = candidates[:MAX_CANDIDATES]
+
         # Second-Pass Verification & Crop Extraction (128x128 @ 0.25 um/px)
         medgemma_client = MedGemmaClient()
         half_crop_px = crop_size_px // 2
@@ -347,15 +354,6 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
             cand["medgemma_rationale"] = None
             cand["medgemma_confidence"] = None
 
-            # Prepare dual-magnification composite for multimodal referee if slide available
-            if openslide_slide is not None:
-                try:
-                    f_crop_b, ctx_b = create_dual_magnification_composite(openslide_slide, cx_px, cy_px, mpp_x)
-                    cand["_composite_bytes"] = f_crop_b
-                    cand["_context_bytes"] = ctx_b
-                except Exception:
-                    pass
-
         # Multimodal Referee Cross-Check (Concurrent via ThreadPoolExecutor)
         from concurrent.futures import ThreadPoolExecutor
 
@@ -370,8 +368,19 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
 
         def _evaluate_single_referee(c_item):
             c_id = c_item["id"]
-            f_crop_b = c_item.get("_composite_bytes") or c_item.get("_crop_bytes")
-            ctx_b = c_item.get("_context_bytes")
+            f_crop_b = c_item.get("_crop_bytes")
+            ctx_b = None
+            if openslide_slide is not None:
+                try:
+                    cx_um, cy_um = c_item["centroid_um"]
+                    cx_px = int(cx_um / mpp_x)
+                    cy_px = int(cy_um / mpp_y)
+                    f_b, c_b = create_dual_magnification_composite(openslide_slide, cx_px, cy_px, mpp_x)
+                    if f_b:
+                        f_crop_b = f_b
+                    ctx_b = c_b
+                except Exception as ce:
+                    print(f"[Worker:Mitosis] Dual-magnification extraction note for {c_id}: {ce}")
 
             try:
                 mg_resp = medgemma_client.evaluate_mitosis_confirmation_sync(f_crop_b, ctx_b)
