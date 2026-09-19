@@ -165,8 +165,12 @@ def load_prompt_template(name: str, version: str = "v1") -> Tuple[str, str]:
     if not os.path.exists(prompt_path):
         raise FileNotFoundError(f"Prompt template file not found: {prompt_path}")
         
-    with open(prompt_path, "r", encoding="utf-8") as f:
-        content = f.read()
+    try:
+        with open(prompt_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except UnicodeDecodeError:
+        with open(prompt_path, "r", encoding="latin-1") as f:
+            content = f.read()
         
     sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
     return content, sha256

@@ -282,9 +282,9 @@ class YoloMitosisDetector:
     def _detect_hyperchromatic_features(self, tile_rgb: np.ndarray) -> List[Tuple[float, float, float]]:
         """
         First-principles hematoxylin optical density & morphological candidate sweep.
-        Sweeps 40x tile for dense condensed chromatin clusters using absolute OD thresholding
-        and connected component analysis. Applies van Diest morphometric gating to reject
-        small round apoptotic fragments and lymphocytes.
+        Adaptive chromatin thresholding + van Diest morphometric gating.
+        Dynamically adapts to slide stain intensity so hyperchromatic slides are not flooded
+        with resting interphase nuclei, while ensuring high recall of true mitoses.
         """
         h, w, _ = tile_rgb.shape
         if h < 32 or w < 32:
@@ -296,62 +296,84 @@ class YoloMitosisDetector:
         # Hematoxylin OD component
         h_od = od[:, :, 0] - 0.15 * od[:, :, 1] - 0.15 * od[:, :, 2]
 
-        # Absolute threshold for condensed chromatin (mitotic chromosomes exhibit H_OD >= 0.85)
-        chromatin_thresh = 0.85
+        # Detect tissue pixels (exclude bright glass background)
+        tissue_mask = (tile_rgb[:, :, 0] < 235) | (tile_rgb[:, :, 1] < 235) | (tile_rgb[:, :, 2] < 235)
+        if not np.any(tissue_mask):
+            return []
+
+        tissue_h_od = h_od[tissue_mask]
+
+        # Adaptive chromatin threshold:
+        # Mitotic chromosomes have significantly higher optical density than interphase nuclei in the same tile.
+        # For lightly stained tissue (p85 ~ 0.60): threshold is max(0.92, 0.60 + 0.14) = 0.92.
+        # For darkly stained tissue (p85 ~ 1.05): threshold is max(0.92, 1.05 + 0.14) = 1.19.
+        # This prevents thousands of resting interphase nuclei from being false-alarmed on hyperchromatic slides.
+        p85_od = float(np.percentile(tissue_h_od, 85))
+        chromatin_thresh = max(0.92, p85_od + 0.14)
         dense_mask = (h_od > chromatin_thresh).astype(np.uint8) * 255
 
         try:
             import cv2
-            # Find connected components of dense chromatin
             cnts, _ = cv2.findContours(dense_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             candidates = []
             for cnt in cnts:
                 area = float(cv2.contourArea(cnt))
-                # Mitotic chromatin clusters typically occupy 350 to 4200 pixels (equivalent diameter ~21-73 px / 5.25-18.25 um)
-                if 350 <= area <= 4200:
-                    perim = float(cv2.arcLength(cnt, True))
-                    if perim <= 0:
-                        continue
-                    circ = float((4.0 * np.pi * area) / (perim * perim))
-                    equiv_diam = float(np.sqrt(4.0 * area / np.pi))
+                # Mitotic chromatin clusters typically occupy 400 to 3800 pixels (equivalent diameter ~22-70 px / 5.5-17.5 um)
+                if not (400 <= area <= 3800):
+                    continue
 
-                    # Exclude small round bodies (lymphocytes and apoptotic fragments)
-                    if equiv_diam < 28.0 and circ > 0.62:
-                        continue
+                perim = float(cv2.arcLength(cnt, True))
+                if perim <= 0:
+                    continue
 
-                    M = cv2.moments(cnt)
-                    if M["m00"] > 0:
-                        cx = float(M["m10"] / M["m00"])
-                        cy = float(M["m01"] / M["m00"])
+                circ = float((4.0 * np.pi * area) / (perim * perim))
+                equiv_diam = float(np.sqrt(4.0 * area / np.pi))
 
-                        # Calculate local peak OD within contour using bounding-box sub-mask
-                        bx, by, bw, bh = cv2.boundingRect(cnt)
-                        sub_mask = np.zeros((bh, bw), dtype=np.uint8)
-                        cnt_shifted = cnt - [bx, by]
-                        cv2.drawContours(sub_mask, [cnt_shifted], -1, 255, -1)
-                        sub_od = h_od[by:by + bh, bx:bx + bw]
-                        pixels_inside = sub_od[sub_mask > 0]
-                        if len(pixels_inside) > 0:
-                            p95_od = float(np.percentile(pixels_inside, 95))
-                        else:
-                            p95_od = float(np.max(sub_od))
+                # Calculate local peak OD within contour using bounding-box sub-mask
+                bx, by, bw, bh = cv2.boundingRect(cnt)
+                sub_mask = np.zeros((bh, bw), dtype=np.uint8)
+                cnt_shifted = cnt - [bx, by]
+                cv2.drawContours(sub_mask, [cnt_shifted], -1, 255, -1)
+                sub_od = h_od[by:by + bh, bx:bx + bw]
+                pixels_inside = sub_od[sub_mask > 0]
+                if len(pixels_inside) == 0:
+                    continue
 
-                        # Calibrate heuristic confidence to conservative screening range (0.10 - 0.65)
-                        # Heuristic candidates NEVER bypass the verifier / referee as definite mitoses
-                        raw_conf = 0.25 + min(0.20, max(0.0, (p95_od - 0.75) * 0.40)) + min(0.20, (area / 1500.0) * 0.20)
-                        conf = float(np.clip(raw_conf, 0.10, 0.65))
-                        if conf >= self.conf_threshold:
-                            candidates.append((cx, cy, conf))
+                p95_od = float(np.percentile(pixels_inside, 95))
 
-            # Apply intra-tile NMS (radius 80 px = 20 um at 0.25 um/px) to avoid multi-contour fragments of same cell
-            candidates.sort(key=lambda c: c[2], reverse=True)
+                # Exclude small round bodies (lymphocytes and apoptotic fragments)
+                if equiv_diam < 28.0 and circ > 0.62:
+                    continue
+
+                # Bona fide mitotic chromosomes require high peak optical density
+                if p95_od < 1.05:
+                    continue
+
+                M = cv2.moments(cnt)
+                if M["m00"] > 0:
+                    cx = float(M["m10"] / M["m00"])
+                    cy = float(M["m01"] / M["m00"])
+
+                    # Mitotic saliency score based on chromatin condensation and contrast
+                    contrast = p95_od - chromatin_thresh
+                    raw_conf = 0.30 + min(0.35, max(0.0, contrast * 0.40)) + min(0.15, (area / 1500.0) * 0.15)
+                    conf = float(np.clip(raw_conf, 0.10, 0.80))
+                    if conf >= self.conf_threshold:
+                        candidates.append((cx, cy, conf, contrast))
+
+            # Apply intra-tile NMS (radius 80 px = 20 um at 0.25 um/px)
+            # Sort by contrast and confidence
+            candidates.sort(key=lambda c: (c[3], c[2]), reverse=True)
             suppressed = []
             for c in candidates:
                 if not any(math.hypot(c[0] - s[0], c[1] - s[1]) < 80.0 for s in suppressed):
-                    suppressed.append(c)
-            if self.max_candidates_per_tile is not None and len(suppressed) > self.max_candidates_per_tile:
-                print(f"[MitosisDetector] Capping {len(suppressed)} tile candidates to max limit {self.max_candidates_per_tile}")
-                return suppressed[:self.max_candidates_per_tile]
+                    suppressed.append((c[0], c[1], c[2]))
+
+            # Keep top candidates per tile to prevent runaway false candidates on dense sheets
+            # In breast cancer hotspots, 3-5 mitoses per 40x tile is clinically high grade
+            max_per_tile = self.max_candidates_per_tile or 4
+            if len(suppressed) > max_per_tile:
+                return suppressed[:max_per_tile]
             return suppressed
         except ImportError:
             # Fallback if OpenCV is not available

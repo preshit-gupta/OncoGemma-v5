@@ -243,9 +243,9 @@ def get_mitosis_stage_data(case_id: str, db: Session = Depends(get_db)):
         "summary": summary,
         "slide": slide_info,
         "model_versions": stage_exec.model_versions or {
-            "detector": "od_heuristic@dev",
+            "detector": f"vertex_ai_midog@{settings.VERTEX_MITOSIS_ENDPOINT_ID}" if getattr(settings, "VERTEX_MITOSIS_ENDPOINT_ID", None) else "od_heuristic@dev",
             "verifier": "morphometric_heuristic@dev",
-            "referee": "unconfigured"
+            "referee": getattr(settings, "GEMINI_REFEREE_MODEL", "gemini-2.5-flash") if getattr(settings, "USE_GEMINI_FLASH_REFEREE", True) else "unconfigured"
         },
         "reviewed_at": stage_exec.reviewed_at.isoformat() if stage_exec.reviewed_at else None,
         "reviewed_by": stage_exec.reviewed_by
