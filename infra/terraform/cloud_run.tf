@@ -202,6 +202,22 @@ resource "google_cloud_run_v2_job" "worker_job" {
           name  = "DATABASE_URL"
           value = "postgresql://${var.db_user}:${var.db_password}@/${var.db_name}?host=/cloudsql/${google_sql_database_instance.oncogemma_db_instance.connection_name}"
         }
+        env {
+          name  = "VERTEX_MITOSIS_ENDPOINT_ID"
+          value = "6276949705008087040"
+        }
+        env {
+          name  = "VERTEX_MITOSIS_LOCATION"
+          value = var.region
+        }
+        env {
+          name  = "USE_GEMINI_FLASH_REFEREE"
+          value = "true"
+        }
+        env {
+          name  = "GEMINI_REFEREE_MODEL"
+          value = "gemini-2.5-flash"
+        }
 
         volume_mounts {
           name       = "cloudsql"

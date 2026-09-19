@@ -183,7 +183,12 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
         # Initialize detectors & verifiers with weights from config
         det_weights = det_cfg.get("weights_path")
         ver_weights = ver_cfg.get("weights_path")
-        detector = YoloMitosisDetector(weights_path=det_weights, conf_threshold=det_thresh)
+        max_cands_per_tile = det_cfg.get("max_candidates_per_tile", 12)
+        detector = YoloMitosisDetector(
+            weights_path=det_weights,
+            conf_threshold=det_thresh,
+            max_candidates_per_tile=max_cands_per_tile
+        )
         verifier = HoVerNetMitosisVerifier(weights_path=ver_weights, threshold=ver_thresh)
 
         # Download raw slide from GCS to transient scratch file for tile & crop sampling
@@ -311,33 +316,31 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
                 print(f"[Worker:Mitosis Warning] Skipping candidate {cand['id']} - could not extract optical crop from slide")
                 continue
 
-            # Run nuclear instance verification (HoVer-Net if weights loaded, or pass through to multimodal referee)
+            # Run nuclear instance verification (HoVer-Net if weights loaded, or van Diest morphometrics)
             ver_enabled = ver_cfg.get("enabled", True)
-            if not ver_enabled or verifier.model is None:
-                # When neural verifier weights are absent, do NOT let flawed OpenCV heuristics discard true mitoses.
-                # Compute lightweight morphological features for contours, but keep candidate eligible for refereeing.
-                ver_conf, contour = verifier.verify(crop_rgb) if ver_enabled else (0.50, None)
-                cand["ver_conf"] = float(ver_conf)
-                if contour:
-                    cand["contour"] = contour
-                if cand["det_conf"] >= 0.70:
-                    cand["label"] = "mitosis"
-                elif cand["det_conf"] >= review_thresh:
-                    cand["label"] = "unreviewed"
-                else:
-                    cand["label"] = "not_mitosis"
-            else:
-                ver_conf, contour = verifier.verify(crop_rgb)
-                cand["ver_conf"] = float(ver_conf)
-                if contour:
-                    cand["contour"] = contour
+            ver_conf, contour = verifier.verify(crop_rgb) if ver_enabled else (0.50, None)
+            cand["ver_conf"] = float(ver_conf)
+            if contour:
+                cand["contour"] = contour
 
-                if ver_conf >= ver_thresh:
-                    cand["label"] = "mitosis"
-                elif ver_conf >= review_thresh or (cand["det_conf"] >= 0.70 and ver_conf >= 0.35):
-                    cand["label"] = "unreviewed"
-                else:
-                    cand["label"] = "not_mitosis"
+            det_c = float(cand.get("det_conf") or 0.0)
+            ver_c = float(ver_conf)
+
+            # Strict van Diest morphological gating:
+            # Candidates scoring ver_conf < 0.35 failed physical mitotic criteria
+            # (intact nuclear envelope, high circularity, smooth boundary, or apoptotic halo)
+            if ver_c < 0.35:
+                cand["label"] = "not_mitosis"
+                cand["label_source"] = "verifier_rejected_morphology"
+            elif ver_c >= ver_thresh and det_c >= 0.50:
+                cand["label"] = "mitosis"
+                cand["label_source"] = "verifier_confirmed"
+            elif ver_c >= review_thresh:
+                cand["label"] = "unreviewed"
+                cand["label_source"] = "candidate_sweep"
+            else:
+                cand["label"] = "not_mitosis"
+                cand["label_source"] = "verifier_rejected_morphology"
 
             # Prepare 128x128 crop PNGs for concurrent GCS upload
             crop_id = cand["id"]
@@ -360,27 +363,31 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
         referee_candidates = [
             c for c in candidates if c.get("label") in ("unreviewed", "mitosis")
         ]
-        # Prioritize top candidates by detection confidence
+        # Prioritize candidates by detection confidence
         referee_candidates.sort(key=lambda c: float(c.get("det_conf") or 0.0), reverse=True)
 
-        MAX_REFEREE_CANDIDATES = 64
+        MAX_REFEREE_CANDIDATES = 100
         candidates_to_referee = referee_candidates[:MAX_REFEREE_CANDIDATES]
 
-        def _evaluate_single_referee(c_item):
-            c_id = c_item["id"]
-            f_crop_b = c_item.get("_crop_bytes")
-            ctx_b = None
-            if openslide_slide is not None:
+        # Pre-extract dual-magnification views sequentially under OpenSlide lock
+        # This completely eliminates lock contention and LANCZOS overhead across concurrent threads!
+        if openslide_slide is not None:
+            for c_item in candidates_to_referee:
                 try:
                     cx_um, cy_um = c_item["centroid_um"]
                     cx_px = int(cx_um / mpp_x)
                     cy_px = int(cy_um / mpp_y)
                     f_b, c_b = create_dual_magnification_composite(openslide_slide, cx_px, cy_px, mpp_x)
                     if f_b:
-                        f_crop_b = f_b
-                    ctx_b = c_b
+                        c_item["_crop_bytes"] = f_b
+                    c_item["_context_bytes"] = c_b
                 except Exception as ce:
-                    print(f"[Worker:Mitosis] Dual-magnification extraction note for {c_id}: {ce}")
+                    print(f"[Worker:Mitosis] Dual-mag pre-extraction note for {c_item['id']}: {ce}")
+
+        def _evaluate_single_referee(c_item):
+            c_id = c_item["id"]
+            f_crop_b = c_item.get("_crop_bytes")
+            ctx_b = c_item.get("_context_bytes")
 
             try:
                 mg_resp = medgemma_client.evaluate_mitosis_confirmation_sync(f_crop_b, ctx_b)
@@ -392,11 +399,11 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
                 if mg_resp.verdict == "CONFIRMED":
                     c_item["label"] = "mitosis"
                     c_item["label_source"] = f"{referee_src}_confirmed"
-                    c_item["ver_conf"] = max(c_item.get("ver_conf") or 0.5, 0.88)
+                    c_item["ver_conf"] = max(c_item.get("ver_conf") or 0.5, 0.90)
                 elif mg_resp.verdict in ("REJECTED_APOPTOSIS", "REJECTED_LYMPHOCYTE", "REJECTED_RESTING_NUCLEUS"):
                     c_item["label"] = "not_mitosis"
                     c_item["label_source"] = f"{referee_src}_{mg_resp.verdict.lower()}"
-                    c_item["ver_conf"] = min(c_item.get("ver_conf") or 0.5, 0.12)
+                    c_item["ver_conf"] = min(c_item.get("ver_conf") or 0.5, 0.10)
                 else: # EQUIVOCAL
                     c_item["label"] = "unreviewed"
                     c_item["label_source"] = f"{referee_src}_equivocal"
@@ -405,9 +412,17 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
 
         if candidates_to_referee:
             ref_model_name = getattr(settings, "GEMINI_REFEREE_MODEL", "gemini-2.5-flash")
-            print(f"[Worker:Mitosis] Adjudicating {len(candidates_to_referee)} candidates via Multimodal Referee ({ref_model_name}) with 8 worker threads...")
-            with ThreadPoolExecutor(max_workers=8) as pool:
+            print(f"[Worker:Mitosis] Adjudicating {len(candidates_to_referee)} candidates via Multimodal Referee ({ref_model_name}) with 10 worker threads...")
+            with ThreadPoolExecutor(max_workers=10) as pool:
                 list(pool.map(_evaluate_single_referee, candidates_to_referee))
+
+        # Ensure any unrefereed candidate NEVER blindly retains a "mitosis" label unless verifier explicitly confirmed it
+        refereed_ids = {c["id"] for c in candidates_to_referee}
+        for c in candidates:
+            if c["id"] not in refereed_ids:
+                if c.get("label") == "mitosis" and c.get("label_source") != "verifier_confirmed":
+                    c["label"] = "unreviewed"
+                    c["label_source"] = "unreviewed_candidate"
 
         # Clean temporary composite/context bytes from all candidates
         for c_item in candidates:
@@ -495,51 +510,56 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
             h_cx_px = int(h_cx_um / mpp_x)
             h_cy_px = int(h_cy_um / mpp_y)
 
-            for mag_name in ("10x", "20x", "40x"):
-                field_um = 577.29 # Standard HPF review field (r=262 um -> width=577.29 um)
-                crop_w_px = max(1, int(round(field_um / mpp_x)))
-                crop_h_px = max(1, int(round(field_um / mpp_y)))
+            field_um = 577.29 # Standard HPF review field (r=262 um -> width=577.29 um)
+            crop_w_px = max(1, int(round(field_um / mpp_x)))
+            crop_h_px = max(1, int(round(field_um / mpp_y)))
 
-                patch_orig = None
-                if openslide_slide is not None:
-                    try:
-                        with OPENSLIDE_GLOBAL_LOCK:
-                            x0 = max(0, min(dim_w - crop_w_px, h_cx_px - crop_w_px // 2))
-                            y0 = max(0, min(dim_h - crop_h_px, h_cy_px - crop_h_px // 2))
-                            patch_orig = openslide_slide.read_region((x0, y0), 0, (crop_w_px, crop_h_px)).convert("RGB")
-                    except Exception:
-                        patch_orig = None
+            patch_orig_raw = None
+            if openslide_slide is not None:
+                try:
+                    with OPENSLIDE_GLOBAL_LOCK:
+                        x0 = max(0, min(dim_w - crop_w_px, h_cx_px - crop_w_px // 2))
+                        y0 = max(0, min(dim_h - crop_h_px, h_cy_px - crop_h_px // 2))
+                        patch_orig_raw = openslide_slide.read_region((x0, y0), 0, (crop_w_px, crop_h_px)).convert("RGB")
+                except Exception:
+                    patch_orig_raw = None
 
-                if patch_orig is None:
-                    raise RuntimeError(f"Failed to extract authentic optical patch for HPF #{hpf_seq} at {mag_name} from slide")
+            if patch_orig_raw is None:
+                raise RuntimeError(f"Failed to extract authentic optical patch for HPF #{hpf_seq} from slide")
 
-                # Multi-resolution hierarchy calibrated to HPF reticle:
-                # 40x: 2048x2048 (0.28 um/px - authentic high-power cellular resolution)
-                # 20x: 1024x1024 (0.56 um/px - medium power)
-                # 10x: 512x512   (1.13 um/px - low power overview)
-                target_dim = 2048 if mag_name == "40x" else (1024 if mag_name == "20x" else 512)
-                patch_orig_scaled = patch_orig.resize((target_dim, target_dim), Image.Resampling.BILINEAR) if patch_orig.size != (target_dim, target_dim) else patch_orig
+            # 40x base patch (2048x2048, 0.28 um/px)
+            patch_40x_orig = patch_orig_raw.resize((2048, 2048), Image.Resampling.BILINEAR) if patch_orig_raw.size != (2048, 2048) else patch_orig_raw
+
+            # Stain normalize 40x ONCE (downsampled versions inherit normalized palette)
+            patch_40x_norm = patch_40x_orig
+            if stain_normalizer:
+                try:
+                    norm_arr = stain_normalizer.transform(np.array(patch_40x_orig))
+                    patch_40x_norm = Image.fromarray(norm_arr)
+                except Exception:
+                    patch_40x_norm = patch_40x_orig
+
+            # Generate multi-resolution hierarchy (40x, 20x, 10x) efficiently in memory
+            for mag_name, target_dim in (("40x", 2048), ("20x", 1024), ("10x", 512)):
+                if target_dim == 2048:
+                    p_orig = patch_40x_orig
+                    p_norm = patch_40x_norm
+                else:
+                    p_orig = patch_40x_orig.resize((target_dim, target_dim), Image.Resampling.BILINEAR)
+                    p_norm = patch_40x_norm.resize((target_dim, target_dim), Image.Resampling.BILINEAR)
 
                 buf_o = io.BytesIO()
                 if mag_name == "40x":
-                    patch_orig_scaled.save(buf_o, "JPEG", quality=94)
+                    p_orig.save(buf_o, "JPEG", quality=94)
                 else:
-                    patch_orig_scaled.save(buf_o, "PNG")
+                    p_orig.save(buf_o, "PNG")
                 orig_bytes = buf_o.getvalue()
-
-                patch_norm_scaled = patch_orig_scaled
-                if stain_normalizer:
-                    try:
-                        norm_arr = stain_normalizer.transform(np.array(patch_orig_scaled))
-                        patch_norm_scaled = Image.fromarray(norm_arr)
-                    except Exception:
-                        patch_norm_scaled = patch_orig_scaled
 
                 buf_n = io.BytesIO()
                 if mag_name == "40x":
-                    patch_norm_scaled.save(buf_n, "JPEG", quality=94)
+                    p_norm.save(buf_n, "JPEG", quality=94)
                 else:
-                    patch_norm_scaled.save(buf_n, "PNG")
+                    p_norm.save(buf_n, "PNG")
                 norm_bytes = buf_n.getvalue()
 
                 hpf_uploads.append((f"cases/{case_id}/mitosis/hpfs/hpf_{hpf_seq}_{mag_name}_orig.png", orig_bytes))

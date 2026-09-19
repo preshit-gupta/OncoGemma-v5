@@ -318,4 +318,52 @@ def test_yolo_detector_vertex_ai_zero_detections_trusted():
         assert detections == []
 
 
+def test_yolo_detector_does_not_pollute_vertex_results_on_dense_tile():
+    """Verify that when Vertex AI returns detections on a tile with hyperchromatic chromatin, detect() does NOT append OD candidates."""
+    with patch("google.cloud.aiplatform.Endpoint") as mock_endpoint_cls, \
+         patch("google.cloud.aiplatform.init"):
+        mock_endpoint = MagicMock()
+        mock_endpoint_cls.return_value = mock_endpoint
+
+        mock_endpoint.predict.return_value = MagicMock(
+            predictions=[
+                {"boxes": [{"cx": 200.0, "cy": 200.0, "confidence": 0.88}]},
+                {"boxes": []},
+                {"boxes": []},
+                {"boxes": []}
+            ]
+        )
+
+        detector = YoloMitosisDetector(endpoint_id="projects/123/locations/us-central1/endpoints/456")
+        # Dense dark H&E tile that would otherwise trigger optical density blobs
+        dense_tile = np.zeros((1024, 1024, 3), dtype=np.uint8)
+        dense_tile[:, :, 0] = 30  # very low intensity -> high optical density
+        dense_tile[:, :, 1] = 180
+        dense_tile[:, :, 2] = 200
+
+        detections = detector.detect(dense_tile)
+        # Authoritative: ONLY the Vertex AI box must be returned
+        assert len(detections) == 1
+        assert detections[0][0] == 200.0
+        assert detections[0][1] == 200.0
+        assert detections[0][2] == 0.88
+
+
+def test_van_diest_morphometric_verification_rejection():
+    """Verify that HoVerNetMitosisVerifier rejects small round pyknotic / apoptotic fragments under van Diest rules."""
+    from pipeline.verify import HoVerNetMitosisVerifier
+    verifier = HoVerNetMitosisVerifier(weights_path=None)
+
+    # Synthetic 128x128 crop with a small round dense apoptotic body
+    crop = np.ones((128, 128, 3), dtype=np.uint8) * 230
+    import cv2
+    # Draw small round pyknotic sphere at center (radius 8px = diam 16px, high circularity, smooth)
+    cv2.circle(crop, (64, 64), 8, (40, 20, 60), -1)
+
+    score, contour = verifier.verify(crop)
+    # Under van Diest morphometrics, small round pyknotic bodies must receive low score (< 0.35)
+    assert score < 0.35
+
+
+
 

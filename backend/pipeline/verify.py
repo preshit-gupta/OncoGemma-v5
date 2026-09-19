@@ -171,20 +171,20 @@ class HoVerNetMitosisVerifier:
 
             # 1. Reject Apoptotic Bodies (Van Diest Criteria):
             # Apoptotic bodies feature small, smooth, compact globular pyknotic fragments
-            # (equiv_diam < 24 px, circ > 0.58, spiculation < 0.20) surrounded by a clear retraction halo.
-            if equiv_diam < 24.0 and circ > 0.58 and spiculation < 0.20 and halo_od < 0.18:
+            # (equiv_diam < 25 px, circ > 0.55, spiculation < 0.20) or clear retraction halo.
+            if equiv_diam < 25.0 and circ > 0.55 and spiculation < 0.20:
                 return 0.08, contour_pts
 
             # 2. Reject Lymphocyte / Inflammatory Cell:
-            # Small (diam 16-30 px ~ 4-7.5 um), high circularity (>0.64), high solidity (>0.86), low spiculation (<0.18)
-            if 16.0 <= equiv_diam <= 30.0 and circ > 0.64 and solidity > 0.86 and spiculation < 0.18:
-                return 0.12, contour_pts
+            # Small (diam 15-32 px ~ 4-8 um), high circularity (>0.60), high solidity (>0.84), low spiculation (<0.18)
+            if 15.0 <= equiv_diam <= 32.0 and circ > 0.60 and solidity > 0.84 and spiculation < 0.18:
+                return 0.10, contour_pts
 
             # 3. Reject Resting Interphase Nuclei:
             # True mitoses REQUIRE dissolved nuclear envelope. An intact, continuous oval/circular membrane
-            # with smooth contour (spiculation < 0.18, circ > 0.55, solidity > 0.84) represents interphase.
-            if spiculation < 0.18 and solidity > 0.84 and (circ > 0.55 or p95_od < 0.90):
-                return 0.15, contour_pts
+            # with smooth contour (spiculation < 0.18, circ > 0.52, solidity > 0.83) represents interphase.
+            if spiculation < 0.18 and solidity > 0.83 and (circ > 0.52 or p95_od < 0.90):
+                return 0.14, contour_pts
 
             # 4. Reject Tiny Debris / Giant Tissue Folds:
             if area < 300.0 or equiv_diam < 20.0 or area > 4200.0 or equiv_diam > 75.0:
@@ -259,8 +259,22 @@ def create_dual_magnification_composite(
     cy0 = max(0, int(center_y - l0_h // 2))
 
     with OPENSLIDE_GLOBAL_LOCK:
-        rgba_ctx = slide_obj.read_region((cx0, cy0), 0, (l0_w, l0_h))
-        rgb_ctx = rgba_ctx.convert("RGB").resize((512, 512), Image.Resampling.LANCZOS)
+        # Utilize pyramid level if available for faster downsampling
+        level = 0
+        read_w, read_h = l0_w, l0_h
+        if hasattr(slide_obj, "get_best_level_for_downsample"):
+            try:
+                cand_level = slide_obj.get_best_level_for_downsample(downsample)
+                cand_down = slide_obj.level_downsamples[cand_level]
+                if cand_down <= downsample * 1.25:
+                    level = cand_level
+                    read_w = max(1, int(round(l0_w / cand_down)))
+                    read_h = max(1, int(round(l0_h / cand_down)))
+            except Exception:
+                level = 0
+
+        rgba_ctx = slide_obj.read_region((cx0, cy0), level, (read_w, read_h))
+        rgb_ctx = rgba_ctx.convert("RGB").resize((512, 512), Image.Resampling.BILINEAR)
 
     buf_ctx = io.BytesIO()
     rgb_ctx.save(buf_ctx, format="JPEG", quality=85)

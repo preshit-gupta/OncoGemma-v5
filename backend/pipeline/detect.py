@@ -43,7 +43,7 @@ class YoloMitosisDetector:
         endpoint_id: Optional[str] = None,
         conf_threshold: float = 0.35,
         device: str = "cpu",
-        max_candidates_per_tile: int = 64,
+        max_candidates_per_tile: int = 12,
         batch_size: int = 16,
         fp16: bool = False
     ):
@@ -251,35 +251,25 @@ class YoloMitosisDetector:
 
         primary_results = vertex_results if vertex_results is not None else local_results
 
-        # 3. Always extract OD hyperchromatic features for fallback and hybrid recall assurance
-        heuristic_candidates = self._detect_hyperchromatic_features(tile_rgb)
-
-        if primary_results is not None and len(primary_results) > 0:
-            if not heuristic_candidates:
-                return primary_results[:self.max_candidates_per_tile]
-
-            # Combine primary model detections with OD candidates, deduplicating within 40px radius (~10 um)
-            combined = list(primary_results)
-            for hc in heuristic_candidates:
-                if not any(math.hypot(hc[0] - pc[0], hc[1] - pc[1]) < 40.0 for pc in primary_results):
-                    combined.append(hc)
-            combined.sort(key=lambda c: c[2], reverse=True)
-            return combined[:self.max_candidates_per_tile]
-
-        # If primary model detector returned empty [] or failed, fall back to OD heuristic
-        if heuristic_candidates:
-            return heuristic_candidates[:self.max_candidates_per_tile]
-
+        # If primary detector (Vertex AI MIDOG or local model) ran successfully,
+        # its predictions are the authoritative candidate set.
+        # Even if empty [] (meaning 0 mitoses on this tile), respect this negative result!
+        # NEVER pollute deep-learning predictions with uncalibrated optical density blobs.
         if primary_results is not None:
-            return primary_results
+            return primary_results[:self.max_candidates_per_tile]
 
-        return []
+        # 3. Only if primary model is unavailable or encountered an unrecoverable failure (None),
+        # gracefully fall back to first-principles OD hyperchromatic candidate extraction.
+        self.model_version = "od_heuristic@dev"
+        heuristic_candidates = self._detect_hyperchromatic_features(tile_rgb)
+        return heuristic_candidates[:self.max_candidates_per_tile]
 
     def _detect_hyperchromatic_features(self, tile_rgb: np.ndarray) -> List[Tuple[float, float, float]]:
         """
         First-principles hematoxylin optical density & morphological candidate sweep.
         Sweeps 40x tile for dense condensed chromatin clusters using absolute OD thresholding
-        and connected component analysis.
+        and connected component analysis. Applies van Diest morphometric gating to reject
+        small round apoptotic fragments and lymphocytes.
         """
         h, w, _ = tile_rgb.shape
         if h < 32 or w < 32:
@@ -302,14 +292,24 @@ class YoloMitosisDetector:
             candidates = []
             for cnt in cnts:
                 area = float(cv2.contourArea(cnt))
-                # Mitotic chromatin clusters typically occupy 200 to 3500 pixels (5-18 um across)
-                if 200 <= area <= 3500:
+                # Mitotic chromatin clusters typically occupy 350 to 4200 pixels (equivalent diameter ~21-73 px / 5.25-18.25 um)
+                if 350 <= area <= 4200:
+                    perim = float(cv2.arcLength(cnt, True))
+                    if perim <= 0:
+                        continue
+                    circ = float((4.0 * np.pi * area) / (perim * perim))
+                    equiv_diam = float(np.sqrt(4.0 * area / np.pi))
+
+                    # Exclude small round bodies (lymphocytes and apoptotic fragments)
+                    if equiv_diam < 28.0 and circ > 0.62:
+                        continue
+
                     M = cv2.moments(cnt)
                     if M["m00"] > 0:
                         cx = float(M["m10"] / M["m00"])
                         cy = float(M["m01"] / M["m00"])
 
-                        # Calculate local peak OD within contour using bounding-box sub-mask (#583)
+                        # Calculate local peak OD within contour using bounding-box sub-mask
                         bx, by, bw, bh = cv2.boundingRect(cnt)
                         sub_mask = np.zeros((bh, bw), dtype=np.uint8)
                         cnt_shifted = cnt - [bx, by]
@@ -321,9 +321,10 @@ class YoloMitosisDetector:
                         else:
                             p95_od = float(np.max(sub_od))
 
-                        # Un-floored confidence computation (#582)
-                        raw_conf = 0.20 + min(0.50, max(0.0, (p95_od - 0.70) * 0.60)) + min(0.25, (area / 1000.0) * 0.25)
-                        conf = float(np.clip(raw_conf, 0.05, 0.98))
+                        # Calibrate heuristic confidence to conservative screening range (0.10 - 0.65)
+                        # Heuristic candidates NEVER bypass the verifier / referee as definite mitoses
+                        raw_conf = 0.25 + min(0.20, max(0.0, (p95_od - 0.75) * 0.40)) + min(0.20, (area / 1500.0) * 0.20)
+                        conf = float(np.clip(raw_conf, 0.10, 0.65))
                         if conf >= self.conf_threshold:
                             candidates.append((cx, cy, conf))
 
