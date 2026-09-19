@@ -1,4 +1,4 @@
-# OncoGemma v5 — Clinical AI Copilot for Cancer Diagnostics
+# OncoGemma — Copilot for same-day Cancer Diagnostics
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.11%20%7C%203.12-blue.svg)](https://python.org)
