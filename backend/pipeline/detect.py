@@ -50,7 +50,9 @@ class YoloMitosisDetector:
         self.conf_threshold = conf_threshold
         self.device = device
         self.weights_path = weights_path
-        self.endpoint_id = endpoint_id or (getattr(settings, "VERTEX_MITOSIS_ENDPOINT_ID", None) if settings else None)
+        self.endpoint_id = endpoint_id if endpoint_id is not None else (getattr(settings, "VERTEX_MITOSIS_ENDPOINT_ID", None) if settings else None)
+        if self.endpoint_id in ("", "none", "null"):
+            self.endpoint_id = None
         self.endpoint_location = getattr(settings, "VERTEX_MITOSIS_LOCATION", "us-central1") if settings else "us-central1"
         self.project_id = getattr(settings, "GCP_PROJECT_ID", "oncogemma-dev") if settings else "oncogemma-dev"
         self.max_candidates_per_tile = max_candidates_per_tile
@@ -346,7 +348,7 @@ class YoloMitosisDetector:
                     continue
 
                 # Bona fide mitotic chromosomes require high peak optical density
-                if p95_od < 1.05:
+                if p95_od < 1.00:
                     continue
 
                 M = cv2.moments(cnt)

@@ -68,7 +68,7 @@ def test_morphometric_identifies_true_mitotic_figure():
 
 
 def test_detector_chromatin_sweep():
-    detector = YoloMitosisDetector()
+    detector = YoloMitosisDetector(endpoint_id="")
     tile = np.full((1024, 1024, 3), (235, 215, 230), dtype=np.uint8)
     # Scatter 2 simulated mitotic figures
     tile[200:230, 200:230] = (50, 15, 80)

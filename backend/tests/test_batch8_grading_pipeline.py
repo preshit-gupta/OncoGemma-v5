@@ -179,7 +179,8 @@ def test_generate_findings_narrative_grounding_in_aggregate():
 def test_generate_cap_report_grounding_pleomorphism_and_lvi():
     """CAP synoptic narrative must ground pleomorphism in p_score and LVI in case lvi_status (#599)."""
     client = MedGemmaClient()
-    with mock.patch.object(client, "_call_vertex_endpoint", side_effect=RuntimeError("Endpoint unavailable")):
+    with mock.patch.object(client, "_call_gemini_flash", side_effect=RuntimeError("Flash offline")), \
+         mock.patch.object(client, "_call_vertex_endpoint", side_effect=RuntimeError("Endpoint unavailable")):
         case_marked_present = {
             "histologic_type": "IDC-NST",
             "nottingham_grade": {

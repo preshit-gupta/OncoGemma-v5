@@ -5,7 +5,7 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-009688.svg)](https://fastapi.tiangolo.com)
 [![Next.js](https://img.shields.io/badge/Next.js-14.2+-black.svg)](https://nextjs.org)
 [![Google Cloud](https://img.shields.io/badge/GCP-Cloud%20Run%20%7C%20Vertex%20AI%20%7C%20GCS-4285F4.svg)](https://cloud.google.com)
-[![Tests](https://img.shields.io/badge/Tests-234%2F234%20Passing-brightgreen.svg)](backend/tests/)
+[![Tests](https://img.shields.io/badge/Tests-250%2F250%20Passing-brightgreen.svg)](backend/tests/)
 
 **OncoGemma v5** is a cloud-native clinical AI platform and diagnostic copilot for digital breast pathology. Designed for surgical pathologists analyzing gigapixel Whole-Slide Images (WSIs) of invasive breast carcinoma, OncoGemma automates slide ingestion, quality control, tumor bed triage, mitotic figure quantification, Nottingham Histologic Grading (Elston-Ellis modification), and College of American Pathologists (CAP) synoptic cancer reporting with AJCC 8th/9th Edition staging.
 
@@ -49,12 +49,11 @@ flowchart TD
         C4 --> D4["Pathologist Mitosis Studio (Nottingham Score 1/2/3)"]
     end
 
-
-    subgraph S5["Stage 5: Nottingham Histologic Grading"]
+    subgraph S5["Stage 5: Nottingham Histologic Grading (Doer-Verifier)"]
         D4 --> A5["24 Stratified 10x Evidence Patch Extraction"]
-        A5 --> B5["MedGemma 1.5 Tubule & Pleomorphism Analysis"]
-        B5 --> C5["Consensus Histologic Subtype Classification"]
-        C5 --> D5["Deterministic Grade Aggregation (Grade 1-3)"]
+        A5 --> B5["Clinical Doer: MedGemma 1.5 4B IT (asia-southeast1)"]
+        B5 --> C5["Multimodal Verifier: Gemini 2.5 Flash (us-central1)"]
+        C5 --> D5["Consensus Histologic Subtype & Deterministic Nottingham (Sum 3-9, Grade 1-3)"]
     end
 
     subgraph S6["Stage 6: CAP Synoptic Report"]
@@ -198,16 +197,33 @@ flowchart TD
 
 ---
 
-### Stage 5: Nottingham Histologic Grading (MedGemma 1.5)
+### Stage 5: Nottingham Histologic Grading (Doer-Verifier Architecture)
 ```mermaid
 flowchart TD
     A["Confirmed Stage 3 Hotspots + Stage 4 Mitotic Score"] -->|"Continuous Density Hotspot Sampling (>= 384 µm Sep)"| B["Sample 24 Stratified Evidence Patches (512x512 @ 1.0 µm/px)"]
     B --> C["Macenko Stain Normalizer Transform"]
     C --> D["Persist Patch PNGs to GCS (oncogemma-dev-artifacts)"]
-    D -->|"Async Batched Inference (MedGemma 1.5)"| E1["MedGemma 1.5: Tubule Formation (24 patches)"]
-    D -->|"Async Batched Inference (MedGemma 1.5)"| E2["MedGemma 1.5: Nuclear Pleomorphism (24 patches)"]
-    D -->|"Multi-Patch Call (Top 8 Patches)"| E3["MedGemma 1.5: Histologic Subtype Consensus"]
-    E1 & E2 & E3 -->|"Pydantic Schema Validation & Cleaning"| F["Parsed Machine Findings"]
+    
+    subgraph DV["Doer-Verifier Histopathology Adjudication"]
+        direction TB
+        subgraph DOER["Stage 5A: Clinical Doer (MedGemma 1.5 4B IT @ asia-southeast1)"]
+            E1["MedGemma 1.5: Glandular & Tubular Lumen Candidate Sweep"]
+            E2["MedGemma 1.5: Nuclear Anaplasia & Pleomorphism Scoring"]
+        end
+        subgraph VERIFIER["Stage 5B: Multimodal Referee (Gemini 2.5 Flash @ us-central1)"]
+            V1["Gemini 2.5 Flash: True Lumen vs. Retraction Artifact Verification"]
+            V2["Gemini 2.5 Flash: Chromatin Texture & Contour Adjudication"]
+        end
+        E1 -->|"Proposed Score & Lumen %"| V1
+        E2 -->|"Proposed Score & Morphometrics"| V2
+        V1 -->|"Adjudicated Score & Verdict"| F1["Validated Tubule Differentiation"]
+        V2 -->|"Adjudicated Score & Verdict"| F2["Validated Nuclear Pleomorphism"]
+    end
+
+    D --> DOER
+    D -->|"Multi-Patch Ensemble (Top 8 Patches)"| E3["MedGemma 1.5: Consensus Histologic Typing"]
+    
+    F1 & F2 & E3 -->|"Pydantic Schema Validation & Repair"| F["Parsed Machine Findings"]
     F -->|"Pure Zero-LLM Deterministic Calculation"| G["Deterministic Nottingham Aggregation Engine"]
     G -->|"Weighted Median (Tubule %) -> Score 1/2/3"| H1["Tubule Formation Score (T)"]
     G -->|"Weighted Mode (Tie -> Higher Grade)"| H2["Nuclear Pleomorphism Score (P)"]
@@ -219,10 +235,14 @@ flowchart TD
     L -->|"Commit to DB (CHECK Constraint Enforced)"| M["Persist to gradings Table + Audit Event -> Advance to Stage 6"]
 ```
 * **Continuous Density Hotspot Sampling**: Extracts 24 stratified 10× evidence patches (512 × 512 µm) from peak cellularity zones of confirmed Stage 3 hotspots (≥ 384 µm separation).
+* **Two-Stage Doer-Verifier Adjudication Architecture**:
+  * **Clinical Pathology Doer (MedGemma 1.5 4B IT)**: Dedicated Google Vertex AI endpoint (`mg-endpoint-1b884451-6cab-4660-9d9e-0f97da95ec87` in `asia-southeast1`). Executes initial microscopic sweeps across all 24 patches to detect glandular lumens, polarized epithelial arrangements, and cytologic nuclear atypia.
+  * **Multimodal Referee & Verifier (Gemini 2.5 Flash)**: Hosted in `us-central1`. Evaluates patch imagery alongside MedGemma's proposed scores to filter out stromal retraction artifacts, tissue tears, and pseudolumina, confirming true tubular lumens (polarized epithelium with distinct lumen) and nuclear chromatin textures (vesicular vs. coarse).
+  * **Schema Hardening & Zero Schema Errors**: Replaces fragile unconstrained JSON prompting with Pydantic schema validation and automatic JSON repairing, eliminating `unassessed_schema_error` across all patches.
 * **Multimodal Nottingham Evaluation**:
   * **Tubule Formation**: Quantifies glandular/tubular lumen percentage (> 75% → Score 1, 10%–75% → Score 2, < 10% → Score 3).
   * **Nuclear Pleomorphism**: Assesses nuclear variation, chromatin clump size, and nucleoli (Uniform → Score 1, Moderate → Score 2, Marked → Score 3).
-  * **Histologic Subtype**: Multi-patch consensus classification (IDC-NST vs. ILC vs. Special Types).
+  * **Histologic Subtype Consensus**: Multi-patch consensus classification (IDC-NST vs. ILC vs. Special Types, e.g. Metaplastic Carcinoma).
 * **Dual-Level Pathologist Sign-Off Gating**: Requires explicit confirmation of individual evidence patches and overall histologic subtype prior to stage approval.
 * **Deterministic Grade Aggregation**:
   * **Nottingham Sum** = Tubule Score + Pleomorphism Score + Mitotic Score (Range: 3–9)
@@ -316,7 +336,7 @@ Every documented finding from the comprehensive system audit has been systematic
 | **WSI Viewing** | OpenSeadragon 5.0, HTML5 Canvas | Sub-pixel whole-slide pyramid streaming and interactive reticles |
 | **Backend API** | FastAPI, Pydantic v2, Python 3.12 | Asynchronous REST control plane with strict schema enforcement |
 | **Database** | PostgreSQL (Cloud SQL) / SQLite, SQLAlchemy | Typed ORM persistence, CASCADE relationships, and audit ledger |
-| **AI / ML Models** | Google Path Foundation (ViT), MedGemma 1.5, MIDOG (Tesla T4), Gemini 2.5 Flash | Foundation embeddings, vision-language grading, MIDOG mitosis detection & multimodal referee |
+| **AI / ML Models** | Google Path Foundation (ViT), MedGemma 1.5 4B IT (Doer, asia-southeast1), MIDOG (Tesla T4), Gemini 2.5 Flash (Verifier, us-central1) | Foundation embeddings, dual-model Doer-Verifier grading, MIDOG mitosis detection & multimodal referees |
 | **WSI Processing** | PyVips, OpenSlide, NumPy, Pillow | Gigapixel tile de-identification, decoding, and stain normalizer |
 | **PDF Engine** | ReportLab Platypus, Jinja2 | Deterministic 3-page CAP surgical pathology synoptic reports |
 | **Cloud Platform** | Google Cloud Run, Cloud Storage, Cloud Build | Serverless compute, distributed asset storage, automated CI/CD |
@@ -331,7 +351,7 @@ Run the comprehensive test suite locally:
 $env:DATABASE_URL="sqlite:///:memory:"; pytest backend/tests/ -q
 ```
 
-### Test Coverage Summary: 234 / 234 Passing (100% Offline Isolated)
+### Test Coverage Summary: 250 / 250 Passing (100% Offline Isolated)
 * `test_api_auth.py` — Authentication, bearer tokens, RBAC roles, and `/health` aliases
 * `test_batch4_state_and_concurrency.py` — Row locking, worker skip_locked, orphan recovery, CASCADE deletes
 * `test_batch5_stain_and_qc.py` — Fitted Macenko deconvolution, tissue mask sampling, 5-check QC engine

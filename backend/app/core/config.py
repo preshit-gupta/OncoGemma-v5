@@ -33,11 +33,11 @@ class Settings(BaseSettings):
     # Vertex AI Endpoint Configuration - MedGemma 1.5 (Stage 5 Grading)
     VERTEX_MEDGEMMA_ENDPOINT_ID: str = os.getenv(
         "VERTEX_MEDGEMMA_ENDPOINT_ID",
-        "medgemma-1-5-endpoint"
+        "mg-endpoint-1b884451-6cab-4660-9d9e-0f97da95ec87"
     )
     VERTEX_MEDGEMMA_LOCATION: str = os.getenv(
         "VERTEX_MEDGEMMA_LOCATION",
-        "us-central1"
+        "asia-southeast1"
     )
     VERTEX_MEDGEMMA_MODEL_VERSION: str = os.getenv(
         "VERTEX_MEDGEMMA_MODEL_VERSION",

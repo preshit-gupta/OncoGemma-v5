@@ -74,7 +74,7 @@ function computeLiveAjccStaging(tumorSize: number | null, posNodes: number, exam
   else if (pnCode === "N2") group = "IIIA";
   else if (pnCode === "N3") group = "IIIC";
 
-  return { pt, pn, group };
+  return { pt, pn, group, stage_group: group };
 }
 
 const ATTESTATION_TEXT =
@@ -406,7 +406,7 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
   const liveStaging = computeLiveAjccStaging(tumorSizeMm, nodesPositive, nodesExamined);
   const displayPt = isSigned ? (data?.staging?.pt_stage || "pTX") : liveStaging.pt;
   const displayPn = isSigned ? (data?.staging?.pn_stage || "pNX") : liveStaging.pn;
-  const displayGroup = isSigned ? (data?.staging?.stage_group || "Pending") : liveStaging.stage_group;
+  const displayGroup = (isSigned ? data?.staging?.stage_group : (liveStaging.stage_group || liveStaging.group)) || "Pending";
 
   return (
     <div className="flex-1 flex flex-col h-full overflow-hidden bg-slate-950 text-slate-100">
@@ -632,7 +632,9 @@ export function ReportWorkspace({ caseId, onRefreshCase }: ReportWorkspaceProps)
                 <div className="p-2.5 bg-slate-950/80 border border-emerald-800/40 rounded-lg bg-emerald-950/10">
                   <div className="text-[10px] text-emerald-400 font-semibold uppercase">AJCC Stage Group</div>
                   <div className="text-sm font-bold text-emerald-300 mt-0.5">
-                    {displayGroup.startsWith("Stage") ? displayGroup : `Stage ${displayGroup}`}
+                    {displayGroup && displayGroup !== "Pending" && displayGroup !== "Unknown" && displayGroup !== "Cannot be determined"
+                      ? (displayGroup.startsWith("Stage") ? displayGroup : `Stage ${displayGroup}`)
+                      : (displayGroup || "Pending")}
                   </div>
                   <div className="text-[10px] text-slate-500">CAP protocol group</div>
                 </div>

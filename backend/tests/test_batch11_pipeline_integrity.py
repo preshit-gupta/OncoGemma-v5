@@ -306,9 +306,10 @@ def test_stage_attempt_ordering_latest_first():
         from app.core.db import SessionLocal
         db = SessionLocal()
         try:
-            # Create attempt 1 (failed) and attempt 2 (running)
-            s1 = StageExecution(case_id=uuid.UUID(case_id), stage="ingest", attempt=1, status="failed")
-            s2 = StageExecution(case_id=uuid.UUID(case_id), stage="ingest", attempt=2, status="running")
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc)
+            s1 = StageExecution(case_id=uuid.UUID(case_id), stage="ingest", attempt=1, status="failed", started_at=now)
+            s2 = StageExecution(case_id=uuid.UUID(case_id), stage="ingest", attempt=2, status="running", started_at=now)
             db.add(s1)
             db.add(s2)
             db.commit()
