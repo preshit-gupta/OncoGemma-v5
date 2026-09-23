@@ -26,11 +26,14 @@ steps:
       - '--region=$_REGION'
       - '--platform=managed'
       - '--allow-unauthenticated'
+      - '--cpu=1'
+      - '--memory=1Gi'
+      - '--cpu-throttling'
+      - '--min-instances=0'
     id: 'deploy-frontend'
 
 substitutions:
   _REGION: 'us-central1'
 
 options:
-  machineType: 'E2_HIGHCPU_8'
   logging: CLOUD_LOGGING_ONLY

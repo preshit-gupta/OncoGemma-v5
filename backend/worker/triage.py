@@ -91,23 +91,30 @@ class VertexPathFoundationClient:
             )
 
             all_embeddings = []
-            for i in range(0, patch_count, batch_size):
-                chunk_len = min(batch_size, patch_count - i)
+            curr_idx = 0
+            while curr_idx < patch_count:
                 instances = []
-                for j in range(chunk_len):
-                    if (i + j) < len(patches):
-                        p_img = patches[i + j].convert("RGB").resize((224, 224), Image.BILINEAR)
+                est_size = 0
+                max_chunk = min(6, patch_count - curr_idx)
+                for j in range(max_chunk):
+                    if (curr_idx + j) < len(patches):
+                        p_img = patches[curr_idx + j].convert("RGB").resize((224, 224), Image.BILINEAR)
                         buf = io.BytesIO()
                         p_img.save(buf, format="PNG")
                         b64_str = base64.b64encode(buf.getvalue()).decode("utf-8")
                     else:
                         raise ValueError("Patch count exceeds available patches; dummy padding prohibited.")
 
-                    instances.append({
+                    inst = {
                         "raw_image_bytes": b64_str,
                         "patch_coordinates": [{"x_origin": 0, "y_origin": 0, "width": 224, "height": 224}]
-                    })
+                    }
+                    if instances and (est_size + len(b64_str)) > 1_250_000:
+                        break
+                    instances.append(inst)
+                    est_size += len(b64_str)
 
+                curr_idx += len(instances)
                 payload = {"instances": instances}
                 body = json.dumps(payload).encode("utf-8")
                 headers = {"Content-Type": "application/json"}
@@ -493,7 +500,7 @@ def run_triage(stage_execution: StageExecution, session: Session) -> tuple[str, 
                 project_id=settings.GCP_PROJECT_ID,
                 api_endpoint=settings.VERTEX_PATH_FOUNDATION_API_ENDPOINT
             )
-            embeddings = client.predict_embeddings(patch_count=patch_count, patches=sample_patches, batch_size=16)
+            embeddings = client.predict_embeddings(patch_count=patch_count, patches=sample_patches, batch_size=6)
             endpoint_calls_made = patch_count
             save_parquet_cache(embeddings, sampled_cells)
         elif settings.USE_MOCK_VERTEX_AI:

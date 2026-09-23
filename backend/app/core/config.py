@@ -16,11 +16,11 @@ class Settings(BaseSettings):
     # Vertex AI Endpoint Configuration - Path Foundation (Stage 3)
     VERTEX_PATH_FOUNDATION_ENDPOINT_ID: str = os.getenv(
         "VERTEX_PATH_FOUNDATION_ENDPOINT_ID",
-        "mg-endpoint-25e5ee92-10b3-41b5-9da7-bccbd2b255f8"
+        "6638504312592924672"
     )
     VERTEX_PATH_FOUNDATION_LOCATION: str = os.getenv(
         "VERTEX_PATH_FOUNDATION_LOCATION",
-        "asia-south1"
+        "us-central1"
     )
     # Note: Dedicated prediction DNS (*.prediction.vertexai.goog) is discovered automatically
     # by aiplatform.Endpoint and used for raw_predict. VERTEX_PATH_FOUNDATION_API_ENDPOINT
@@ -33,11 +33,11 @@ class Settings(BaseSettings):
     # Vertex AI Endpoint Configuration - MedGemma 1.5 (Stage 5 Grading)
     VERTEX_MEDGEMMA_ENDPOINT_ID: str = os.getenv(
         "VERTEX_MEDGEMMA_ENDPOINT_ID",
-        "mg-endpoint-1b884451-6cab-4660-9d9e-0f97da95ec87"
+        "2026818294165536768"
     )
     VERTEX_MEDGEMMA_LOCATION: str = os.getenv(
         "VERTEX_MEDGEMMA_LOCATION",
-        "asia-southeast1"
+        "us-central1"
     )
     VERTEX_MEDGEMMA_MODEL_VERSION: str = os.getenv(
         "VERTEX_MEDGEMMA_MODEL_VERSION",

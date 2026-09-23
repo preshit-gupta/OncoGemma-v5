@@ -225,10 +225,12 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
         raw_candidates = []
         cand_seq = 1
 
-        # Sweep each confirmed hotspot, skipping empty glass tiles
+        # Enumerate all candidate tiles across confirmed hotspots, skipping empty glass
+        from concurrent.futures import ThreadPoolExecutor
+        all_tiles_to_sweep = []
         for hs in hotspots:
             poly_um = hs["polygon_um"]
-            tiles = enumerate_hotspot_tiles(
+            hs_tiles = enumerate_hotspot_tiles(
                 poly_um,
                 tile_size_px=tile_size_px,
                 mpp=mpp_x,
@@ -237,42 +239,50 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
                 slide_dimensions_um=slide_dimensions_um,
                 min_tissue_ratio=0.20
             )
+            for t in hs_tiles:
+                t["hotspot_id"] = hs["id"]
+            all_tiles_to_sweep.extend(hs_tiles)
 
-            for tile in tiles:
-                tx_um, ty_um = tile["origin_um"]
-                tx_px, ty_px = tile["origin_px"]
+        print(f"[Worker:Mitosis] Sweeping {len(all_tiles_to_sweep)} tiles across {len(hotspots)} hotspots concurrently with 4 workers...")
 
-                # Read tile RGB
-                tile_rgb = None
-                if openslide_slide is not None:
-                    try:
-                        with OPENSLIDE_GLOBAL_LOCK:
-                            tile_pil = openslide_slide.read_region((tx_px, ty_px), 0, (tile_size_px, tile_size_px)).convert("RGB")
-                            tile_rgb = np.array(tile_pil)
-                    except Exception as e:
-                        print(f"[Worker:Mitosis] OpenSlide read_region error at ({tx_px}, {ty_px}): {e}")
+        def _sweep_single_tile(tile):
+            tx_um, ty_um = tile["origin_um"]
+            tx_px, ty_px = tile["origin_px"]
+            tile_rgb = None
+            if openslide_slide is not None:
+                try:
+                    with OPENSLIDE_GLOBAL_LOCK:
+                        tile_pil = openslide_slide.read_region((tx_px, ty_px), 0, (tile_size_px, tile_size_px)).convert("RGB")
+                        tile_rgb = np.array(tile_pil)
+                except Exception as e:
+                    print(f"[Worker:Mitosis] OpenSlide read_region error at ({tx_px}, {ty_px}): {e}")
 
-                if tile_rgb is None:
-                    print(f"[Worker:Mitosis Warning] Could not read tile at ({tx_px}, {ty_px}) from slide")
-                    continue
+            if tile_rgb is None:
+                return []
 
-                # Detect mitotic candidates on tile
-                tile_preds = detector.detect(tile_rgb)
+            tile_preds = detector.detect(tile_rgb)
+            res = []
+            for cx_px, cy_px, det_conf in tile_preds:
+                cand_cx_um = tx_um + (cx_px * mpp_x)
+                cand_cy_um = ty_um + (cy_px * mpp_y)
+                res.append((cand_cx_um, cand_cy_um, float(det_conf), tile["hotspot_id"]))
+            return res
 
-                for cx_px, cy_px, det_conf in tile_preds:
-                    cand_cx_um = tx_um + (cx_px * mpp_x)
-                    cand_cy_um = ty_um + (cy_px * mpp_y)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            sweep_results = list(pool.map(_sweep_single_tile, all_tiles_to_sweep))
 
-                    raw_candidates.append({
-                        "id": f"m_{cand_seq:04d}",
-                        "hotspot_id": hs["id"],
-                        "centroid_um": [float(cand_cx_um), float(cand_cy_um)],
-                        "det_conf": float(det_conf),
-                        "ver_conf": None,
-                        "label": "unreviewed",
-                        "label_source": "model"
-                    })
-                    cand_seq += 1
+        for tile_cands in sweep_results:
+            for cand_cx_um, cand_cy_um, det_conf, hs_id in tile_cands:
+                raw_candidates.append({
+                    "id": f"m_{cand_seq:04d}",
+                    "hotspot_id": hs_id,
+                    "centroid_um": [float(cand_cx_um), float(cand_cy_um)],
+                    "det_conf": float(det_conf),
+                    "ver_conf": None,
+                    "label": "unreviewed",
+                    "label_source": "model"
+                })
+                cand_seq += 1
 
         # Cross-tile Global Physical NMS
         candidates = apply_global_nms(raw_candidates, nms_radius_um=nms_radius_um)
@@ -402,8 +412,8 @@ def run_mitosis(stage_exec: Any, db: Session) -> Tuple[str, Dict[str, str]]:
 
         if candidates_to_referee:
             ref_model_name = getattr(settings, "GEMINI_REFEREE_MODEL", "gemini-2.5-flash")
-            print(f"[Worker:Mitosis] Adjudicating {len(candidates_to_referee)} candidates via Multimodal Referee ({ref_model_name}) with 10 worker threads...")
-            with ThreadPoolExecutor(max_workers=10) as pool:
+            print(f"[Worker:Mitosis] Adjudicating {len(candidates_to_referee)} candidates via Multimodal Referee ({ref_model_name}) with 4 worker threads...")
+            with ThreadPoolExecutor(max_workers=4) as pool:
                 list(pool.map(_evaluate_single_referee, candidates_to_referee))
 
         # Ensure any unrefereed candidate NEVER blindly retains a "mitosis" label unless verifier explicitly confirmed it

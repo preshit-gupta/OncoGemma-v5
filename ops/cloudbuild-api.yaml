@@ -27,7 +27,12 @@ steps:
       - '--platform=managed'
       - '--allow-unauthenticated'
       - '--add-cloudsql-instances=$PROJECT_ID:$_REGION:oncogemma-dev-psql'
-      - '--update-env-vars=VERTEX_MITOSIS_ENDPOINT_ID=6276949705008087040,VERTEX_MITOSIS_LOCATION=us-central1,USE_GEMINI_FLASH_REFEREE=true,GEMINI_REFEREE_MODEL=gemini-2.5-flash,VERTEX_MEDGEMMA_ENDPOINT_ID=mg-endpoint-1b884451-6cab-4660-9d9e-0f97da95ec87,VERTEX_MEDGEMMA_LOCATION=asia-southeast1'
+      - '--cpu=4'
+      - '--memory=8Gi'
+      - '--no-cpu-throttling'
+      - '--min-instances=1'
+      - '--timeout=3600'
+      - '--update-env-vars=VERTEX_MITOSIS_ENDPOINT_ID=6276949705008087040,VERTEX_MITOSIS_LOCATION=us-central1,USE_GEMINI_FLASH_REFEREE=true,GEMINI_REFEREE_MODEL=gemini-2.5-flash,VERTEX_MEDGEMMA_ENDPOINT_ID=2026818294165536768,VERTEX_MEDGEMMA_LOCATION=us-central1,VERTEX_PATH_FOUNDATION_ENDPOINT_ID=6638504312592924672,VERTEX_PATH_FOUNDATION_LOCATION=us-central1'
     id: 'deploy-api'
 
 

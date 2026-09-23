@@ -977,26 +977,34 @@ class MedGemmaClient:
                 contents.append(types.Part.from_bytes(data=img_b, mime_type="image/png"))
 
             candidate_models = [model_name]
-            for fallback in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]:
+            for fallback in ["gemini-2.5-flash", "gemini-2.0-flash-001", "gemini-1.5-flash-002", "gemini-1.5-flash"]:
                 if fallback not in candidate_models:
                     candidate_models.append(fallback)
 
             for m in candidate_models:
-                try:
-                    resp = await asyncio.to_thread(
-                        v_client.models.generate_content,
-                        model=m,
-                        contents=contents,
-                        config=types.GenerateContentConfig(
-                            temperature=0.0,
-                            response_mime_type="application/json"
+                for retry in range(2):
+                    try:
+                        resp = await asyncio.to_thread(
+                            v_client.models.generate_content,
+                            model=m,
+                            contents=contents,
+                            config=types.GenerateContentConfig(
+                                temperature=0.0,
+                                response_mime_type="application/json"
+                            )
                         )
-                    )
-                    if resp and resp.text:
-                        return resp.text
-                except Exception as ex_m:
-                    print(f"[Vertex AI Gemini Flash model {m} attempt failed]: {ex_m}")
-                    continue
+                        if resp and resp.text:
+                            return resp.text
+                    except Exception as ex_m:
+                        err_str = str(ex_m)
+                        if ("429" in err_str or "RESOURCE_EXHAUSTED" in err_str) and retry == 0:
+                            import random
+                            backoff = 1.0 + random.uniform(0.2, 0.8)
+                            print(f"[Vertex AI Gemini Flash model {m} rate-limited (429), backing off for {backoff:.2f}s...]")
+                            await asyncio.sleep(backoff)
+                            continue
+                        print(f"[Vertex AI Gemini Flash model {m} attempt failed]: {ex_m}")
+                        break
         except Exception as e:
             print(f"[Vertex AI Gemini Flash GenAI SDK note] {e}")
 
@@ -1005,7 +1013,7 @@ class MedGemmaClient:
             import vertexai
             from vertexai.generative_models import GenerativeModel, Part
             vertexai.init(project=self.project, location=gemini_loc)
-            for m in [model_name, "gemini-1.5-flash", "gemini-1.5-flash-002"]:
+            for m in [model_name, "gemini-1.5-flash-002", "gemini-1.5-flash"]:
                 try:
                     v_model = GenerativeModel(m)
                     parts = [prompt]
@@ -1051,7 +1059,7 @@ class MedGemmaClient:
             images.append(b64_context)
             images_bytes.append(hpf_context_bytes)
 
-        # 1. Primary: Try Gemini 1.5 Flash Multimodal API if enabled
+        # 1. Primary: Try Gemini Flash Multimodal API if enabled
         use_flash = getattr(settings, "USE_GEMINI_FLASH_REFEREE", True)
         if use_flash:
             try:
@@ -1059,7 +1067,8 @@ class MedGemmaClient:
                 parsed = self._extract_json_from_text(raw_text)
                 return MitosisConfirmationResponse.model_validate(parsed)
             except Exception as e:
-                print(f"[Mitosis Referee Note] Gemini Flash referee fell through: {e}. Trying Vertex AI custom endpoint...")
+                print(f"[Mitosis Referee Note] Gemini Flash referee fell through: {e}. Using morphometric van Diest fallback.")
+                return self._morphometric_mitosis_fallback(candidate_crop_bytes)
 
         # 2. Secondary: Try custom Vertex AI Endpoint (e.g. MedGemma 1.5)
         last_error = None

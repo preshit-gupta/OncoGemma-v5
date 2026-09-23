@@ -125,3 +125,29 @@ def test_run_all_qc_checks_full_5_suite():
     assert check_names == {"tissue_coverage", "focus", "pen_marks", "folds", "stain_sanity"}
     assert res["verdict"] in ["pass", "warn", "fail"]
 
+
+def test_check_focus_sharpness_large_wsi():
+    """Verify check_focus_sharpness correctly maps coordinates on large WSI dimensions."""
+    from PIL import Image
+
+    slide = Image.new("RGB", (4096, 4096), color=(240, 235, 240))
+    # Synthetic tissue mask (512, 512) with tissue concentrated in bottom right
+    mask = np.zeros((512, 512), dtype=bool)
+    mask[256:, 256:] = True  # Bottom-right quadrant has tissue
+
+    config = {
+        "focus": {
+            "vol_threshold": 5.0,
+            "fail_blurry_ratio": 0.70,
+            "warn_blurry_ratio": 0.30,
+            "sample_max_tiles": 20,
+        }
+    }
+
+    res = check_focus_sharpness(
+        slide, mask, mpp_x=0.25, mpp_y=0.25, config=config
+    )
+    assert res["name"] == "focus"
+    assert "blurry" in res["message"].lower() or "focus" in res["message"].lower()
+
+

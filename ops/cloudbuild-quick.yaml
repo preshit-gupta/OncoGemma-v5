@@ -42,7 +42,11 @@ steps:
       - '--platform=managed'
       - '--allow-unauthenticated'
       - '--add-cloudsql-instances=$PROJECT_ID:$_REGION:oncogemma-dev-psql'
-      - '--update-env-vars=VERTEX_MITOSIS_ENDPOINT_ID=6276949705008087040,VERTEX_MITOSIS_LOCATION=us-central1,USE_GEMINI_FLASH_REFEREE=true,GEMINI_REFEREE_MODEL=gemini-2.5-flash'
+      - '--cpu=4'
+      - '--memory=8Gi'
+      - '--no-cpu-throttling'
+      - '--min-instances=1'
+      - '--update-env-vars=VERTEX_MITOSIS_ENDPOINT_ID=6276949705008087040,VERTEX_MITOSIS_LOCATION=us-central1,USE_GEMINI_FLASH_REFEREE=true,GEMINI_REFEREE_MODEL=gemini-2.5-flash,VERTEX_MEDGEMMA_ENDPOINT_ID=2026818294165536768,VERTEX_MEDGEMMA_LOCATION=us-central1,VERTEX_PATH_FOUNDATION_ENDPOINT_ID=6638504312592924672,VERTEX_PATH_FOUNDATION_LOCATION=us-central1'
     id: 'deploy-api'
 
 
@@ -57,11 +61,14 @@ steps:
       - '--region=$_REGION'
       - '--platform=managed'
       - '--allow-unauthenticated'
+      - '--cpu=1'
+      - '--memory=1Gi'
+      - '--cpu-throttling'
+      - '--min-instances=0'
     id: 'deploy-frontend'
 
 substitutions:
   _REGION: 'us-central1'
 
 options:
-  machineType: 'E2_HIGHCPU_8'
   logging: CLOUD_LOGGING_ONLY

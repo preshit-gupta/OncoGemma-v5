@@ -29,9 +29,9 @@ HANDLERS = {
     "report": run_report
 }
 
-def reset_stuck_running_stages(timeout_seconds: int = 300):
+def reset_stuck_running_stages(timeout_seconds: int = 1800):
     """
-    Reset orphan stages left in 'running' state exceeding timeout_seconds (default: 5 minutes / Cloud Run timeout).
+    Reset orphan stages left in 'running' state exceeding timeout_seconds (default: 30 minutes / Cloud Run timeout).
     Prevents resetting actively executing sibling worker tasks on worker startup.
     """
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=timeout_seconds)
@@ -143,12 +143,12 @@ def poll_and_execute_single_task():
 
 def run_worker_loop():
     print(f"[Worker] Starting OncoGemma stage worker poll loop. Engine: {engine.dialect.name}. Handlers: {list(HANDLERS.keys())}")
-    reset_stuck_running_stages(timeout_seconds=300)
+    reset_stuck_running_stages(timeout_seconds=1800)
     last_reset_check = time.time()
     while True:
         try:
             if time.time() - last_reset_check > 60.0:
-                reset_stuck_running_stages(timeout_seconds=300)
+                reset_stuck_running_stages(timeout_seconds=1800)
                 last_reset_check = time.time()
 
             executed = poll_and_execute_single_task()

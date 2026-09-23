@@ -95,24 +95,42 @@ def check_focus_sharpness(
 
     from pipeline.tiles import read_region_srgb
 
-    patch_size_um = 512.0
-    thumb_h, thumb_w = tissue_mask_1bit.shape
-    slide_w_um = thumb_w * 8.0 * mpp_x
-    slide_h_um = thumb_h * 8.0 * mpp_y
+    slide_w_px = float(getattr(slide_obj, "width_px", 2048) or 2048)
+    slide_h_px = float(getattr(slide_obj, "height_px", 2048) or 2048)
+    if hasattr(slide_obj, "dimensions"):
+        slide_w_px, slide_h_px = float(slide_obj.dimensions[0]), float(slide_obj.dimensions[1])
+    elif hasattr(slide_obj, "size"):
+        slide_w_px, slide_h_px = float(slide_obj.size[0]), float(slide_obj.size[1])
 
+    slide_w_um = slide_w_px * mpp_x
+    slide_h_um = slide_h_px * mpp_y
+
+    patch_size_um = 512.0
+    mask_h, mask_w = tissue_mask_1bit.shape
+
+    tissue_coords = np.argwhere(tissue_mask_1bit)  # [row, col] -> [y, x]
+    max_x_um = max(0.0, slide_w_um - patch_size_um)
+    max_y_um = max(0.0, slide_h_um - patch_size_um)
+
+    if len(tissue_coords) > 0:
+        rng = np.random.default_rng(42)
+        sample_size = min(max_tiles, len(tissue_coords))
+        chosen_idx = rng.choice(len(tissue_coords), size=sample_size, replace=(len(tissue_coords) < sample_size))
+        chosen = tissue_coords[chosen_idx]
+        candidate_xs = np.clip((chosen[:, 1] / float(mask_w)) * slide_w_um - patch_size_um / 2.0, 0, max_x_um)
+        candidate_ys = np.clip((chosen[:, 0] / float(mask_h)) * slide_h_um - patch_size_um / 2.0, 0, max_y_um)
+        positions = list(zip(candidate_xs, candidate_ys))
+    else:
+        step_um = patch_size_um * 2
+        xs = np.arange(0, max(patch_size_um, slide_w_um - patch_size_um), step_um)
+        ys = np.arange(0, max(patch_size_um, slide_h_um - patch_size_um), step_um)
+        positions = [(x, y) for x in xs for y in ys]
+        if len(positions) > max_tiles:
+            rng = np.random.default_rng(42)
+            idx_sample = rng.choice(len(positions), size=max_tiles, replace=False)
+            positions = [positions[i] for i in idx_sample]
     blurry_tile_count = 0
     total_sampled_tiles = 0
-
-    step_um = patch_size_um * 2
-    xs = np.arange(0, max(patch_size_um, slide_w_um - patch_size_um), step_um)
-    ys = np.arange(0, max(patch_size_um, slide_h_um - patch_size_um), step_um)
-
-    positions = [(x, y) for x in xs for y in ys]
-
-    if len(positions) > max_tiles:
-        rng = np.random.default_rng(42)
-        idx_sample = rng.choice(len(positions), size=max_tiles, replace=False)
-        positions = [positions[i] for i in idx_sample]
 
     for x_um, y_um in positions:
         try:

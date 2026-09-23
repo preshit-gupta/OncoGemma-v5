@@ -127,7 +127,8 @@ def test_tile_bounds_check_immediate_404():
 
 def test_qc_pass_auto_chains_triage():
     """Verify QC 'pass' sets status='done' and auto-enqueues triage stage (Issue #47)."""
-    from app.core.db import SessionLocal
+    from app.core.db import SessionLocal, Base, engine
+    Base.metadata.create_all(bind=engine)
     db = SessionLocal()
     try:
         case = Case(status="open", created_by="pathologist_test")
